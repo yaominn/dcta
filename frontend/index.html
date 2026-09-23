@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>DCTA — Direct Conversational Transaction Agent</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+    h1 { font-size: 1.4rem; }
+    .tag { display: inline-block; background: #f0f0f0; padding: 2px 8px; border-radius: 4px; font-size: .8rem; }
+    code { background: #f5f5f5; padding: 1px 4px; border-radius: 3px; }
+    .muted { color: #666; }
+  </style>
+</head>
+<body>
+  <h1>DCTA — Direct Conversational Transaction Agent</h1>
+  <p class="tag">DBS track · Scenario 1 — Voice-Enabled Payment and Transaction</p>
+
+  <blockquote><strong>GenAI is a generator of drafts, never an executor of funds.</strong></blockquote>
+
+  <p class="muted">
+    Frontend placeholder. Milestone 7 builds the real voice I/O + confirmation
+    overlay here (plain HTML/JS, no build toolchain — brief Section 8).
+  </p>
+
+  <p>
+    Backend health: <a href="http://localhost:8000/">/</a> ·
+    <a href="http://localhost:8000/api/seed/users">seeded users</a> ·
+    <a href="http://localhost:8000/api/seed/headline">headline arithmetic</a>
+  </p>
+
+  <p class="muted">The overlay will render from the resolved draft JSON with a fixed
+  template — it will never display LLM-generated text as the transaction summary.</p>
+</body>
+</html>

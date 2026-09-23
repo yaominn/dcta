@@ -1,0 +1,18 @@
+# DCTA — Direct Conversational Transaction Agent
+# Install:  pip install -r requirements.txt
+# (sandbox already has fastapi/uvicorn/pydantic; listed for portability + the
+#  teammates' machines and the deployed demo link.)
+
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.5
+python-dotenv>=1.0
+
+# --- Tencent Cloud (real services, wired in M3/M7; stubs used until then) ---
+tencentcloud-sdk-python>=3.0
+
+# --- Auth (transaction signing) — needed in M2, listed for visibility ---
+py_webauthn>=2.0
+
+# --- Tests ---
+pytest>=8.0

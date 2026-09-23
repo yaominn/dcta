@@ -1,0 +1,20 @@
+"""Frozen schemas (the cross-team contract). See schemas.py."""
+from backend.models.schemas import (  # noqa: F401
+    Amount,
+    AmountOp,
+    BuyEquityIntent,
+    Intent,
+    IntentPlan,
+    IntentType,
+    LegStatus,
+    LiteralAmount,
+    MentionTarget,
+    PayBillIntent,
+    ResolvedBuyEquity,
+    ResolvedIntent,
+    ResolvedPayBill,
+    ResolvedPlan,
+    ResolvedTransfer,
+    SymbolicAmount,
+    TransferIntent,
+)
