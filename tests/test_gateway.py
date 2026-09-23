@@ -1,0 +1,214 @@
+"""
+Gateway tests — the security core. (brief Section 4.2 acceptance test)
+
+"A script calling the gateway directly with a well-formed but unsigned request
+is rejected and logged." Plus the full verification matrix: valid signed ->
+executed+logged, bad signature, replay, expired, swap-after-approval, unknown
+credential, and sequential stop-at-first-failure execution (brief 4.1).
+"""
+from __future__ import annotations
+
+from backend.audit import AuditLog
+from backend.audit.canonical import payload_hash, challenge_hash
+from backend.auth import MockCredentialStore
+from backend.data.db import connect
+from backend.data.seed import seed
+from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor
+from backend.models.schemas import ResolvedPlan, ResolvedTransfer, ResolvedBuyEquity
+
+
+def _build(tmp_path, ttl=120):
+    """Seed a fresh temp DB and wire a fully-real gateway against a mock signer."""
+    db_path = tmp_path / "ledger.db"
+    seed(db_path)
+    signer = MockSigner()
+    creds = MockCredentialStore()
+    creds.register("cred_alice", signer.public_key)
+    nonce_store = NonceStore(ttl_seconds=ttl)
+    audit = AuditLog(db_path)
+    executor = MockExecutor(db_path)
+    gw = Gateway(
+        signer=signer, nonce_store=nonce_store,
+        audit=audit, executor=executor, credentials=creds,
+    )
+    return gw, signer, nonce_store, audit
+
+
+def _plan(draft_id="d1", amount=500.0, source="acct_savings") -> ResolvedPlan:
+    return ResolvedPlan(
+        draft_id=draft_id,
+        plan=[
+            ResolvedTransfer(
+                id="t1", type="TRANSFER", source_account=source,
+                payee_id="payee_17", payee_display="Mom", amount=amount,
+            )
+        ],
+        created_at="2026-10-16T10:00:00+00:00",
+    )
+
+
+def _sign(signer, plan, nonce) -> str:
+    return signer.sign(challenge_hash(payload_hash(plan), nonce))
+
+
+def _balance(tmp_path, account="acct_savings") -> float:
+    conn = connect(tmp_path / "ledger.db")
+    try:
+        return conn.execute(
+            "SELECT balance FROM accounts WHERE id=?", (account,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+# --------------------------------------------------------------------------- acceptance
+def test_unsigned_request_rejected_and_logged(tmp_path):
+    """THE brief acceptance test: well-formed but unsigned -> rejected + logged."""
+    gw, _signer, nonce_store, audit = _build(tmp_path)
+    plan = _plan()
+    nonce = nonce_store.issue(plan.draft_id)
+
+    result = gw.submit(plan, signature=None, nonce=nonce, credential_id="cred_alice")
+
+    assert result["accepted"] is False
+    assert result["rejection"] == "SIGNATURE"
+    assert result["reason"] == "missing signature"
+    entries = audit.all_entries()
+    assert any(
+        e["entry_type"] == "SIGNATURE" and "missing signature" in e["payload"]
+        for e in entries
+    ), "rejection must be logged to the audit chain"
+
+
+def test_valid_signed_request_accepted_and_executed(tmp_path):
+    gw, signer, nonce_store, audit = _build(tmp_path)
+    plan = _plan(amount=500.0)
+    nonce = nonce_store.issue(plan.draft_id)
+    sig = _sign(signer, plan, nonce)
+
+    result = gw.submit(plan, sig, nonce, "cred_alice")
+
+    assert result["accepted"] is True
+    assert result["execution"]["status"] == "EXECUTED"
+    assert _balance(tmp_path) == 7920.50          # 8420.50 - 500
+    assert any(e["entry_type"] == "EXECUTION" for e in audit.all_entries())
+
+
+# --------------------------------------------------------------------------- verification matrix
+def test_bad_signature_rejected(tmp_path):
+    gw, _signer, nonce_store, _audit = _build(tmp_path)
+    plan = _plan()
+    nonce = nonce_store.issue(plan.draft_id)
+
+    result = gw.submit(plan, "deadbeef" * 8, nonce, "cred_alice")   # 64 random hex
+
+    assert result["accepted"] is False
+    assert result["rejection"] == "SIGNATURE"
+    assert result["reason"] == "bad signature"
+
+
+def test_replayed_nonce_rejected(tmp_path):
+    gw, signer, nonce_store, _audit = _build(tmp_path)
+    plan = _plan()
+    nonce = nonce_store.issue(plan.draft_id)
+    sig = _sign(signer, plan, nonce)
+
+    first = gw.submit(plan, sig, nonce, "cred_alice")
+    assert first["accepted"] is True
+
+    second = gw.submit(plan, sig, nonce, "cred_alice")   # same nonce + sig
+    assert second["accepted"] is False
+    assert second["rejection"] == "NONCE"
+    assert "replay" in second["reason"]
+
+
+def test_expired_nonce_rejected(tmp_path):
+    gw, signer, nonce_store, _audit = _build(tmp_path)
+    plan = _plan()
+    nonce = nonce_store.issue(plan.draft_id)
+    nonce_store._store[nonce].issued_at -= 1000          # backdate past the 120s TTL
+
+    sig = _sign(signer, plan, nonce)
+    result = gw.submit(plan, sig, nonce, "cred_alice")
+
+    assert result["accepted"] is False
+    assert result["rejection"] == "NONCE"
+    assert "expired" in result["reason"]
+
+
+def test_swap_after_approval_rejected(tmp_path):
+    """The brief 4.5 attack: approve draft A, submit draft B with A's nonce.
+    Draft-binding makes this fail."""
+    gw, signer, nonce_store, _audit = _build(tmp_path)
+    plan_b = _plan(draft_id="dB")
+    nonce = nonce_store.issue("dA")                  # bound to dA, not dB
+    sig = _sign(signer, plan_b, nonce)               # valid sig for plan B's hash
+
+    result = gw.submit(plan_b, sig, nonce, "cred_alice")
+
+    assert result["accepted"] is False
+    assert result["rejection"] == "NONCE"
+    assert "swap-after-approval" in result["reason"]
+
+
+def test_unknown_credential_rejected(tmp_path):
+    gw, signer, nonce_store, _audit = _build(tmp_path)
+    plan = _plan()
+    nonce = nonce_store.issue(plan.draft_id)
+    sig = _sign(signer, plan, nonce)
+
+    result = gw.submit(plan, sig, nonce, "cred_nonexistent")
+
+    assert result["accepted"] is False
+    assert result["rejection"] == "SIGNATURE"
+    assert result["reason"] == "unknown credential"
+
+
+# --------------------------------------------------------------------------- execution semantics (brief 4.1)
+def test_two_leg_sequential_execution(tmp_path):
+    gw, signer, nonce_store, _audit = _build(tmp_path)
+    plan = ResolvedPlan(
+        draft_id="d2",
+        plan=[
+            ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
+                             payee_id="payee_17", payee_display="Mom", amount=500.0),
+            ResolvedBuyEquity(id="t2", type="BUY_EQUITY", source_account="acct_savings",
+                              ticker="AAPL", amount=1000.0,
+                              estimated_shares=4, estimated_fill_price=241.50),
+        ],
+        created_at="2026-10-16T10:00:00+00:00",
+    )
+    nonce = nonce_store.issue(plan.draft_id)
+    sig = _sign(signer, plan, nonce)
+
+    result = gw.submit(plan, sig, nonce, "cred_alice")
+
+    assert result["accepted"] is True
+    legs = result["execution"]["legs"]
+    assert legs[0]["status"] == "EXECUTED"
+    assert legs[1]["status"] == "EXECUTED"
+    assert _balance(tmp_path) == 6920.50              # 8420.50 - 500 - 1000
+
+
+def test_stop_at_first_failure_marks_rest_blocked(tmp_path):
+    gw, signer, nonce_store, _audit = _build(tmp_path)
+    plan = ResolvedPlan(
+        draft_id="d3",
+        plan=[
+            ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
+                             payee_id="payee_17", payee_display="Mom", amount=999999.0),
+            ResolvedTransfer(id="t2", type="TRANSFER", source_account="acct_joint",
+                             payee_id="payee_17", payee_display="Mom", amount=10.0),
+        ],
+        created_at="2026-10-16T10:00:00+00:00",
+    )
+    nonce = nonce_store.issue(plan.draft_id)
+    sig = _sign(signer, plan, nonce)
+
+    result = gw.submit(plan, sig, nonce, "cred_alice")
+
+    assert result["accepted"] is True                  # signature valid; execution failed
+    legs = result["execution"]["legs"]
+    assert legs[0]["status"] == "FAILED"
+    assert legs[1]["status"] == "BLOCKED"               # brief 4.1: stop at first failure
+    assert result["execution"]["status"] == "FAILED"

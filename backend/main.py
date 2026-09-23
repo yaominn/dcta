@@ -13,9 +13,15 @@ gateway -> audit) is built in Milestones 1-8.
 from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
 
 from backend.config import settings
-from backend.data.db import get_conn
+from backend.data.db import DB_PATH, get_conn
+from backend.audit import AuditLog
+from backend.audit.canonical import payload_hash, challenge_hash
+from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor
+from backend.auth import MockCredentialStore
+from backend.models.schemas import ResolvedPlan
 
 app = FastAPI(
     title="DCTA — Direct Conversational Transaction Agent",
@@ -33,9 +39,9 @@ def root():
         "project": "DCTA",
         "scenario": "Scenario 1 — Voice-Enabled Payment and Transaction, with KYC and basic risk control",
         "core_principle": "GenAI is a generator of drafts, never an executor of funds.",
-        "milestone": "0 (scaffold + seed)",
+        "milestone": "1 (gateway + audit + import-boundary)",
         "credentials_configured": settings.has_credentials,
-        "note": "credentials empty = running on stubs, which is expected for M0",
+        "note": "credentials empty = running on stubs; M1 security core needs no creds",
     }
 
 
@@ -110,3 +116,78 @@ def headline_arithmetic():
         "share_cost": cost,
         "remainder_in_source": remainder,
     }
+
+
+# --------------------------------------------------------------------------- M1
+# The security core, served over HTTP for the demo. Singletons share one mock
+# signer + one registered demo credential ("cred_alice") so the happy path is
+# exercisable end to end. Real WebAuthn (M2) swaps the signer + credential store.
+
+_signer = MockSigner()
+_credentials = MockCredentialStore()
+_credentials.register("cred_alice", _signer.public_key)   # MOCK demo credential
+
+_nonce_store = NonceStore(ttl_seconds=120)
+_audit = AuditLog(DB_PATH)
+_executor = MockExecutor(DB_PATH)
+_gateway = Gateway(
+    signer=_signer,
+    nonce_store=_nonce_store,
+    audit=_audit,
+    executor=_executor,
+    credentials=_credentials,
+)
+
+
+@app.get("/api/auth/nonce")
+def issue_nonce(draft_id: str = Query(...)):
+    """Issue a draft-bound, single-use, 120s-TTL nonce (brief 4.5).
+    The nonce binds to this draft_id — a swap-after-approval fails at the gateway."""
+    return {"nonce": _nonce_store.issue(draft_id),
+            "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
+
+
+class MockSignRequest(BaseModel):
+    """# MOCK dev-only convenience to demo the happy path. Would NOT exist in M2,
+    where the browser signs via WebAuthn. Lets an HTTP client obtain a valid
+    signature over the canonical challenge without the server's mock secret."""
+    resolved_plan: ResolvedPlan
+    nonce: str
+
+
+@app.post("/api/auth/mock-sign")
+def mock_sign(req: MockSignRequest):
+    p_hash = payload_hash(req.resolved_plan)
+    challenge = challenge_hash(p_hash, req.nonce)
+    return {"signature": _signer.sign(challenge),
+            "payload_hash": p_hash, "challenge": challenge,
+            "credential_id": "cred_alice"}
+
+
+class ExecuteRequest(BaseModel):
+    """The ONLY shape the gateway accepts (brief 4.2): payload + signature + nonce.
+    resolved_plan is validated into the frozen ResolvedPlan schema on the way in."""
+    resolved_plan: ResolvedPlan
+    signature: str | None = None
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/gateway/execute")
+def gateway_execute(req: ExecuteRequest):
+    """The single execution chokepoint. Verifies nonce -> signature -> executes.
+    Returns accepted=True on success; accepted=False (rejected+logged) on any
+    verification failure (brief acceptance test: unsigned request rejected+logged)."""
+    return _gateway.submit(req.resolved_plan, req.signature, req.nonce, req.credential_id)
+
+
+@app.get("/api/audit/chain")
+def audit_chain():
+    """List the hash-chained audit log in order."""
+    return {"entries": _audit.all_entries()}
+
+
+@app.get("/api/audit/verify")
+def audit_verify():
+    """verify_chain(): ok=True or the exact entry where tampering broke the chain."""
+    return _audit.verify_chain()

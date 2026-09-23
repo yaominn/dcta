@@ -14,8 +14,9 @@ Headline test arithmetic locked in here (brief Section 13):
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from backend.data.db import DB_PATH, get_conn, init_schema
+from backend.data.db import DB_PATH, connect, init_schema
 
 # --------------------------------------------------------------------------- seed data
 USERS = [
@@ -76,9 +77,10 @@ def _history_rows() -> list[tuple]:
 
 
 # --------------------------------------------------------------------------- driver
-def seed() -> None:
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = get_conn()
+def seed(db_path: Path = DB_PATH) -> None:
+    """Seed (or re-seed) the mock ledger at db_path. Idempotent: drops + recreates."""
+    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    conn = connect(db_path)
     try:
         # drop + recreate so seeding is fully idempotent
         for t in ["transaction_history", "limits", "equities", "billers", "payees", "accounts", "users"]:
@@ -99,8 +101,8 @@ def seed() -> None:
         conn.close()
 
     # report what we seeded
-    print(f"Seeded {DB_PATH}")
-    c = get_conn()
+    print(f"Seeded {db_path}")
+    c = connect(db_path)
     for t in ["users", "accounts", "payees", "billers", "equities", "transaction_history", "limits"]:
         n = c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         print(f"  {t:20s} {n} rows")

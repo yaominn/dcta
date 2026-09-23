@@ -11,12 +11,21 @@ from pathlib import Path
 DB_PATH = Path(__file__).resolve().parent / "dcta.db"
 
 
-def get_conn() -> sqlite3.Connection:
-    """Open a connection with row access by column name."""
-    conn = sqlite3.connect(DB_PATH)
+def connect(db_path: Path | str | None = None) -> sqlite3.Connection:
+    """Open a connection with row access by column name.
+
+    Pass a path to target an isolated DB (tests); omit it for the default
+    mock ledger. Always sets row_factory + foreign_keys so callers are uniform.
+    """
+    conn = sqlite3.connect(db_path or DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def get_conn() -> sqlite3.Connection:
+    """Default connection to the mock ledger DB."""
+    return connect()
 
 
 def init_schema(conn: sqlite3.Connection) -> None:

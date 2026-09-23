@@ -16,5 +16,9 @@ HONEST LIMITATION (state in the pitch, don't hide it):
 NOTE: WebAuthn is for TRANSACTION SIGNING only. App login is a mock session
 (pick a seeded user) — different ceremony, different nonce/UV flow.
 
-# TODO: Milestone 2 — registration + sign canonical payload end to end.
+Milestone 1 ships the # MOCK credential store here so the gateway can verify
+against a test key; Milestone 2 adds real WebAuthn registration + signing.
 """
+from backend.auth.credentials import MockCredentialStore
+
+__all__ = ["MockCredentialStore"]
