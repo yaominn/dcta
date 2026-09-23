@@ -27,7 +27,14 @@ from __future__ import annotations
 from enum import Enum
 from typing import Annotated, Literal, Union
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+# The authorization window is part of the SIGNED contract: changing this bound
+# changes what is acceptable to sign. It lives with the schema (not config.py)
+# for the same reason schema_version does — it is a contract-level property,
+# not a deployment setting. 300s = an approval is minutes-scale, not open-ended.
+MAX_AUTH_WINDOW_S = 300
 
 
 # --------------------------------------------------------------------------- enums
@@ -192,7 +199,11 @@ class ResolvedPlan(BaseModel):
       - expires_at puts the time bound INSIDE what the user signed. The 120s
         nonce TTL is server-side state; an expiry in the payload is part of the
         authorization itself. gateway.submit() enforces it, first, cheaply,
-        before consuming any state.
+        before consuming any state. The window itself is enforced AT
+        CONSTRUCTION (created_at < expires_at <= created_at + MAX_AUTH_WINDOW_S),
+        so a malformed timestamp can never be signed in the first place — the
+        same enforce-the-property philosophy as the float guard in canonical.py
+        and the import-boundary test.
     """
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["1"] = "1"
@@ -204,3 +215,21 @@ class ResolvedPlan(BaseModel):
     )
     created_at: int         # Unix seconds UTC — one representation, no string drift
     expires_at: int         # Unix seconds UTC — checked first in gateway.submit()
+
+    @model_validator(mode="after")
+    def _check_window(self):
+        """N1+N2: the authorization window is bounded by construction, not just
+        asserted. An inverted window (expires_at <= created_at, e.g. an approval
+        that ended before it began) and an open-ended window (e.g. a ten-year
+        approval) are both rejected here, so neither can be signed. The runtime
+        expiry check in gateway.submit() is still what rejects an authorization
+        whose (valid) window has since elapsed; this validator guarantees the
+        window was well-formed to begin with."""
+        if self.expires_at <= self.created_at:
+            raise ValueError("expires_at must be after created_at")
+        if self.expires_at - self.created_at > MAX_AUTH_WINDOW_S:
+            raise ValueError(
+                f"authorization window {self.expires_at - self.created_at}s exceeds "
+                f"{MAX_AUTH_WINDOW_S}s: an approval is time-bounded by construction"
+            )
+        return self

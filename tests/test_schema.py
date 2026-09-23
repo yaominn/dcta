@@ -11,7 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from backend.audit.canonical import hash_transcript
-from backend.models.schemas import IntentPlan, ResolvedPlan
+from backend.models.schemas import IntentPlan, ResolvedPlan, MAX_AUTH_WINDOW_S
 
 _TX = "stub: pay mom five hundred then buy aapl with the rest"
 _TX_HASH = hash_transcript(_TX)
@@ -126,7 +126,7 @@ def test_resolved_plan_roundtrip():
         ],
         "transcript_hash": _TX_HASH,
         "created_at": 1_700_000_000,
-        "expires_at": 1_700_000_600,
+        "expires_at": 1_700_000_120,
     })
     assert resolved.plan[1].estimated_shares == 32  # whole shares only
     assert resolved.schema_version == "1"
@@ -145,7 +145,7 @@ def test_resolved_plan_requires_transcript_hash():
                  "payee_id": "payee_17", "payee_display": "Mom", "amount_cents": 50000},
             ],
             "created_at": 1_700_000_000,
-            "expires_at": 1_700_000_600,
+            "expires_at": 1_700_000_120,
         })   # <- no transcript_hash
 
 
@@ -167,5 +167,54 @@ def test_transcript_hash_must_be_valid_sha256(bad_hash):
             ],
             "transcript_hash": bad_hash,
             "created_at": 1_700_000_000,
-            "expires_at": 1_700_000_600,
+            "expires_at": 1_700_000_120,
         })
+
+
+# --------------------------------------------------------------------------- N1/N2: the authorization window is bounded by construction
+def _resolved_dict(**overrides):
+    """A minimal valid ResolvedPlan dict. Tests override created_at/expires_at
+    to exercise the window validator (N1 inverted, N2 over-long)."""
+    base = {
+        "draft_id": "d_001",
+        "plan": [
+            {"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+             "payee_id": "payee_17", "payee_display": "Mom", "amount_cents": 50000},
+        ],
+        "transcript_hash": _TX_HASH,
+        "created_at": 1_700_000_000,
+        "expires_at": 1_700_000_120,
+    }
+    base.update(overrides)
+    return base
+
+
+def test_inverted_window_rejected():
+    """N1: expires_at must be strictly after created_at. An approval that ends
+    before or exactly when it began is not an authorization; rejected at
+    construction so it can never be signed."""
+    with pytest.raises(ValidationError):
+        ResolvedPlan.model_validate(_resolved_dict(
+            created_at=1_700_000_000, expires_at=1_700_000_000,
+        ))
+
+
+def test_overlong_window_rejected():
+    """N2: the authorization window is capped (MAX_AUTH_WINDOW_S). A ten-year
+    approval is not a time-bounded authorization. Enforced at construction, so
+    a bad timestamp can never be signed regardless of what the server wrote."""
+    c = 1_700_000_000
+    with pytest.raises(ValidationError):
+        ResolvedPlan.model_validate(_resolved_dict(
+            created_at=c, expires_at=c + MAX_AUTH_WINDOW_S + 1,
+        ))
+
+
+def test_window_at_cap_is_valid():
+    """Boundary: a window of exactly MAX_AUTH_WINDOW_S is acceptable (the cap is
+    inclusive). Pins the edge so a future off-by-one is caught."""
+    c = 1_700_000_000
+    plan = ResolvedPlan.model_validate(_resolved_dict(
+        created_at=c, expires_at=c + MAX_AUTH_WINDOW_S,
+    ))
+    assert plan.expires_at - plan.created_at == MAX_AUTH_WINDOW_S

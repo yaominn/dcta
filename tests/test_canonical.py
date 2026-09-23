@@ -24,7 +24,9 @@ from backend.models.schemas import ResolvedPlan, ResolvedTransfer
 _STUB_TX = "stub: transfer five hundred dollars to mom then buy aapl with the rest"
 _STUB_TX_HASH = hash_transcript(_STUB_TX)
 _CREATED = 1_700_000_000      # fixed Unix second — deterministic, clock-independent
-_EXPIRES = 4_000_000_000      # far future — always > now, so never expires in tests
+_EXPIRES = _CREATED + 300     # valid 300s window (the schema cap). Canonical tests
+                             # never hit the gateway runtime expiry check, so a fixed
+                             # past window is fine and keeps hashes deterministic.
 
 
 def _plan(amount_cents=50000, created_at=_CREATED, draft_id="d1",

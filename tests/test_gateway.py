@@ -8,6 +8,8 @@ credential, and sequential stop-at-first-failure execution (brief 4.1).
 """
 from __future__ import annotations
 
+import time
+
 from backend.audit import AuditLog
 from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
 from backend.auth import MockCredentialStore
@@ -19,9 +21,19 @@ from backend.models.schemas import ResolvedPlan, ResolvedTransfer, ResolvedBuyEq
 # Stub transcript (ASR lands in M7); its sha256 is the required transcript_hash.
 _STUB_TX = "stub: transfer five hundred dollars to mom then buy aapl with the rest"
 _STUB_TX_HASH = hash_transcript(_STUB_TX)
-_CREATED = 1_700_000_000      # fixed Unix second — deterministic
-_EXPIRES = 4_000_000_000      # far future — always > now, so plans never expire
-_PAST = 0                     # 1970 — always < now, so a plan carrying it is expired
+# The schema caps the authorization window at MAX_AUTH_WINDOW_S (300s), so a
+# "far-future" expiry is impossible. Gateway tests hit the runtime expiry check
+# (now > expires_at), so happy-path plans need created_at ~ now with a valid
+# <=300s window that stays unexpired through the test run. A fixed past
+# timestamp with a valid window would be expired at runtime (rejected EXPIRED).
+_NOW = int(time.time())
+_CREATED = _NOW                 # fresh plan: created ~ now
+_EXPIRES = _CREATED + 300       # 300s window (the cap); stays > now through the run
+# An expired-but-schema-valid plan: created 10 min ago, expires ~5 min ago. The
+# window is valid (300s, <= cap) but expires_at < now -> gateway rejects EXPIRED.
+# Used to prove the expiry check runs BEFORE nonce consumption.
+_EXPIRED_CREATED = _NOW - 600
+_EXPIRED_EXPIRES = _EXPIRED_CREATED + 300
 
 
 def _build(tmp_path, ttl=120):
@@ -42,7 +54,8 @@ def _build(tmp_path, ttl=120):
 
 
 def _plan(draft_id="d1", amount_cents=50000, source="acct_savings",
-          transcript_hash=_STUB_TX_HASH, expires_at=_EXPIRES) -> ResolvedPlan:
+          transcript_hash=_STUB_TX_HASH, created_at=_CREATED,
+          expires_at=_EXPIRES) -> ResolvedPlan:
     return ResolvedPlan(
         draft_id=draft_id,
         plan=[
@@ -52,7 +65,7 @@ def _plan(draft_id="d1", amount_cents=50000, source="acct_savings",
             )
         ],
         transcript_hash=transcript_hash,
-        created_at=_CREATED,
+        created_at=created_at,
         expires_at=expires_at,
     )
 
@@ -152,9 +165,14 @@ def test_expired_payload_rejected_nonce_preserved(tmp_path):
     stays usable and a fresh, unexpired resubmission of the SAME draft still
     executes. The time bound lives inside the signed payload (the user's own
     consent expiring), distinct from the server-side 120s nonce TTL above.
-    Rejected + logged, like every other rejection."""
+    Rejected + logged, like every other rejection.
+
+    The expired plan carries a SCHEMA-VALID window (created_at < expires_at,
+    300s <= cap) that has simply elapsed at runtime — distinct from the
+    N1/N2 inverted/over-long windows which are rejected at construction."""
     gw, signer, nonce_store, audit = _build(tmp_path)
-    expired = _plan(expires_at=_PAST)            # expires_at in the past
+    expired = _plan(created_at=_EXPIRED_CREATED,
+                    expires_at=_EXPIRED_EXPIRES)   # valid window, already expired
     nonce = nonce_store.issue(expired.draft_id)
     sig = _sign(signer, expired, nonce)          # valid sig — only the expiry is wrong
 
@@ -168,8 +186,9 @@ def test_expired_payload_rejected_nonce_preserved(tmp_path):
         '"EXPIRED"' in e["payload"] for e in audit.all_entries()
     ), "EXPIRED rejection must be logged to the audit chain"
     # nonce NOT consumed: a fresh, unexpired plan with the SAME nonce executes.
-    # (same draft_id "d1"; only expires_at differs -> different hash -> different sig)
-    fresh = _plan(expires_at=_EXPIRES)
+    # (same draft_id "d1"; only created_at/expires_at differ -> different hash
+    # -> different sig; the nonce is bound to draft_id, not to the hash.)
+    fresh = _plan()                               # created ~ now, expires ~ now+300
     fresh_sig = _sign(signer, fresh, nonce)
     result2 = gw.submit(fresh, fresh_sig, nonce, "cred_alice")
     assert result2["accepted"] is True
