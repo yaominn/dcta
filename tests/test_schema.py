@@ -10,7 +10,11 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from backend.audit.canonical import hash_transcript
 from backend.models.schemas import IntentPlan, ResolvedPlan
+
+_TX = "stub: pay mom five hundred then buy aapl with the rest"
+_TX_HASH = hash_transcript(_TX)
 
 
 # --------------------------------------------------------------------------- the Section 7 example
@@ -111,6 +115,7 @@ def test_unresolved_must_not_be_guessed():
 def test_resolved_plan_roundtrip():
     """The signed payload carries concrete payee_id + amounts (cents), never mentions."""
     resolved = ResolvedPlan.model_validate({
+        "schema_version": "1",
         "draft_id": "d_001",
         "plan": [
             {"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
@@ -119,6 +124,48 @@ def test_resolved_plan_roundtrip():
              "ticker": "AAPL", "amount_cents": 772800,
              "estimated_shares": 32, "estimated_fill_price_cents": 24150},
         ],
-        "created_at": "2026-09-23T12:00:00+00:00",
+        "transcript_hash": _TX_HASH,
+        "created_at": 1_700_000_000,
+        "expires_at": 1_700_000_600,
     })
     assert resolved.plan[1].estimated_shares == 32  # whole shares only
+    assert resolved.schema_version == "1"
+    assert resolved.transcript_hash == _TX_HASH
+
+
+def test_resolved_plan_requires_transcript_hash():
+    """S1: a plan cannot be built without binding to a transcript. With no
+    default, omitting transcript_hash is a ValidationError — the non-repudiation
+    binding to the origin utterance cannot be retrofitted later."""
+    with pytest.raises(ValidationError):
+        ResolvedPlan.model_validate({
+            "draft_id": "d_001",
+            "plan": [
+                {"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+                 "payee_id": "payee_17", "payee_display": "Mom", "amount_cents": 50000},
+            ],
+            "created_at": 1_700_000_000,
+            "expires_at": 1_700_000_600,
+        })   # <- no transcript_hash
+
+
+@pytest.mark.parametrize("bad_hash", [
+    "abc",                          # wrong length
+    "z" * 64,                       # right length, non-hex
+    "deadbeef",                     # too short, partial hex
+    "",                             # empty
+])
+def test_transcript_hash_must_be_valid_sha256(bad_hash):
+    """S1: transcript_hash is pattern-locked to ^[0-9a-f]{64}$ . A wrong
+    length or any non-hex char is rejected at validation, not at hashing time."""
+    with pytest.raises(ValidationError):
+        ResolvedPlan.model_validate({
+            "draft_id": "d_001",
+            "plan": [
+                {"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+                 "payee_id": "payee_17", "payee_display": "Mom", "amount_cents": 50000},
+            ],
+            "transcript_hash": bad_hash,
+            "created_at": 1_700_000_000,
+            "expires_at": 1_700_000_600,
+        })

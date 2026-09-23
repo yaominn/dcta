@@ -12,6 +12,7 @@ from backend.audit.canonical import (
     payload_hash,
     entry_hash,
     challenge_hash,
+    hash_transcript,
 )
 from backend.audit.log import AuditLog, AuditEntryType, GENESIS_HASH
 
@@ -20,6 +21,7 @@ __all__ = [
     "payload_hash",
     "entry_hash",
     "challenge_hash",
+    "hash_transcript",
     "AuditLog",
     "AuditEntryType",
     "GENESIS_HASH",

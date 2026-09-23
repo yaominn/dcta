@@ -170,10 +170,37 @@ ResolvedIntent = Annotated[
 class ResolvedPlan(BaseModel):
     """The canonical payload that gets hashed + signed.
 
+    The signature binds FOUR things, not three: identity (the WebAuthn key),
+    intent (the legs), the full payload (every field below), AND the origin
+    utterance (transcript_hash). Without transcript_hash the signature proved
+    the user approved *a plan* but not that the plan came from anything they
+    said; with it, non-repudiation covers the spoken intent itself.
+
     NO leg_status here on purpose: execution outcome is runtime state and is
     logged in the audit chain separately. The signature binds the *intent*
-    the user approved, not the eventual outcome."""
+    the user approved, not the eventual outcome.
+
+    Field notes:
+      - schema_version is a Literal, not a plain str: any future change is an
+        explicit, reviewable edit, and old audit entries stay interpretable.
+      - transcript_hash has NO default: a plan cannot be built without binding
+        it to a transcript. Pattern-locked to a 64-char hex sha256.
+      - created_at / expires_at are Unix-seconds UTC integers, not ISO strings
+        (same class of problem as the float-money bug L2: a free-form ISO
+        string leaves format drift — Z vs +00:00, microseconds or not — inside
+        a hashed field). Integers have one representation in every language.
+      - expires_at puts the time bound INSIDE what the user signed. The 120s
+        nonce TTL is server-side state; an expiry in the payload is part of the
+        authorization itself. gateway.submit() enforces it, first, cheaply,
+        before consuming any state.
+    """
     model_config = ConfigDict(extra="forbid")
+    schema_version: Literal["1"] = "1"
     draft_id: str            # server-issued; the WebAuthn nonce binds to THIS (brief 4.5)
     plan: list[ResolvedIntent]
-    created_at: str          # ISO-8601 UTC, fixed format for deterministic canonicalization
+    transcript_hash: str = Field(
+        pattern=r"^[0-9a-f]{64}$",
+        description="sha256 of the raw UTF-8 transcript this plan was derived from",
+    )
+    created_at: int         # Unix seconds UTC — one representation, no string drift
+    expires_at: int         # Unix seconds UTC — checked first in gateway.submit()

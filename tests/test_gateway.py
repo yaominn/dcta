@@ -9,12 +9,19 @@ credential, and sequential stop-at-first-failure execution (brief 4.1).
 from __future__ import annotations
 
 from backend.audit import AuditLog
-from backend.audit.canonical import payload_hash, challenge_hash
+from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
 from backend.auth import MockCredentialStore
 from backend.data.db import connect
 from backend.data.seed import seed
 from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer, ResolvedBuyEquity
+
+# Stub transcript (ASR lands in M7); its sha256 is the required transcript_hash.
+_STUB_TX = "stub: transfer five hundred dollars to mom then buy aapl with the rest"
+_STUB_TX_HASH = hash_transcript(_STUB_TX)
+_CREATED = 1_700_000_000      # fixed Unix second — deterministic
+_EXPIRES = 4_000_000_000      # far future — always > now, so plans never expire
+_PAST = 0                     # 1970 — always < now, so a plan carrying it is expired
 
 
 def _build(tmp_path, ttl=120):
@@ -34,7 +41,8 @@ def _build(tmp_path, ttl=120):
     return gw, signer, nonce_store, audit
 
 
-def _plan(draft_id="d1", amount_cents=50000, source="acct_savings") -> ResolvedPlan:
+def _plan(draft_id="d1", amount_cents=50000, source="acct_savings",
+          transcript_hash=_STUB_TX_HASH, expires_at=_EXPIRES) -> ResolvedPlan:
     return ResolvedPlan(
         draft_id=draft_id,
         plan=[
@@ -43,7 +51,9 @@ def _plan(draft_id="d1", amount_cents=50000, source="acct_savings") -> ResolvedP
                 payee_id="payee_17", payee_display="Mom", amount_cents=amount_cents,
             )
         ],
-        created_at="2026-10-16T10:00:00+00:00",
+        transcript_hash=transcript_hash,
+        created_at=_CREATED,
+        expires_at=expires_at,
     )
 
 
@@ -136,6 +146,36 @@ def test_expired_nonce_rejected(tmp_path):
     assert "expired" in result["reason"]
 
 
+def test_expired_payload_rejected_nonce_preserved(tmp_path):
+    """S5: a payload whose expires_at is in the past is rejected with reason
+    EXPIRED. Checked FIRST, before the nonce is consumed — so the issued nonce
+    stays usable and a fresh, unexpired resubmission of the SAME draft still
+    executes. The time bound lives inside the signed payload (the user's own
+    consent expiring), distinct from the server-side 120s nonce TTL above.
+    Rejected + logged, like every other rejection."""
+    gw, signer, nonce_store, audit = _build(tmp_path)
+    expired = _plan(expires_at=_PAST)            # expires_at in the past
+    nonce = nonce_store.issue(expired.draft_id)
+    sig = _sign(signer, expired, nonce)          # valid sig — only the expiry is wrong
+
+    result = gw.submit(expired, sig, nonce, "cred_alice")
+
+    assert result["accepted"] is False
+    assert result["rejection"] == "EXPIRED"
+    assert "expired" in result["reason"]
+    # logged to the audit chain, like the other rejections
+    assert any(
+        '"EXPIRED"' in e["payload"] for e in audit.all_entries()
+    ), "EXPIRED rejection must be logged to the audit chain"
+    # nonce NOT consumed: a fresh, unexpired plan with the SAME nonce executes.
+    # (same draft_id "d1"; only expires_at differs -> different hash -> different sig)
+    fresh = _plan(expires_at=_EXPIRES)
+    fresh_sig = _sign(signer, fresh, nonce)
+    result2 = gw.submit(fresh, fresh_sig, nonce, "cred_alice")
+    assert result2["accepted"] is True
+    assert result2["execution"]["status"] == "EXECUTED"
+
+
 def test_swap_after_approval_rejected(tmp_path):
     """The brief 4.5 attack: approve draft A, submit draft B with A's nonce.
     Draft-binding makes this fail."""
@@ -176,7 +216,9 @@ def test_two_leg_sequential_execution(tmp_path):
                               ticker="AAPL", amount_cents=100000,
                               estimated_shares=4, estimated_fill_price_cents=24150),
         ],
-        created_at="2026-10-16T10:00:00+00:00",
+        transcript_hash=_STUB_TX_HASH,
+        created_at=_CREATED,
+        expires_at=_EXPIRES,
     )
     nonce = nonce_store.issue(plan.draft_id)
     sig = _sign(signer, plan, nonce)
@@ -200,7 +242,9 @@ def test_stop_at_first_failure_marks_rest_blocked(tmp_path):
             ResolvedTransfer(id="t2", type="TRANSFER", source_account="acct_joint",
                              payee_id="payee_17", payee_display="Mom", amount_cents=1000),
         ],
-        created_at="2026-10-16T10:00:00+00:00",
+        transcript_hash=_STUB_TX_HASH,
+        created_at=_CREATED,
+        expires_at=_EXPIRES,
     )
     nonce = nonce_store.issue(plan.draft_id)
     sig = _sign(signer, plan, nonce)

@@ -4,16 +4,23 @@ The execution gateway — the one chokepoint funds pass through.
 payload hash and nonce; 4.1: sequential execution, stop at first failure.)
 
 submit() verifies, in order:
-  1. nonce  — draft-bound, fresh, single-use (swap-after-approval & replay blocked)
-  2. signature — over the canonical challenge hash, against a registered public key
-  3. execute — on the mock ledger, marking later legs BLOCKED on first failure
+  1. expiry   — now > expires_at -> reject EXPIRED. Checked FIRST: cheap, and it
+                consumes no state (the nonce stays usable for a fresh, unexpired
+                resubmission of the same draft). The time bound lives INSIDE the
+                signed payload, so an expired authorization is the user's own
+                consent expiring — not server-side bookkeeping.
+  2. nonce    — draft-bound, fresh, single-use (swap-after-approval & replay blocked)
+  3. signature — over the canonical challenge hash, against a registered public key
+  4. execute  — on the mock ledger, marking later legs BLOCKED on first failure
 
-Every step is logged to the hash-chained audit log. A request with a missing or
-bad signature, or a replayed/expired/swapped nonce, is REJECTED and LOGGED — so
-even a fully compromised LLM can do nothing here without a valid human
-signature. That is the whole point of the trust boundary.
+Every step is logged to the hash-chained audit log. A request with an expired
+payload, a missing or bad signature, or a replayed/swapped nonce is REJECTED and
+LOGGED — so even a fully compromised LLM can do nothing here without a valid
+human signature. That is the whole point of the trust boundary.
 """
 from __future__ import annotations
+
+import time
 
 from backend.audit.canonical import payload_hash, challenge_hash
 from backend.audit.log import AuditLog, AuditEntryType
@@ -51,14 +58,25 @@ class Gateway:
         p_hash = payload_hash(resolved_plan)
         challenge = challenge_hash(p_hash, nonce)
 
-        # 1. nonce — draft-bound, single-use, TTL. Consumed here: a failed attempt
+        # 1. expiry — checked FIRST, before any state is consumed. The time bound
+        #    lives inside the signed payload (expires_at); an expired authorization
+        #    is rejected without touching the nonce, so a fresh, unexpired
+        #    resubmission of the same draft can still use the issued nonce.
+        now = int(time.time())
+        if now > resolved_plan.expires_at:
+            return self._reject(
+                draft_id, p_hash, "EXPIRED",
+                f"payload expired at {resolved_plan.expires_at}, now {now}",
+            )
+
+        # 2. nonce — draft-bound, single-use, TTL. Consumed here: a failed attempt
         #    burns the nonce (one signing attempt per nonce; re-request to retry).
         try:
             self.nonce_store.consume(nonce, draft_id)
         except NonceError as exc:
             return self._reject(draft_id, p_hash, "NONCE", str(exc))
 
-        # 2. signature — over the canonical challenge, against a registered key.
+        # 3. signature — over the canonical challenge, against a registered key.
         pubkey = self.credentials.get(credential_id)
         if pubkey is None:
             return self._reject(draft_id, p_hash, "SIGNATURE", "unknown credential")
@@ -67,7 +85,7 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
 
-        # 3. execute on the mock ledger.
+        # 4. execute on the mock ledger.
         result = self.executor.execute(resolved_plan)
         self.audit.append(
             AuditEntryType.EXECUTION,

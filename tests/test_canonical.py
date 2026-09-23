@@ -15,11 +15,20 @@ from backend.audit.canonical import (
     payload_hash,
     entry_hash,
     challenge_hash,
+    hash_transcript,
 )
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer
 
+# Stub transcript (ASR lands in M7; until then a fixed string stands in for the
+# spoken intent). Its sha256 is the transcript_hash — required from M2 onward.
+_STUB_TX = "stub: transfer five hundred dollars to mom then buy aapl with the rest"
+_STUB_TX_HASH = hash_transcript(_STUB_TX)
+_CREATED = 1_700_000_000      # fixed Unix second — deterministic, clock-independent
+_EXPIRES = 4_000_000_000      # far future — always > now, so never expires in tests
 
-def _plan(amount_cents=50000, created_at="2026-10-16T10:00:00+00:00", draft_id="d1"):
+
+def _plan(amount_cents=50000, created_at=_CREATED, draft_id="d1",
+          transcript_hash=_STUB_TX_HASH, expires_at=_EXPIRES) -> ResolvedPlan:
     return ResolvedPlan(
         draft_id=draft_id,
         plan=[
@@ -28,7 +37,9 @@ def _plan(amount_cents=50000, created_at="2026-10-16T10:00:00+00:00", draft_id="
                 payee_id="payee_17", payee_display="Mom", amount_cents=amount_cents,
             )
         ],
+        transcript_hash=transcript_hash,
         created_at=created_at,
+        expires_at=expires_at,
     )
 
 
@@ -67,9 +78,19 @@ def test_identical_plans_have_identical_hashes():
 
 
 def test_created_at_is_part_of_the_hash():
-    a = payload_hash(_plan(created_at="2026-01-01T00:00:00+00:00"))
-    b = payload_hash(_plan(created_at="2026-02-02T00:00:00+00:00"))
+    a = payload_hash(_plan(created_at=1_700_000_000))
+    b = payload_hash(_plan(created_at=1_700_000_001))
     assert a != b
+
+
+def test_transcript_hash_changes_payload_hash():
+    """S1: transcript_hash is part of the signed payload, so the signature binds
+    the origin utterance — two plans derived from different transcripts cannot
+    share a payload hash (non-repudiation of *what was said*, not just *what was
+    approved*)."""
+    other = hash_transcript("stub: a totally different spoken intent")
+    assert other != _STUB_TX_HASH
+    assert payload_hash(_plan()) != payload_hash(_plan(transcript_hash=other))
 
 
 def test_challenge_binds_to_nonce():

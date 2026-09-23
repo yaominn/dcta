@@ -75,3 +75,17 @@ def challenge_hash(payload_hash_hex: str, nonce: str) -> str:
     """The WebAuthn challenge (brief 4.5): sha256(payload_hash + server_nonce).
     The authenticator signs this blind hash; the gateway verifies the same."""
     return hashlib.sha256((payload_hash_hex + nonce).encode()).hexdigest()
+
+
+def hash_transcript(transcript: str) -> str:
+    """SHA-256 over the raw UTF-8 transcript a plan was derived from.
+
+    This is what `ResolvedPlan.transcript_hash` carries — it binds the signature
+    to the origin utterance, so non-repudiation covers *what the user said*,
+    not just *what was approved*. The transcript ITSELF goes in the audit log;
+    only this hash is signed.
+
+    ASR lands in M7; until then the resolver uses a stubbed transcript string,
+    but the binding must exist from M2 onward — not be retrofitted onto an
+    already-signed payload."""
+    return hashlib.sha256(transcript.encode("utf-8")).hexdigest()
