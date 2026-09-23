@@ -12,7 +12,9 @@ python-dotenv>=1.0
 tencentcloud-sdk-python>=3.0
 
 # --- Auth (transaction signing) — needed in M2, listed for visibility ---
-py_webauthn>=2.0
+# NOTE: the Duo library is `py_webauthn` on GitHub but publishes to PyPI as `webauthn`.
+# `py_webauthn` on PyPI is a different abandoned package capped at 0.0.6.
+webauthn>=2.0        # imports as `import webauthn`; 3.0.0 verified working
 
 # --- Tests ---
 pytest>=8.0

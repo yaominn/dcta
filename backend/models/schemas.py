@@ -18,6 +18,9 @@ Security properties baked into the shapes (say this to the judges):
      {ref, op} token the resolver computes against the ledger.     (brief 4.1)
   3. The signed payload is the ResolvedPlan, never the raw LLM output. (brief 4.5/7)
   4. extra="forbid" on every model -> an LLM that invents a field is rejected.
+  5. Money is int cents from DB to signed payload. The `_cents` suffix stops
+     anyone reintroducing a float. canonical_json RAISES on any float, so a
+     float can never silently enter a signed payload (no hash collisions).
 """
 from __future__ import annotations
 
@@ -52,9 +55,13 @@ class LegStatus(str, Enum):
 
 # --------------------------------------------------------------------------- LLM OUTPUT
 class LiteralAmount(BaseModel):
-    """A concrete amount the user stated. e.g. {"literal": 500}"""
+    """A concrete amount the user stated. e.g. {"literal_cents": 50000} ($500.00)
+
+    Money is integer minor units (cents). Never float — floats cannot be
+    canonicalized deterministically across languages (Python f'{2.675:.2f}'='2.67',
+    JS (2.675).toFixed(2)='2.68'), which produces hash collisions."""
     model_config = ConfigDict(extra="forbid")
-    literal: float = Field(ge=0)
+    literal_cents: int = Field(gt=0)
 
 
 class SymbolicAmount(BaseModel):
@@ -130,7 +137,7 @@ class ResolvedTransfer(BaseModel):
     source_account: str
     payee_id: str            # resolver mapped the mention -> concrete id
     payee_display: str       # safe label for the overlay (user nickname)
-    amount: float            # concrete number, computed by the resolver
+    amount_cents: int = Field(gt=0)   # concrete, computed by the resolver
 
 
 class ResolvedPayBill(BaseModel):
@@ -140,7 +147,7 @@ class ResolvedPayBill(BaseModel):
     source_account: str
     biller_id: str
     biller_display: str
-    amount: float
+    amount_cents: int = Field(gt=0)
 
 
 class ResolvedBuyEquity(BaseModel):
@@ -149,9 +156,9 @@ class ResolvedBuyEquity(BaseModel):
     type: Literal["BUY_EQUITY"] = "BUY_EQUITY"
     source_account: str
     ticker: str
-    amount: float             # dollars allocated
+    amount_cents: int = Field(gt=0)             # dollars allocated, in cents
     estimated_shares: int      # WHOLE shares only (floor) -> the demo's 32 shares
-    estimated_fill_price: float
+    estimated_fill_price_cents: int             # per-share price, in cents
 
 
 ResolvedIntent = Annotated[

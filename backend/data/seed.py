@@ -6,10 +6,10 @@ Run:  python -m backend.data.seed
 
 # MOCK: simulated bank data. Real DBS APIs are out of scope (brief Section 12).
 
-Headline test arithmetic locked in here (brief Section 13):
-  acct_savings 8420.50 - 500 (t1) = 7920.50 -> at AAPL 241.50:
-  floor(7920.50 / 241.50) = floor(32.79..) = 32 whole shares = 7728.00
-  remainder 7920.50 - 7728.00 = 192.50   <- forces whole-share flooring into the demo
+Headline test arithmetic locked in here (brief Section 13), in integer cents:
+  acct_savings 842050 - 50000 (t1) = 792050 -> at AAPL 24150:
+  792050 // 24150 = 32 whole shares = 772800, remainder 19250.
+  Same numbers as the float version, no floats, no drift, no collisions.
 """
 from __future__ import annotations
 
@@ -26,10 +26,10 @@ USERS = [
 ]
 
 ACCOUNTS = [
-    # id,            user_id,   alias,          balance,  type
-    ("acct_savings", "u_alice", "acct_savings", 8420.50, "savings"),
-    ("acct_joint",   "u_alice", "acct_joint",   1200.00, "joint"),
-    ("acct_invest",  "u_alice", "acct_invest",   0.00,   "settlement"),
+    # id,            user_id,   alias,          balance_cents, type
+    ("acct_savings", "u_alice", "acct_savings", 842050, "savings"),   # $8,420.50
+    ("acct_joint",   "u_alice", "acct_joint",   120000, "joint"),     # $1,200.00
+    ("acct_invest",  "u_alice", "acct_invest",      0, "settlement"),# $0.00
 ]
 
 PAYEES = [
@@ -48,31 +48,31 @@ BILLERS = [
 ]
 
 EQUITIES = [
-    # ticker, price
-    ("AAPL", 241.50),
-    ("D05",  45.80),
-    ("O39",  12.94),
+    # ticker, price_cents
+    ("AAPL", 24150),   # $241.50
+    ("D05",   4580),   # $45.80
+    ("O39",   1294),   # $12.94
 ]
 
 LIMITS = {
-    "per_transaction": 20000,
-    "daily": 50000,
-    "velocity_count": 5,
-    "velocity_window_minutes": 10,
+    "per_transaction": 2000000,            # $20,000.00 in cents
+    "daily": 5000000,                      # $50,000.00 in cents
+    "velocity_count": 5,                   # count, not money
+    "velocity_window_minutes": 10,         # minutes, not money
 }
 
 
 def _history_rows() -> list[tuple]:
-    """12x $50 to payee_21 (median 50 -> 'fifty thousand' is 1000x, anomaly fires hard)
-    and 6x monthly $500 to payee_17 (so $500 is unremarkable)."""
+    """12x $50 (5000c) to payee_21 (median 5000 -> 'fifty thousand' is 1000x, anomaly fires hard)
+    and 6x monthly $500 (50000c) to payee_17 (so $500 is unremarkable)."""
     rows: list[tuple] = []
     now = datetime.now(timezone.utc)
     for i in range(12):  # 12 small transfers to John Doe
         ts = (now - timedelta(days=i)).isoformat()
-        rows.append(("u_alice", "payee_21", 50.0, ts))
+        rows.append(("u_alice", "payee_21", 5000, ts))    # $50.00 in cents
     for i in range(6):  # 6 monthly transfers to Mom
         ts = (now - timedelta(days=30 * i)).isoformat()
-        rows.append(("u_alice", "payee_17", 500.0, ts))
+        rows.append(("u_alice", "payee_17", 50000, ts))   # $500.00 in cents
     return rows
 
 
@@ -93,7 +93,7 @@ def seed(db_path: Path = DB_PATH) -> None:
         conn.executemany("INSERT INTO billers VALUES (?,?,?)", BILLERS)
         conn.executemany("INSERT INTO equities VALUES (?,?)", EQUITIES)
         conn.executemany("INSERT INTO limits VALUES (?,?)",
-                         [(k, float(v)) for k, v in LIMITS.items()])
+                         [(k, v) for k, v in LIMITS.items()])
         conn.executemany("INSERT INTO transaction_history (user_id, payee_id, amount, ts) VALUES (?,?,?,?)",
                          _history_rows())
         conn.commit()

@@ -43,7 +43,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             id         TEXT PRIMARY KEY,
             user_id    TEXT NOT NULL REFERENCES users(id),
             alias      TEXT NOT NULL,                    -- 'acct_savings'
-            balance    REAL NOT NULL,
+            balance    INTEGER NOT NULL,                 -- cents (int minor units; never float)
             type       TEXT NOT NULL                     -- savings | joint | invest | settlement
         );
 
@@ -63,20 +63,20 @@ def init_schema(conn: sqlite3.Connection) -> None:
 
         CREATE TABLE IF NOT EXISTS equities (
             ticker TEXT PRIMARY KEY,
-            price  REAL NOT NULL
+            price  INTEGER NOT NULL                  -- cents (int minor units; never float)
         );
 
         CREATE TABLE IF NOT EXISTS transaction_history (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id   TEXT NOT NULL REFERENCES users(id),
             payee_id  TEXT NOT NULL REFERENCES payees(id),
-            amount    REAL NOT NULL,
-            ts        TEXT NOT NULL                       -- ISO-8601
+            amount    INTEGER NOT NULL,               -- cents (int minor units; never float)
+            ts        TEXT NOT NULL                   -- ISO-8601
         );
 
         CREATE TABLE IF NOT EXISTS limits (
             key   TEXT PRIMARY KEY,
-            value REAL NOT NULL
+            value INTEGER NOT NULL                    -- money limits in cents; counts/mins as-is
         );
         """
     )

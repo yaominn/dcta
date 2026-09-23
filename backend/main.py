@@ -96,25 +96,32 @@ def list_billers():
 @app.get("/api/seed/headline")
 def headline_arithmetic():
     """Locks the Section 13 demo arithmetic so the resolver (M4) has a target.
-    8420.50 - 500 = 7920.50 -> 32 whole AAPL shares @ 241.50 = 7728.00,
-    remainder 192.50. Whole-share flooring is non-negotiable."""
+    All money is int cents: 842050 - 50000 = 792050 -> 32 whole AAPL shares
+    @ 24150 = 772800, remainder 19250. Whole-share flooring is non-negotiable.
+    No floats anywhere — the _display fields are strings for the UI only."""
     conn = get_conn()
     try:
         bal = conn.execute("SELECT balance FROM accounts WHERE id='acct_savings'").fetchone()[0]
         price = conn.execute("SELECT price FROM equities WHERE ticker='AAPL'").fetchone()[0]
     finally:
         conn.close()
-    after_transfer = round(bal - 500, 2)
-    shares = int(after_transfer // price)            # floor to whole shares
-    cost = round(shares * price, 2)
-    remainder = round(after_transfer - cost, 2)
+    after_transfer = bal - 50000                  # 792050
+    shares = after_transfer // price              # 32 — floor to whole shares
+    cost = shares * price                         # 772800
+    remainder = after_transfer - cost            # 19250
+    from backend.display import cents_to_display
     return {
-        "acct_savings_balance": bal,
-        "after_t1_minus_500": after_transfer,
-        "aapl_price": price,
+        "acct_savings_balance_cents": bal,
+        "acct_savings_balance_display": cents_to_display(bal),
+        "after_t1_minus_500_cents": after_transfer,
+        "after_t1_minus_500_display": cents_to_display(after_transfer),
+        "aapl_price_cents": price,
+        "aapl_price_display": cents_to_display(price),
         "estimated_whole_shares": shares,
-        "share_cost": cost,
-        "remainder_in_source": remainder,
+        "share_cost_cents": cost,
+        "share_cost_display": cents_to_display(cost),
+        "remainder_in_source_cents": remainder,
+        "remainder_in_source_display": cents_to_display(remainder),
     }
 
 

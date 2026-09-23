@@ -21,7 +21,7 @@ SECTION_7_EXAMPLE = {
             "type": "TRANSFER",
             "source_account": "acct_savings",
             "target": {"mention": "mom"},
-            "amount": {"literal": 500},
+            "amount": {"literal_cents": 50000},   # $500.00 in cents
         },
         {
             "id": "t2",
@@ -42,7 +42,7 @@ def test_section7_example_validates():
     assert plan.plan[0].type == "TRANSFER"      # Literal discriminator -> plain str
     assert plan.plan[1].type == "BUY_EQUITY"
     # the second leg's amount is symbolic, not computed — the LLM did no arithmetic
-    assert not hasattr(plan.plan[1].amount, "literal")  # it's a SymbolicAmount
+    assert not hasattr(plan.plan[1].amount, "literal_cents")  # it's a SymbolicAmount
 
 
 # --------------------------------------------------------------------------- security: no payee_id field exists for the LLM
@@ -54,7 +54,7 @@ def test_llm_cannot_emit_payee_id():
             {
                 "id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
                 "target": {"mention": "mom"},
-                "amount": {"literal": 500},
+                "amount": {"literal_cents": 50000},
                 "payee_id": "payee_17",  # <-- invented, must be rejected
             }
         ],
@@ -71,7 +71,7 @@ def test_llm_cannot_attach_account_number():
             {
                 "id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
                 "target": {"mention": "mom", "account_number": "123-456"},  # invented
-                "amount": {"literal": 500},
+                "amount": {"literal_cents": 50000},
             }
         ],
         "unresolved": [],
@@ -88,7 +88,7 @@ def test_wrong_variant_field_rejected():
             {
                 "id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
                 "target": {"mention": "mom"},
-                "amount": {"literal": 500},
+                "amount": {"literal_cents": 50000},
                 "ticker": "AAPL",  # ticker doesn't belong on a TRANSFER
             }
         ],
@@ -109,15 +109,15 @@ def test_unresolved_must_not_be_guessed():
 
 # --------------------------------------------------------------------------- resolved plan
 def test_resolved_plan_roundtrip():
-    """The signed payload carries concrete payee_id + amounts, never mentions."""
+    """The signed payload carries concrete payee_id + amounts (cents), never mentions."""
     resolved = ResolvedPlan.model_validate({
         "draft_id": "d_001",
         "plan": [
             {"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
-             "payee_id": "payee_17", "payee_display": "Mom", "amount": 500.0},
+             "payee_id": "payee_17", "payee_display": "Mom", "amount_cents": 50000},
             {"id": "t2", "type": "BUY_EQUITY", "source_account": "acct_savings",
-             "ticker": "AAPL", "amount": 7728.0,
-             "estimated_shares": 32, "estimated_fill_price": 241.50},
+             "ticker": "AAPL", "amount_cents": 772800,
+             "estimated_shares": 32, "estimated_fill_price_cents": 24150},
         ],
         "created_at": "2026-09-23T12:00:00+00:00",
     })

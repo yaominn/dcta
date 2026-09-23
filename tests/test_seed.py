@@ -44,7 +44,7 @@ def test_accounts_seeded():
         sav = conn.execute("SELECT balance FROM accounts WHERE id='acct_savings'").fetchone()
     finally:
         conn.close()
-    assert sav["balance"] == pytest.approx(8420.50)
+    assert sav["balance"] == 842050          # $8,420.50 in cents (int, not float)
 
 
 def test_payees_seeded_with_two_johns():
@@ -73,7 +73,7 @@ def test_malicious_biller_reference_seeded():
 
 
 def test_history_anomaly_baseline():
-    """12x $50 to payee_21 (median 50) -> 'fifty thousand' is 1000x, anomaly fires."""
+    """12x $50 (5000c) to payee_21 (median 5000c) -> 'fifty thousand' is 1000x, anomaly fires."""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -82,19 +82,20 @@ def test_history_anomaly_baseline():
     finally:
         conn.close()
     assert len(rows) == 12
-    assert all(r["amount"] == 50.0 for r in rows)
+    assert all(r["amount"] == 5000 for r in rows)   # $50.00 in cents
 
 
 def test_headline_arithmetic():
-    """8420.50 - 500 = 7920.50 -> 32 whole AAPL @ 241.50 = 7728.00, remainder 192.50."""
+    """842050 - 50000 = 792050 -> 32 whole AAPL @ 24150 = 772800, remainder 19250.
+    All integer cents — no floats, no round(), no drift."""
     conn = get_conn()
     try:
         bal = conn.execute("SELECT balance FROM accounts WHERE id='acct_savings'").fetchone()[0]
         price = conn.execute("SELECT price FROM equities WHERE ticker='AAPL'").fetchone()[0]
     finally:
         conn.close()
-    after = round(bal - 500, 2)
-    shares = int(after // price)
+    after = bal - 50000
+    shares = after // price
     assert shares == 32
-    assert round(shares * price, 2) == 7728.00
-    assert round(after - shares * price, 2) == 192.50
+    assert shares * price == 772800
+    assert after - shares * price == 19250

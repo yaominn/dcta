@@ -6,10 +6,18 @@ order, 500.0 vs 500.00, timezone text. If the hash isn't stable, a user could
 sign one thing and the gateway could "see" another: a silent swap. So we force
 ONE canonical form before hashing:
 
-  1. money floats -> fixed 2-decimal strings ("500.00")   [no float drift]
+  1. money is int cents (never float) — see the fail-closed guard below
   2. sort all object keys
   3. compact separators, no ASCII escaping
   4. SHA-256
+
+"Money is int cents" is enforced IN CODE, not in a docstring: _normalize()
+RAISES TypeError on any float in the payload. This is the same philosophy as
+the import-boundary test — enforce the property, don't assert it. A float can
+never silently enter a signed payload, because floats cannot be canonicalized
+deterministically across languages (Python f'{2.675:.2f}'='2.67' but
+JS (2.675).toFixed(2)='2.68'), which produced hash collisions (500.001 and
+500.004 both rounded to '500.00' -> one signature valid for two different plans).
 
 "What you see is what you sign" rests on this: the confirmation overlay must
 render from this same canonical form, so the bytes the user approved (via the
@@ -25,12 +33,18 @@ from backend.models.schemas import ResolvedPlan
 
 
 def _normalize(obj: Any) -> Any:
-    """Recursively canonicalize: floats -> 2dp strings. Keys left untouched
-    (json.dumps sorts them). bool checked before int (bool subclasses int)."""
+    """Recursively canonicalize. Keys left untouched (json.dumps sorts them).
+
+    bool is checked before int (bool subclasses int). A float RAISES: money
+    is int cents; floats cannot be canonicalized deterministically across
+    languages and produced hash collisions. Fail closed, not conventional."""
     if isinstance(obj, bool):
         return obj
     if isinstance(obj, float):
-        return f"{obj:.2f}"            # fixed money format — no drift between runs
+        raise TypeError(
+            f"float in canonical payload: {obj!r}. Money is int cents. "
+            "Floats cannot be canonicalized deterministically across languages."
+        )
     if isinstance(obj, int):
         return obj
     if isinstance(obj, dict):

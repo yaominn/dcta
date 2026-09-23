@@ -34,13 +34,13 @@ def _build(tmp_path, ttl=120):
     return gw, signer, nonce_store, audit
 
 
-def _plan(draft_id="d1", amount=500.0, source="acct_savings") -> ResolvedPlan:
+def _plan(draft_id="d1", amount_cents=50000, source="acct_savings") -> ResolvedPlan:
     return ResolvedPlan(
         draft_id=draft_id,
         plan=[
             ResolvedTransfer(
                 id="t1", type="TRANSFER", source_account=source,
-                payee_id="payee_17", payee_display="Mom", amount=amount,
+                payee_id="payee_17", payee_display="Mom", amount_cents=amount_cents,
             )
         ],
         created_at="2026-10-16T10:00:00+00:00",
@@ -51,7 +51,7 @@ def _sign(signer, plan, nonce) -> str:
     return signer.sign(challenge_hash(payload_hash(plan), nonce))
 
 
-def _balance(tmp_path, account="acct_savings") -> float:
+def _balance(tmp_path, account="acct_savings") -> int:
     conn = connect(tmp_path / "ledger.db")
     try:
         return conn.execute(
@@ -82,7 +82,7 @@ def test_unsigned_request_rejected_and_logged(tmp_path):
 
 def test_valid_signed_request_accepted_and_executed(tmp_path):
     gw, signer, nonce_store, audit = _build(tmp_path)
-    plan = _plan(amount=500.0)
+    plan = _plan(amount_cents=50000)
     nonce = nonce_store.issue(plan.draft_id)
     sig = _sign(signer, plan, nonce)
 
@@ -90,7 +90,7 @@ def test_valid_signed_request_accepted_and_executed(tmp_path):
 
     assert result["accepted"] is True
     assert result["execution"]["status"] == "EXECUTED"
-    assert _balance(tmp_path) == 7920.50          # 8420.50 - 500
+    assert _balance(tmp_path) == 792050          # 842050 - 50000 cents
     assert any(e["entry_type"] == "EXECUTION" for e in audit.all_entries())
 
 
@@ -171,10 +171,10 @@ def test_two_leg_sequential_execution(tmp_path):
         draft_id="d2",
         plan=[
             ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
-                             payee_id="payee_17", payee_display="Mom", amount=500.0),
+                             payee_id="payee_17", payee_display="Mom", amount_cents=50000),
             ResolvedBuyEquity(id="t2", type="BUY_EQUITY", source_account="acct_savings",
-                              ticker="AAPL", amount=1000.0,
-                              estimated_shares=4, estimated_fill_price=241.50),
+                              ticker="AAPL", amount_cents=100000,
+                              estimated_shares=4, estimated_fill_price_cents=24150),
         ],
         created_at="2026-10-16T10:00:00+00:00",
     )
@@ -187,7 +187,7 @@ def test_two_leg_sequential_execution(tmp_path):
     legs = result["execution"]["legs"]
     assert legs[0]["status"] == "EXECUTED"
     assert legs[1]["status"] == "EXECUTED"
-    assert _balance(tmp_path) == 6920.50              # 8420.50 - 500 - 1000
+    assert _balance(tmp_path) == 692050              # 842050 - 50000 - 100000
 
 
 def test_stop_at_first_failure_marks_rest_blocked(tmp_path):
@@ -196,9 +196,9 @@ def test_stop_at_first_failure_marks_rest_blocked(tmp_path):
         draft_id="d3",
         plan=[
             ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
-                             payee_id="payee_17", payee_display="Mom", amount=999999.0),
+                             payee_id="payee_17", payee_display="Mom", amount_cents=99999900),
             ResolvedTransfer(id="t2", type="TRANSFER", source_account="acct_joint",
-                             payee_id="payee_17", payee_display="Mom", amount=10.0),
+                             payee_id="payee_17", payee_display="Mom", amount_cents=1000),
         ],
         created_at="2026-10-16T10:00:00+00:00",
     )
