@@ -167,6 +167,96 @@ company-name → ticker, `unresolved`-is-a-hint, empty plan → question with no
 clarify-resume round-trip and provenance tests proving `payee_display`/`biller_display`
 carry no legal name or injection text.
 
+**Amended while building M5** — three fixes, all in mention handling:
+
+- **`{"mention":"default"}` now resolves.** `backend/agent/prompts.py` tells the
+  model to emit that when the user names no account, and the resolver had no
+  rule for it — so *every* transcript that did not name an account dead-ended in
+  a question, including this README's own demo sentence. It now resolves to the
+  documented default (the user's savings account), and because the resolved
+  `source_account` is a concrete id the overlay renders, **the default is seen
+  before it is signed**. A default you can see is consent; a silent one is the
+  failure this project exists to prevent.
+- **Mentions are normalised** — case, whitespace, punctuation and filler words
+  (`my`, `the`, `account`) — through **one** helper applied to *both* sides of
+  every comparison, so the rule cannot drift between the four mention kinds.
+  `" mom"`, `"mom."`, `"Mom,"`, `"my savings account"` all match now; none did
+  before. Account synonyms (`investment`/`invest`/`brokerage` → the
+  `settlement`-type account) make the investment account reachable by a word a
+  human would actually say.
+- **Every mention question is answerable in one round-trip.** A 0-match
+  previously returned before it read `answers` and carried no `choices`, so
+  "I don't have a payee called 'Dave'" could only be answered by re-saying the
+  whole sentence — which re-parsed to the same 0-match. That is an infinite
+  loop in a voice flow. 0-match now offers the user's own list, validated the
+  same way the 2+ path already was: an id the mention does not justify is still
+  refused.
+
+`tests/test_pipeline_m3_m4.py` runs the **real parser into the real resolver**
+for every demo transcript. Every M4 test built its `IntentPlan` by hand, which
+is why a broken seam shipped green across 153 tests.
+
+## M5 — Policy engine: KYC + limits + velocity + anomaly
+
+`backend/policy/` evaluates a concrete `ResolvedPlan` and returns a **verdict
+per leg** — `ALLOW` / `REQUIRE_EXTRA_CONFIRMATION` / `BLOCK` — each with a
+reason written for a person, not a log file. Pure deterministic functions: no
+LLM, no floats, and `tests/test_import_boundary.py` now forbids
+`backend.policy` from reaching `backend.agent`, so "no LLM in a risk decision"
+is CI-checked rather than asserted.
+
+| rule | source of truth | outcome |
+|---|---|---|
+| KYC | `users.kyc_status`, `users.investment_eligible` | BLOCK (`u_bob` is `PENDING`) |
+| per-transaction | `limits.per_transaction` ($20,000) | BLOCK |
+| daily | `limits.daily` ($50,000), accumulated across today's history **and** the legs of this plan | BLOCK |
+| velocity | `limits.velocity_count` / `velocity_window_minutes` (5 in 10 min) | BLOCK |
+| anomaly | median of this user's history with this payee | **escalate**, never block |
+
+**Precedence is explicit**: KYC → per-transaction → daily → velocity → anomaly,
+first BLOCK wins, and anomaly can only ever escalate. A blocked leg reports one
+reason, not four. The engine **never mutates the plan** — the plan is what gets
+hashed and signed, so changing it after resolution would break the binding
+between what the user saw and what they signed (`test_evaluate_never_mutates_the_plan`).
+
+**Where it is enforced.** Checking policy before rendering the overlay is UX.
+The enforcement point is **`gateway.submit()`**, which re-runs the same
+evaluation against the same ledger after verifying the signature and before
+executing. Without that, a caller who assembled or replayed a signed payload
+would skip the overlay path and every limit with it, and the policy engine
+would be advisory. The gateway is the one place funds pass through (brief 4.2),
+so it is the one place a limit can actually be a limit. The owner whose limits
+apply is **derived from the account rows being debited**, never from a field in
+the request — `ResolvedPlan` carries no `user_id` on purpose.
+
+Three things about the seeded data, stated rather than discovered later:
+
+- **Executed transfers now write `transaction_history`.** Until M5 only
+  `seed.py` ever did, so a daily cap and a velocity counter could not be moved
+  by an actual payment. `PAY_BILL` and `BUY_EQUITY` still cannot be recorded:
+  `transaction_history.payee_id` is `NOT NULL` and foreign-keys to `payees`, so
+  the table can only represent transfers — which is also why anomaly is
+  transfers-only.
+- **Nothing in the seed exercises velocity** (its rows are a day apart), so
+  those tests build their own.
+- **`u_bob` has no accounts**, so his KYC block is unreachable through the
+  resolver. The rules are pure functions and are tested directly.
+- **"Daily" means UTC midnight**, which is what the UTC-aware seeded timestamps
+  support. A deployed Singapore product would use UTC+8 and differ for eight
+  hours a day.
+
+Tests (`pytest tests/test_policy.py`): 25 cases covering each rule, the limit
+boundary exactly (`2000000` passes, `2000001` blocks), accumulation across legs,
+a blocked leg not consuming a later leg's allowance, both anomaly directions,
+plan immutability, and the gateway re-check — including that a correctly signed
+but policy-violating plan is rejected and logged to the hash chain.
+
+M5 and M6 were built in parallel and meet here. They are independent by design:
+the validator is **read-only** and freezes a draft by withholding its nonce,
+while the policy engine **blocks** at the gateway. Both boundaries are now
+CI-checked in `tests/test_import_boundary.py` — `policy` cannot reach `agent`,
+`validator` cannot reach `gateway` or `auth`. Full suite: 209 passed.
+
 ## M6 — Independent validation agent
 
 `backend/validator/validate()` is a second, **read-only** audit of a resolved
@@ -278,10 +368,10 @@ dcta/
 | 1 | Gateway + audit log first | done |
 | 2 | WebAuthn register + sign canonical payload | done |
 | 3 | LLM parser + schema + opaque IDs | done |
-| 4 | Resolver + clarify loop | done |
-| 5 | Policy engine + KYC + velocity + anomaly | **next** |
+| 4 | Resolver + clarify loop | done (amended in M5 — see above) |
+| 5 | Policy engine + KYC + velocity + anomaly | **done (this commit)** |
 | 6 | Validation agent | done |
-| 7 | Voice I/O + confirmation overlay UI | |
+| 7 | Voice I/O + confirmation overlay UI | next |
 | 8 | Red-team demo + polish | |
 | 9 | Submission package | |
 
@@ -289,7 +379,12 @@ dcta/
 
 1. **Happy path** — multi-intent voice command → one overlay → one fingerprint → both legs executed.
 2. **Ambiguity** — "Send fifty to John" → disambiguation → correct payee.
-3. **Anomaly** — "fifty thousand" to a usual-$50 payee → extra confirmation.
+3. **Anomaly** — "five thousand" to a usual-$50 payee → extra confirmation.
+   (Was "fifty thousand", which is impossible: $50,000 breaks the $20,000
+   per-transaction limit and meets the $50,000 daily cap, so policy blocks it
+   outright and the scene never reaches a confirmation. $5,000 is still 100x
+   the $50 median, so anomaly fires and the user confirms — which is the more
+   interesting beat to show. Scenario 6 is where a hard block belongs.)
 4. **Injection via data** — malicious biller reference → prove it never reached the prompt.
 5. **Injection via voice** — spoken attack → at most a draft, flagged, declined.
 6. **Rogue agent** — direct gateway call without a signature → rejected.

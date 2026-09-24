@@ -63,7 +63,7 @@ def root():
         "project": "DCTA",
         "scenario": "Scenario 1 — Voice-Enabled Payment and Transaction, with KYC and basic risk control",
         "core_principle": "GenAI is a generator of drafts, never an executor of funds.",
-        "milestone": "3 (LLM parser + schema + opaque IDs)",
+        "milestone": "5 (policy engine: KYC + limits + velocity + anomaly)",
         "credentials_configured": settings.has_credentials,
         "webauthn": {"rp_id": settings.rp_id, "expected_origin": settings.expected_origin},
         "note": "credentials empty = running on stubs; the security core needs no Tencent creds",
@@ -168,6 +168,7 @@ _gateway = Gateway(
     audit=_audit,
     executor=_executor,
     credentials=_credentials,
+    policy_db_path=DB_PATH,      # M5: policy is enforced at the chokepoint
 )
 
 
@@ -191,6 +192,7 @@ _webauthn_gateway = Gateway(
     audit=_audit,                 # shared
     executor=_executor,           # shared (one ledger)
     credentials=_webauthn_credentials,
+    policy_db_path=DB_PATH,       # shared — the same limits on both paths
 )
 
 # In-memory registration challenges (user_id -> (challenge bytes, issued_at)).

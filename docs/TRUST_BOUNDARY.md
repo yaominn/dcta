@@ -13,7 +13,7 @@ and who could forge it. A proper diagram will be rendered for the submission.
 | 4 | Resolver -> policy | concrete ResolvedPlan | None (pure deterministic code) | Deterministic; no external input |
 | 5 | ResolvedPlan -> overlay | canonical JSON | A compromised renderer | Overlay renders from fixed template, never LLM text; **client-integrity assumption, stated honestly** |
 | 6 | Overlay -> WebAuthn | payload hash + draft-bound nonce | Replay/swap of an approved draft | Nonce bound to `draft_id`, single-use, 120s TTL; challenge = sha256(payload_hash + nonce) |
-| 7 | WebAuthn -> gateway | (payload, signature) | Forged signature / unsigned request | Gateway accepts ONLY (payload, signature); verifies signature, hash, nonce freshness |
+| 7 | WebAuthn -> gateway | (payload, signature) | Forged signature / unsigned request | Gateway accepts ONLY (payload, signature); verifies signature, hash, nonce freshness; **re-evaluates policy (M5)** so a signed payload that skipped the overlay still meets KYC, limits and velocity |
 | 8 | Gateway -> ledger | signed execution | A rogue agent trying to execute | Agent has no gateway credentials and no import path to gateway/ (enforced by import-boundary test) |
 | 9 | Every step -> audit log | transcript/draft/policy/sig/exec hashes | Tampering with history | Hash-chained; `verify_chain()` pinpoints the break |
 
@@ -21,7 +21,10 @@ and who could forge it. A proper diagram will be rendered for the submission.
 
 Boundary 7 (gateway) is where "a draft" becomes "a debit." It accepts only a
 signed payload and verifies it against a registered public key + a draft-bound
-nonce. The agent never reaches it. That asymmetry — generate here, execute
+nonce, **and re-runs the policy engine against the ledger before executing** —
+because a limit that is only checked on the way to the overlay is a limit a
+caller can walk around. The user whose limits apply is derived from the account
+rows being debited, never from a field in the request. The agent never reaches it. That asymmetry — generate here, execute
 there, with a human signature in between — is the entire security argument.
 
 ## Honest client-integrity caveat (state in the pitch)
