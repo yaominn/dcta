@@ -33,11 +33,11 @@ ACCOUNTS = [
 ]
 
 PAYEES = [
-    # id,        user_id,  nickname,  legal_name,     last4
-    ("payee_17", "u_alice", "Mom",     "Jane Tan",      "3310"),   # normal ~$500/mo
-    ("payee_21", "u_alice", "John",    "John Doe",      "4521"),   # usual $50 (anomaly baseline)
-    ("payee_22", "u_alice", "John",    "John Smith",    "8892"),   # forces disambiguation
-    ("payee_30", "u_alice", "Landlord","Property Mgmt", "7001"),   # large-but-normal
+    # id,        user_id,  nickname,  legal_name,     last4,  phone (fictional)
+    ("payee_17", "u_alice", "Mom",     "Jane Tan",      "3310", "+65 9123 3310"),  # normal ~$500/mo
+    ("payee_21", "u_alice", "John",    "John Doe",      "4521", "+65 8123 4521"),  # usual $50 (anomaly baseline)
+    ("payee_22", "u_alice", "John",    "John Smith",    "8892", "+65 9876 8892"),  # forces disambiguation
+    ("payee_30", "u_alice", "Landlord","Property Mgmt", "7001", "+65 6123 7001"),  # large-but-normal
 ]
 
 BILLERS = [
@@ -104,7 +104,7 @@ def seed(db_path: Path = DB_PATH, *, reset_audit: bool = False) -> None:
 
         conn.executemany("INSERT INTO users VALUES (?,?,?,?)", USERS)
         conn.executemany("INSERT INTO accounts VALUES (?,?,?,?,?)", ACCOUNTS)
-        conn.executemany("INSERT INTO payees VALUES (?,?,?,?,?)", PAYEES)
+        conn.executemany("INSERT INTO payees VALUES (?,?,?,?,?,?)", PAYEES)
         conn.executemany("INSERT INTO billers VALUES (?,?,?)", BILLERS)
         conn.executemany("INSERT INTO equities VALUES (?,?)", EQUITIES)
         conn.executemany("INSERT INTO limits VALUES (?,?)",

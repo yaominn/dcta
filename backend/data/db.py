@@ -28,6 +28,16 @@ def get_conn() -> sqlite3.Connection:
     return connect()
 
 
+def migrate(conn: sqlite3.Connection) -> None:
+    """Bring an existing ledger up to the current schema without re-seeding
+    (a re-seed would drop the user's own edits and registered passkeys).
+    Idempotent; called at app startup."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
+    if cols and "phone" not in cols:
+        conn.execute("ALTER TABLE payees ADD COLUMN phone TEXT")
+        conn.commit()
+
+
 def init_schema(conn: sqlite3.Connection) -> None:
     """Create all tables. Called by seed.py (idempotent: drops first)."""
     conn.executescript(
@@ -52,7 +62,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             user_id     TEXT NOT NULL REFERENCES users(id),
             nickname    TEXT NOT NULL,                   -- 'Mom'  <- shown to the LLM
             legal_name  TEXT NOT NULL,                   -- 'Jane Tan'  <- NEVER shown to the LLM
-            last4       TEXT NOT NULL                    -- '3310'
+            last4       TEXT NOT NULL,                   -- '3310'
+            phone       TEXT                             -- '+65 9123 3310'; NEVER shown to the LLM.
+                                                         -- Editable by the user, via a signed draft only.
         );
 
         CREATE TABLE IF NOT EXISTS billers (

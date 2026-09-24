@@ -2,71 +2,93 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>DCTA — Confirm Transaction</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#0b1020" />
+  <title>DCTA Assistant</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <main class="card">
-    <header>
-      <h1>DCTA</h1>
-      <p class="tag">GenAI is a generator of drafts, never an executor of funds.</p>
-      <p class="scenario">Scenario 1 — Voice-Enabled Payment &amp; Transaction</p>
-    </header>
+  <div class="stage">
+    <aside class="caption">
+      <p class="brand">DCTA</p>
+      <h1>GenAI is a generator of drafts, never an executor of funds.</h1>
+      <p class="muted">Scenario 1 — Voice-Enabled Payment &amp; Transaction,
+        with KYC and basic risk control.</p>
+      <p class="muted small">Unusual payments and phone-number changes send a
+        code to the user's phone.
+        <a href="/phone" target="dcta-phone">Open the demo phone</a> in a
+        second window.</p>
+      <p class="muted small"><a href="/data" target="dcta-data">See exactly what
+        the AI was told</a>, step by step, for every request.</p>
+    </aside>
 
-    <!-- M7: say it, or type it. Voice has three tiers (Tencent ASR -> Web
-         Speech API -> this text box). The text box is ALWAYS present: if the
-         room beats the microphone on stage, you type the same sentence and the
-         demo continues (brief §5). -->
-    <section id="say-box" class="say-box" hidden>
-      <h2>What would you like to do?</h2>
-      <div class="say-row">
-        <button id="mic" class="mic" title="Hold a conversation">🎙</button>
-        <form id="say-form" class="say-form">
-          <input id="say" type="text" autocomplete="off"
-                 placeholder="Pay mom five hundred then buy Apple with the rest" />
-          <button type="submit" class="primary">Go</button>
-        </form>
+    <div class="device">
+      <div class="island" aria-hidden="true"></div>
+      <div class="screen">
+        <div class="statusbar" aria-hidden="true">
+          <span id="clock">9:41</span>
+          <span class="sb-icons">
+            <svg width="17" height="11" viewBox="0 0 17 11"><rect x="0" y="7" width="3" height="4" rx="1"/><rect x="4.5" y="5" width="3" height="6" rx="1"/><rect x="9" y="2.5" width="3" height="8.5" rx="1"/><rect x="13.5" y="0" width="3" height="11" rx="1"/></svg>
+            <svg width="15" height="11" viewBox="0 0 15 11"><path d="M7.5 2.2c2 0 3.9.8 5.3 2.1l1.1-1.1A9 9 0 0 0 7.5.6 9 9 0 0 0 1.1 3.2l1.1 1.1a7.5 7.5 0 0 1 5.3-2.1Zm0 3.2c1.1 0 2.2.4 3 1.2l1.1-1.1a6 6 0 0 0-8.2 0l1.1 1.1c.8-.8 1.9-1.2 3-1.2Zm0 3.2c-.4 0-.8.2-1.1.5L7.5 10.2l1.1-1.1c-.3-.3-.7-.5-1.1-.5Z"/></svg>
+            <svg width="25" height="12" viewBox="0 0 25 12"><rect x=".5" y=".5" width="21" height="11" rx="3" fill="none" stroke="currentColor" opacity=".45"/><rect x="2" y="2" width="16" height="8" rx="1.6"/><rect x="22.5" y="4" width="1.8" height="4" rx=".9" opacity=".45"/></svg>
+          </span>
+        </div>
+
+        <header class="appbar">
+          <div class="avatar" aria-hidden="true">
+            <svg width="20" height="20" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9L12 2Zm6.5 11l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6Z"/></svg>
+          </div>
+          <div class="who">
+            <p class="name">DCTA Assistant</p>
+            <p class="sub"><span class="dot"></span>Drafts only · you approve every payment</p>
+          </div>
+          <div class="shield" title="Every payment needs your biometric">
+            <svg width="20" height="20" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M12 3l7 3v5.5c0 4.3-2.9 7.9-7 9.5-4.1-1.6-7-5.2-7-9.5V6l7-3Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8.8 12.2l2.2 2.2 4.3-4.6"/></svg>
+          </div>
+        </header>
+
+        <!-- The conversation. Every value from the server is set with
+             textContent (never innerHTML), and a payment is rendered as a
+             FIXED-TEMPLATE card from the ResolvedPlan JSON — never from
+             LLM-generated text (brief 4.2). -->
+        <main id="thread" class="thread" aria-live="polite">
+          <!-- Registration (mock session = u_alice). A passkey is device-bound;
+               do this live as part of the demo (brief 10). -->
+          <section id="register" class="msg bot" hidden>
+            <div class="bubble card onboard">
+              <p class="card-title">Set up your passkey</p>
+              <p>Every payment I draft needs your fingerprint or face before it
+                can move money. Register this device once to get started.</p>
+              <button id="register-btn" class="btn primary">Register passkey</button>
+            </div>
+          </section>
+
+          <!-- showResult() renders into #result. It lives in the static HTML so
+               it exists before any draft (tests/test_overlay_xss.py). -->
+          <section id="result" class="result" hidden></section>
+        </main>
+
+        <!-- Say it, or type it. Voice has three tiers (Tencent ASR -> Web
+             Speech API -> this text box). The text box is ALWAYS present: if
+             the room beats the microphone on stage, you type the same sentence
+             and the demo continues (brief §5). -->
+        <footer id="say-box" class="composer" hidden>
+          <p id="status" class="status" hidden></p>
+          <form id="say-form" class="say-form">
+            <button id="mic" class="mic" type="button" title="Speak">
+              <svg width="20" height="20" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+            </button>
+            <input id="say" type="text" autocomplete="off" enterkeyhint="send"
+                   placeholder="Pay, invest, or edit a contact…" />
+            <button type="submit" class="send" title="Send">
+              <svg width="18" height="18" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+          </form>
+        </footer>
+        <div class="homebar" aria-hidden="true"></div>
       </div>
-      <p id="status" class="status" hidden></p>
-    </section>
-
-    <!-- One short question at a time, voice-first (brief §5.3). Choice buttons
-         appear only for a 2+ disambiguation; the resolver re-validates the
-         chosen id against a fresh deterministic match. -->
-    <section id="clarify" class="clarify" hidden></section>
-
-    <!-- The confirmation overlay. Renders from the ResolvedPlan JSON via a
-         FIXED template (brief 4.2): known fields -> fixed labels. It NEVER
-         displays LLM-generated text as the transaction summary. As of M7 the
-         plan comes from the real pipeline: parse -> resolve -> validate. -->
-    <section id="plan" class="plan" hidden>
-      <h2>Confirm this transaction</h2>
-      <div id="legs"></div>
-      <dl class="meta">
-        <dt>Authorization window</dt><dd id="window"></dd>
-        <dt>Transcript hash</dt><dd id="txhash" class="mono"></dd>
-        <dt>Payload hash <small>(recomputed in your browser)</small></dt>
-        <dd id="phash" class="mono"></dd>
-      </dl>
-      <button id="sign" class="primary" disabled>Confirm with biometric</button>
-      <p class="hint">Your device signs a blind hash of this exact payload. The
-      browser recomputes that hash itself, so what you see is what you sign.</p>
-    </section>
-
-    <!-- Registration (mock session = u_alice). A passkey is device-bound; do this
-      live as part of the demo (brief 10). -->
-    <section id="register" class="register" hidden>
-      <h2>Register a passkey</h2>
-      <p>No passkey registered for this demo session (u_alice) yet. Enroll a
-      platform authenticator to confirm transactions.</p>
-      <button id="register-btn" class="primary">Register passkey</button>
-    </section>
-
-    <section id="result" class="result" hidden></section>
-
-    <p id="err" class="err" hidden></p>
-  </main>
+    </div>
+  </div>
 
   <script src="/static/canonical.js"></script>
   <script src="/static/voice.js"></script>

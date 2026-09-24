@@ -29,6 +29,7 @@ TRUST BOUNDARY (enforced by tests/test_import_boundary.py):
 Deterministic means deterministic: no path from a risk decision to the LLM.
 """
 from backend.policy.context import load_context, owner_of
+from backend.policy.contacts import contact_change_step_up
 from backend.policy.engine import (
     ANOMALY_MULTIPLE,
     Decision,
@@ -44,6 +45,7 @@ from backend.policy.engine import (
 )
 
 __all__ = [
+    "contact_change_step_up",
     "ANOMALY_MULTIPLE", "Decision", "PolicyContext", "PolicyResult", "Verdict",
     "check_anomaly", "check_daily", "check_kyc", "check_per_transaction",
     "check_velocity", "evaluate", "load_context", "owner_of",

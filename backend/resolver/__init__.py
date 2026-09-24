@@ -381,7 +381,7 @@ def _resolve_leg(
     if balances[source_acct] < debit:
         return Clarify(
             question=(
-                f"Your account only has {cents_to_display(balances[source_acct])} — "
+                f"Your account only has ${cents_to_display(balances[source_acct])} — "
                 "a smaller amount, or a different account?"
             ),
             field=f"{leg.id}.amount",

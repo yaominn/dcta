@@ -31,6 +31,8 @@ class StubProvider:
     def complete(self, *, system: str, user: str) -> str:
         transcript = _extract_transcript(user)
         context = _extract_context(user)
+        if system == prompts.contact_system_prompt():
+            return json.dumps(_rules_contact_edit(transcript, context))
         plan = _rules_plan(transcript, context)
         return json.dumps(plan)
 
@@ -40,7 +42,9 @@ def _extract_transcript(user_prompt: str) -> str:
     """Lift the verbatim transcript out of the prompt (a real model just reads
     it; the stub needs it as a string)."""
     after = user_prompt.split(prompts.TRANSCRIPT_MARKER, 1)[1]
-    return after.split(prompts.OUTPUT_FOOTER, 1)[0].strip()
+    for footer in (prompts.OUTPUT_FOOTER, prompts.CONTACT_OUTPUT_FOOTER):
+        after = after.split(footer, 1)[0]
+    return after.strip()
 
 
 def _extract_context(user_prompt: str) -> dict:
@@ -246,3 +250,46 @@ def _rules_plan(transcript: str, context: dict) -> dict:
     if not legs and not unresolved:
         unresolved.append(f"could not understand: {transcript!r}")
     return {"plan": legs, "unresolved": unresolved}
+
+
+# --------------------------------------------------------------------------- contact edits
+# "rename John to Johnny", "change mom's number to 9123 4567",
+# "update the phone number for landlord to +65 6123 0000". The new value is
+# copied VERBATIM: normalising or validating a phone number is the resolver's
+# job (deterministic code), not the parser's.
+_C_FIELD = r"(?P<field>nick\s?name|name|phone(?:\s+number)?|mobile(?:\s+number)?|number|contact\s+number|handphone)"
+_C_VERB = r"(?:please\s+)?(?:change|update|set|edit|correct|fix|make)"
+_C_PATTERNS = [
+    # rename <who> to/as <value>
+    (re.compile(r"^(?:please\s+)?rename\s+(?P<who>.+?)\s+(?:to|as)\s+(?P<val>.+)$", re.I), "nickname"),
+    # change <who>'s <field> to <value>
+    (re.compile(_C_VERB + r"\s+(?:the\s+)?(?P<who>.+?)(?:'s|\u2019s|s')\s+" + _C_FIELD
+                + r"\s+(?:to|as|into)\s+(?P<val>.+)$", re.I), None),
+    # change the <field> of/for <who> to <value>
+    (re.compile(_C_VERB + r"\s+(?:the\s+)?" + _C_FIELD + r"\s+(?:of|for)\s+(?P<who>.+?)"
+                + r"\s+(?:to|as|into)\s+(?P<val>.+)$", re.I), None),
+]
+
+
+def _rules_contact_edit(transcript: str, context: dict) -> dict:
+    nicknames = [p["nickname"] for p in context.get("payees", [])]
+    edits: list[dict] = []
+    unresolved: list[str] = []
+    for clause in re.split(r"\bthen\b|;", transcript, flags=re.I):
+        clause = clause.strip().rstrip(".!?").strip()
+        if not clause:
+            continue
+        for pat, fixed_field in _C_PATTERNS:
+            m = pat.search(clause)
+            if not m:
+                continue
+            field_word = fixed_field or m.group("field").lower()
+            field = "nickname" if "name" in field_word and "number" not in field_word else "phone"
+            who = m.group("who").strip()
+            who = _find_mention(who, nicknames) or who     # the user's words, never an id
+            val = m.group("val").strip().strip("\"'\u201c\u201d")
+            edits.append({"target": {"mention": who}, "field": field, "new_value": val[:64]})
+            break
+        else:
+            unresolved.append(f"could not tell what to change in: {clause!r}")
+    return {"edits": edits, "unresolved": unresolved}

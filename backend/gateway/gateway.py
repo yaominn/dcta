@@ -17,6 +17,9 @@ submit() verifies, in order:
                 payload would otherwise bypass every limit, which would make the
                 policy engine advisory. The gateway is the one place funds pass
                 through, so it is the one place a limit can be a limit.
+                A plan policy ESCALATES (anomaly) additionally needs an
+                out-of-band confirmation of this exact payload (stepup.py);
+                without one it is rejected CONFIRMATION, not executed.
   5. execute  — on the mock ledger, marking later legs BLOCKED on first failure
 
 Every step is logged to the hash-chained audit log. A request with an expired
@@ -32,10 +35,13 @@ from backend.audit.canonical import payload_hash, challenge_hash
 from backend.audit.log import AuditLog, AuditEntryType
 from backend.gateway.nonce import NonceStore, NonceError
 from backend.gateway.signer import MockSigner
+from backend.gateway.stepup import StepUpStore
 from backend.gateway.executor import MockExecutor
 from backend.auth.credentials import MockCredentialStore
+from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
-from backend.policy import evaluate, load_context, owner_of
+from backend.policy import (Decision, contact_change_step_up, evaluate,
+                            load_context, owner_of)
 
 
 class Gateway:
@@ -48,6 +54,7 @@ class Gateway:
         executor: MockExecutor,
         credentials: MockCredentialStore,
         policy_db_path=None,
+        step_up: StepUpStore | None = None,
     ):
         self.signer = signer
         self.nonce_store = nonce_store
@@ -58,6 +65,9 @@ class Gateway:
         # used only by the M1 gateway unit tests, which predate M5 and exercise
         # the signature matrix in isolation. main.py always wires it.
         self.policy_db_path = policy_db_path
+        # Where out-of-band confirmations are recorded. None means none can
+        # exist, so an escalated plan is always refused — the closed direction.
+        self.step_up = step_up
 
     def submit(
         self,
@@ -115,9 +125,18 @@ class Gateway:
             if verdicts.blocked:
                 return self._reject(draft_id, p_hash, "POLICY",
                                     "; ".join(verdicts.reasons()))
+            if (verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION
+                    and not (self.step_up is not None
+                             and self.step_up.is_confirmed(draft_id, p_hash))):
+                return self._reject(draft_id, p_hash, "CONFIRMATION",
+                                    "this payment needs an out-of-band "
+                                    "confirmation first: "
+                                    + "; ".join(verdicts.reasons()))
 
         # 5. execute on the mock ledger.
         result = self.executor.execute(resolved_plan)
+        if self.step_up is not None:
+            self.step_up.consume(draft_id)
         self.audit.append(
             AuditEntryType.EXECUTION,
             {
@@ -129,6 +148,60 @@ class Gateway:
         )
         return {"accepted": True, "draft_id": draft_id,
                 "payload_hash": p_hash, "execution": result}
+
+    def submit_contact_change(
+        self,
+        change: ResolvedContactChange,
+        signature: str | None,
+        nonce: str,
+        credential_id: str,
+    ) -> dict:
+        """The same chokepoint for a contact edit: expiry -> nonce -> signature
+        -> step-up (a phone change) -> apply -> audit. A contact's details are
+        written nowhere else, so a rename or a number change needs the user's
+        signature over exactly this change, however the request arrived."""
+        draft_id = change.draft_id
+        p_hash = payload_hash(change)
+        challenge = challenge_hash(p_hash, nonce)
+
+        now = int(time.time())
+        if now > change.expires_at:
+            return self._reject(draft_id, p_hash, "EXPIRED",
+                                f"payload expired at {change.expires_at}, now {now}")
+        try:
+            self.nonce_store.consume(nonce, draft_id)
+        except NonceError as exc:
+            return self._reject(draft_id, p_hash, "NONCE", str(exc))
+        pubkey = self.credentials.get(credential_id)
+        if pubkey is None:
+            return self._reject(draft_id, p_hash, "SIGNATURE", "unknown credential")
+        if not signature:
+            return self._reject(draft_id, p_hash, "SIGNATURE", "missing signature")
+        if not self.signer.verify(pubkey, signature, challenge):
+            return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
+
+        # Re-derived HERE from the payload, not taken from the draft store: a
+        # hand-assembled phone change needs the out-of-band code too.
+        reasons = contact_change_step_up(change)
+        if reasons and not (self.step_up is not None
+                            and self.step_up.is_confirmed(draft_id, p_hash)):
+            return self._reject(draft_id, p_hash, "CONFIRMATION",
+                                "this change needs an out-of-band confirmation "
+                                "first: " + " ".join(reasons))
+
+        result = self.executor.apply_contact_change(change)
+        if self.step_up is not None and reasons:
+            self.step_up.consume(draft_id)
+        self.audit.append(AuditEntryType.CONTACT_UPDATE, {
+            "draft_id": draft_id, "payload_hash": p_hash, "outcome": result["status"],
+            # payee ids and fields only: the audit chain is append-only and hard
+            # to redact, so the phone numbers themselves are not copied into it.
+            "edits": [{"payee_id": e.payee_id, "field": e.field} for e in change.edits],
+        })
+        return {"accepted": result["status"] == "UPDATED", "draft_id": draft_id,
+                "payload_hash": p_hash, "execution": result,
+                **({} if result["status"] == "UPDATED"
+                   else {"rejection": "FAILED", "reason": result["error"]})}
 
     def _reject(self, draft_id: str, p_hash: str, kind: str, reason: str) -> dict:
         self.audit.append(
