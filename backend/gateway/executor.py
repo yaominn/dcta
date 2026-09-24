@@ -8,8 +8,18 @@ legs BLOCKED. For M1 we exercise TRANSFER / PAY_BILL / BUY_EQUITY against the
 seeded ledger; amounts are already concrete (the resolver lands in M4), so the
 executor does no arithmetic — it only debits the resolved cents. All money is
 int cents; no float(), no round() — integers need neither.
+
+M5: an executed TRANSFER now appends a row to transaction_history. Until then
+only seed.py ever wrote that table, so the daily-limit total and the velocity
+count could never advance from an actual payment — a $20,000 daily cap that
+executed transactions did not count against. PAY_BILL and BUY_EQUITY cannot be
+recorded there: transaction_history.payee_id is NOT NULL and foreign-keys to
+payees, so the table can only represent transfers. Stated, not silently
+skipped.
 """
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 from backend.data.db import DB_PATH, connect
 from backend.models.schemas import ResolvedPlan
@@ -31,6 +41,7 @@ class MockExecutor:
                 try:
                     if leg.type == "TRANSFER":
                         self._debit(conn, leg.source_account, leg.amount_cents)
+                        self._record_transfer(conn, leg)
                         # MOCK: external payee credit not modeled in the seed ledger.
                     elif leg.type == "PAY_BILL":
                         self._debit(conn, leg.source_account, leg.amount_cents)
@@ -50,6 +61,21 @@ class MockExecutor:
             conn.close()
         return {"draft_id": plan.draft_id, "legs": results,
                 "status": "FAILED" if aborted else "EXECUTED"}
+
+    def _record_transfer(self, conn, leg) -> None:
+        """Append the executed transfer to transaction_history, so the M5 daily
+        and velocity rules see payments that actually happened. The user is read
+        from the debited account rather than taken on trust."""
+        row = conn.execute("SELECT user_id FROM accounts WHERE id=?",
+                           (leg.source_account,)).fetchone()
+        if row is None:  # pragma: no cover - _debit already raised
+            return
+        conn.execute(
+            "INSERT INTO transaction_history (user_id, payee_id, amount, ts) "
+            "VALUES (?,?,?,?)",
+            (row["user_id"], leg.payee_id, leg.amount_cents,
+             datetime.now(timezone.utc).isoformat()),
+        )
 
     def _debit(self, conn, account_id: str, amount_cents: int) -> None:
         row = conn.execute("SELECT balance FROM accounts WHERE id=?", (account_id,)).fetchone()

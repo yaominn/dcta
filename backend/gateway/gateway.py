@@ -11,7 +11,13 @@ submit() verifies, in order:
                 consent expiring — not server-side bookkeeping.
   2. nonce    — draft-bound, fresh, single-use (swap-after-approval & replay blocked)
   3. signature — over the canonical challenge hash, against a registered public key
-  4. execute  — on the mock ledger, marking later legs BLOCKED on first failure
+  4. policy   — M5: KYC, limits, velocity, anomaly, re-evaluated HERE against the
+                ledger. Checking policy before the overlay is UX; checking it
+                here is enforcement. A caller who assembled or replayed a signed
+                payload would otherwise bypass every limit, which would make the
+                policy engine advisory. The gateway is the one place funds pass
+                through, so it is the one place a limit can be a limit.
+  5. execute  — on the mock ledger, marking later legs BLOCKED on first failure
 
 Every step is logged to the hash-chained audit log. A request with an expired
 payload, a missing or bad signature, or a replayed/swapped nonce is REJECTED and
@@ -29,6 +35,7 @@ from backend.gateway.signer import MockSigner
 from backend.gateway.executor import MockExecutor
 from backend.auth.credentials import MockCredentialStore
 from backend.models.schemas import ResolvedPlan
+from backend.policy import evaluate, load_context, owner_of
 
 
 class Gateway:
@@ -40,12 +47,17 @@ class Gateway:
         audit: AuditLog,
         executor: MockExecutor,
         credentials: MockCredentialStore,
+        policy_db_path=None,
     ):
         self.signer = signer
         self.nonce_store = nonce_store
         self.audit = audit
         self.executor = executor
         self.credentials = credentials
+        # The ledger policy is evaluated against. None disables the re-check —
+        # used only by the M1 gateway unit tests, which predate M5 and exercise
+        # the signature matrix in isolation. main.py always wires it.
+        self.policy_db_path = policy_db_path
 
     def submit(
         self,
@@ -85,7 +97,26 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
 
-        # 4. execute on the mock ledger.
+        # 4. policy — re-evaluated at the chokepoint (M5). The owner is derived
+        #    from the ACCOUNT ROWS being debited, never from a field in the
+        #    request, so a caller cannot nominate whose limits apply to them.
+        if self.policy_db_path is not None:
+            owner = owner_of(resolved_plan, db_path=self.policy_db_path)
+            if owner is None:
+                return self._reject(draft_id, p_hash, "POLICY",
+                                    "cannot determine the owner of the accounts "
+                                    "this plan debits")
+            verdicts = evaluate(
+                resolved_plan,
+                load_context(owner, db_path=self.policy_db_path),
+            )
+            self.audit.append(AuditEntryType.POLICY,
+                              verdicts.to_audit_payload(draft_id))
+            if verdicts.blocked:
+                return self._reject(draft_id, p_hash, "POLICY",
+                                    "; ".join(verdicts.reasons()))
+
+        # 5. execute on the mock ledger.
         result = self.executor.execute(resolved_plan)
         self.audit.append(
             AuditEntryType.EXECUTION,

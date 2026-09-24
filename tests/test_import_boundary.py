@@ -8,6 +8,8 @@ Walks the module import graph and enforces every trust boundary:
   - any module under backend/resolver/ that transitively imports backend/agent/
     is a violation (M4) — the resolver is deterministic by definition and must
     not reach the LLM side.
+  - any module under backend/policy/ that transitively imports backend/agent/
+    is a violation (M5) — a risk decision must have no path to the LLM.
 
 Pure static AST analysis (no modules imported/executed, so no side effects).
 Runs in CI.
@@ -19,7 +21,8 @@ Real tests, not a trivially-green stub:
      flagged                                                              follows edges)
   4. a planted resolver->agent forbidden import is flagged (M4)         (proves the new
                                                                          boundary catches)
-  5. clean agent->resolver and resolver->data imports stay green        (proves it doesn't
+  5. a planted policy->agent forbidden import is flagged (M5)           (same, for policy)
+  6. clean agent->resolver and resolver->data imports stay green        (proves it doesn't
                                                                          false-fire)
 """
 from __future__ import annotations
@@ -41,6 +44,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BOUNDARIES = [
     ("backend.agent", ("backend.gateway", "backend.auth")),
     ("backend.resolver", ("backend.agent",)),
+    ("backend.policy", ("backend.agent",)),
 ]
 
 
@@ -227,5 +231,38 @@ def test_agent_importing_resolver_is_allowed(tmp_path):
         "backend/agent/__init__.py": "",
         "backend/agent/clean.py": "import backend.resolver\n",
         "backend/resolver/__init__.py": "",
+    })
+    assert find_violations(root) == []
+
+
+def test_planted_policy_agent_violation_is_flagged(tmp_path):
+    """M5: the policy engine must not reach the agent. A risk decision that could
+    consult the LLM is not a deterministic risk decision. Proves the boundary
+    catches, so "no LLM in policy/" is CI-checked rather than asserted."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/agent/__init__.py": "",
+        "backend/policy/__init__.py": "",
+        "backend/policy/evil.py": "from backend.agent import parse_transcript\n",
+    })
+    v = find_violations(root)
+    assert any(
+        x["root"].startswith("backend.policy")
+        and x["reaches"].startswith("backend.agent")
+        for x in v
+    ), v
+
+
+def test_clean_policy_passes(tmp_path):
+    """policy -> data / models / display are all allowed; only agent is forbidden."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/policy/__init__.py": "",
+        "backend/policy/engine.py": "import backend.models.schemas\n",
+        "backend/policy/context.py": "import backend.data.db\n",
+        "backend/models/__init__.py": "",
+        "backend/models/schemas.py": "",
+        "backend/data/__init__.py": "",
+        "backend/data/db.py": "",
     })
     assert find_violations(root) == []
