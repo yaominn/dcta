@@ -167,6 +167,64 @@ company-name → ticker, `unresolved`-is-a-hint, empty plan → question with no
 clarify-resume round-trip and provenance tests proving `payee_display`/`biller_display`
 carry no legal name or injection text.
 
+## M6 — Independent validation agent
+
+`backend/validator/validate()` is a second, **read-only** audit of a resolved
+draft before the user ever sees it. It can freeze a transaction; it can never
+execute one. `tests/test_import_boundary.py` forbids `backend.validator` from
+reaching `backend.gateway` or `backend.auth`, so "read-only" is CI-checked
+rather than asserted.
+
+It takes three inputs — what the LLM said (`IntentPlan`), what the resolver
+produced (`ResolvedPlan`), and what the user said (transcript) — and runs them
+in order of authority:
+
+| check | kind | on mismatch |
+|---|---|---|
+| **transcript binding** — `hash_transcript(transcript)` vs `plan.transcript_hash` | exact | **freeze, short-circuit** |
+| amount — literal vs symbolic (see below) | exact | freeze |
+| beneficiary — resolved payee's DB nickname appears in the transcript | hard | freeze |
+| source account, asset class | lenient tripwire | record only |
+| LLM auditor, separate prompt | soft | record only |
+
+The binding check runs **first and short-circuits**: if the hashes disagree,
+every check below it is meaningless — we would be comparing a plan against an
+utterance it was not derived from, so a pass proves nothing and a fail is
+uninterpretable. The LLM half is skipped rather than asked.
+
+**Amounts split on literal vs symbolic**, which is why the `IntentPlan` is
+required. A literal (`{"literal_cents": 50000}`) must be derivable from the
+transcript by rule. A symbolic (`{"after_leg":"t1","op":"ALL"}`) is
+**independently recomputed** against the ledger — never text-matched, because
+772800 was computed from "the rest" and appears nowhere in what the user said.
+Text-matching it would flag every correct plan.
+
+**Freeze is a property, not a flag.** A frozen `draft_id` never receives a
+nonce at `/api/auth/nonce`, so no WebAuthn challenge can be built and the
+gateway rejects any submission. `FreezeSet` is a read-through cache over the
+**hash-chained audit log**, which is the source of truth: it rehydrates from
+the chain, so a restart inside the 300s authorization window does not unfreeze
+anything.
+
+Decisions stated up front (not hidden):
+
+- **A provider outage never freezes.** If the LLM half is unavailable the audit
+  entry records `llm_check: "unavailable"` and the deterministic result stands.
+  Freezing on an upstream blip would be a self-inflicted outage; silently
+  recording a pass that never ran would be worse.
+- **If the audit DB is unreadable at first boot, rehydrate fails OPEN** rather
+  than refusing every nonce, for the same reason. The authoritative freeze is
+  re-established by the next validation.
+- **The LLM half is unexercised.** With no Tencent credentials the provider is
+  the deterministic stub, so that path has never run against a real model.
+
+Tests (`pytest tests/test_validator.py tests/test_import_boundary.py`): the 8
+acceptance cases (clean plan passes; tampered literal amount, tampered
+beneficiary and wrong symbolic arithmetic each freeze; a symbolic amount absent
+from the transcript does **not** false-positive; LLM-unavailable does not
+freeze; the audit chain still verifies; a frozen draft is unsignable) plus the
+transcript-binding short-circuit and freeze-survives-restart cases.
+
 ## Architecture
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the pipeline and the
@@ -220,9 +278,9 @@ dcta/
 | 1 | Gateway + audit log first | done |
 | 2 | WebAuthn register + sign canonical payload | done |
 | 3 | LLM parser + schema + opaque IDs | done |
-| 4 | Resolver + clarify loop | **done (this commit)** |
-| 5 | Policy engine + KYC + velocity + anomaly | next |
-| 6 | Validation agent | |
+| 4 | Resolver + clarify loop | done |
+| 5 | Policy engine + KYC + velocity + anomaly | **next** |
+| 6 | Validation agent | done |
 | 7 | Voice I/O + confirmation overlay UI | |
 | 8 | Red-team demo + polish | |
 | 9 | Submission package | |
