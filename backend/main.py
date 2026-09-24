@@ -180,7 +180,8 @@ def headline_arithmetic():
 
 _signer = MockSigner()
 _credentials = MockCredentialStore()
-_credentials.register("cred_alice", _signer.public_key)   # MOCK demo credential
+_credentials.register("cred_alice", _signer.public_key,   # MOCK demo credential
+                      user_id="u_alice")                   # == DEMO_USER_ID, defined below
 
 
 # The three routes below that use _signer/_gateway are the MOCK path: a
@@ -335,6 +336,7 @@ def gateway_execute(req: ExecuteRequest):
 def _traced_gateway(draft_id: str, path: str, out: dict) -> dict:
     _traces.event(draft_id, "gateway", path=path, accepted=out.get("accepted"),
                   rejection=out.get("rejection"), reason=out.get("reason"),
+                  ownership=out.get("ownership"),
                   execution=out.get("execution"), payload_hash=out.get("payload_hash"))
     return out
 
