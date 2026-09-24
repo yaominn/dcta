@@ -11,11 +11,6 @@ python-dotenv>=1.0
 # --- Tencent Cloud (real services, wired in M3/M7; stubs used until then) ---
 tencentcloud-sdk-python>=3.0
 
-# --- OpenAI (alternative LLM provider; see LLM_PROVIDER in .env.example) ---
-# Hunyuan remains the preferred provider for the judged "use of AI tools"
-# dimension; this unblocks development while Tencent access is pending.
-openai>=1.40
-
 # --- Auth (transaction signing) — needed in M2, listed for visibility ---
 # NOTE: the Duo library is `py_webauthn` on GitHub but publishes to PyPI as `webauthn`.
 # `py_webauthn` on PyPI is a different abandoned package capped at 0.0.6.

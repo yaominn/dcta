@@ -1,7 +1,7 @@
 """
 Swappable LLM provider interface. (brief Section 8)
 
-The parser talks to a LLMProvider — two methods' worth of surface — so the
+The parser talks to a LLMProvider — one method's worth of surface — so the
 model can be swapped without touching the pipeline. The deterministic stub is
 the fallback so local dev, CI and the security test-suite never need network
 or keys.
@@ -10,11 +10,11 @@ Selection is config-driven ONLY: no code edit to swap, and credentials come
 from the environment via backend.config — never hardcoded (brief Section 8 /
 README credentials section).
 
-LLM_PROVIDER pins a provider explicitly ("hunyuan" | "openai" | "stub").
-Unset, or "auto", picks by available credentials with Hunyuan FIRST: the
-hackathon judges "use of AI tools" and the tracks are built on Tencent Cloud
-services, so the Tencent path wins whenever it is available. OpenAI exists so
-development is not blocked while Hunyuan access is pending.
+LLM_PROVIDER pins a provider explicitly ("hunyuan" | "stub"). Unset, or
+"auto", picks by whether Tencent credentials exist. Pinning "hunyuan" is
+worth knowing about: it makes a missing or broken key fail LOUDLY instead of
+silently falling back to the stub, which would look exactly like the model
+working during a demo.
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ class UnknownProvider(ValueError):
 
 
 def get_provider(settings) -> LLMProvider:
-    """Explicit LLM_PROVIDER if set, else credentials-driven with Hunyuan first."""
+    """Explicit LLM_PROVIDER if set, else Hunyuan when credentials exist."""
     choice = (getattr(settings, "llm_provider", "") or "auto").strip().lower()
 
     if choice == "stub":
@@ -43,20 +43,12 @@ def get_provider(settings) -> LLMProvider:
     if choice == "hunyuan":
         from backend.agent.hunyuan import HunyuanProvider  # local: stub mode stays SDK-light
         return HunyuanProvider(settings)
-    if choice == "openai":
-        from backend.agent.openai_provider import OpenAIProvider
-        return OpenAIProvider(settings)
     if choice != "auto":
         raise UnknownProvider(
-            f"LLM_PROVIDER={choice!r} is not a provider "
-            "(expected 'hunyuan', 'openai', 'stub' or 'auto')"
+            f"LLM_PROVIDER={choice!r} is not a provider (expected 'hunyuan', 'stub' or 'auto')"
         )
 
-    # auto: Tencent first — it is the judged path — then OpenAI, then the stub.
     if settings.has_credentials:
         from backend.agent.hunyuan import HunyuanProvider
         return HunyuanProvider(settings)
-    if settings.has_openai_credentials:
-        from backend.agent.openai_provider import OpenAIProvider
-        return OpenAIProvider(settings)
     return StubProvider()

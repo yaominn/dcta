@@ -68,19 +68,17 @@ pytest -q
 The LLM parser (M3) runs on a deterministic stub provider until credentials
 exist, so local dev, CI and the security tests need no keys and no network.
 
-**Three providers, selected by config — never by a code edit:**
+**Selected by config — never by a code edit:**
 
 | `LLM_PROVIDER` | Uses | When |
 |---|---|---|
-| `auto` (default) | Hunyuan → OpenAI → stub | picks by which credentials exist |
-| `hunyuan` | Tencent Hunyuan | the submission path |
-| `openai` | OpenAI GPT | while Tencent access is pending |
+| `auto` (default) | Hunyuan when credentials exist, else stub | normal use |
+| `hunyuan` | Tencent Hunyuan | pins the real model |
 | `stub` | deterministic rules | CI, tests, offline dev |
 
-`auto` prefers **Hunyuan whenever its credentials exist**, even if an OpenAI
-key is also present: the hackathon judges "use of AI tools" and the tracks are
-built on Tencent Cloud services, so the Tencent path is the one that should
-win by default. OpenAI exists so the build is not blocked waiting on access.
+Pinning `hunyuan` is worth knowing about for the demo: it makes a missing or
+broken key **fail loudly**, instead of silently falling back to the stub —
+which would look exactly like the model working.
 
 Whichever provider runs, the schema constraint is enforced **on our side** —
 generate → validate against the frozen Pydantic schema → retry, bounded. A

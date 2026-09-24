@@ -4,10 +4,9 @@ Provider selection + provider-failure handling.
 Two things are pinned here, neither needing a network or a key:
 
 1. Which provider get_provider() returns, for every combination of explicit
-   LLM_PROVIDER and available credentials. Hunyuan wins `auto` whenever its
-   credentials exist — the hackathon judges "use of AI tools" and the tracks
-   are built on Tencent Cloud services. OpenAI exists so development is not
-   blocked while that access is pending.
+   LLM_PROVIDER and available credentials. Pinning "hunyuan" matters for the
+   demo: a missing key must fail loudly rather than silently serving stub
+   output, which would look exactly like the model working.
 
 2. That a provider FAILURE is retried and then reported as an upstream problem
    (502), never as a bad plan (422) and never as an unhandled 500. Previously
@@ -25,11 +24,9 @@ from backend.agent.stub import StubProvider
 
 class _Settings:
     """Minimal stand-in for backend.config.Settings."""
-    def __init__(self, *, tencent=False, openai=False, provider="auto"):
+    def __init__(self, *, tencent=False, provider="auto"):
         self.tencent_secret_id = "id" if tencent else ""
         self.tencent_secret_key = "key" if tencent else ""
-        self.openai_api_key = "sk-test" if openai else ""
-        self.openai_model = "gpt-4o-mini"
         self.hunyuan_model = "hunyuan-functioncall"
         self.hunyuan_region = "ap-guangzhou"
         self.llm_provider = provider
@@ -40,31 +37,32 @@ class _Settings:
     def has_credentials(self):
         return bool(self.tencent_secret_id and self.tencent_secret_key)
 
-    @property
-    def has_openai_credentials(self):
-        return bool(self.openai_api_key)
-
 
 # --------------------------------------------------------------------------- selection
-@pytest.mark.parametrize("tencent,openai,expected", [
-    (False, False, "stub"),      # no keys at all -> deterministic stub
-    (True,  False, "hunyuan"),
-    (False, True,  "openai"),
-    (True,  True,  "hunyuan"),   # BOTH present -> Tencent wins (judged dimension)
+@pytest.mark.parametrize("tencent,expected", [
+    (False, "stub"),      # no credentials -> deterministic stub
+    (True,  "hunyuan"),
 ])
-def test_auto_selection_prefers_hunyuan(tencent, openai, expected):
-    assert get_provider(_Settings(tencent=tencent, openai=openai)).name == expected
+def test_auto_selection_follows_credentials(tencent, expected):
+    assert get_provider(_Settings(tencent=tencent)).name == expected
 
 
-@pytest.mark.parametrize("pinned", ["stub", "hunyuan", "openai"])
+@pytest.mark.parametrize("pinned", ["stub", "hunyuan"])
 def test_explicit_provider_overrides_credentials(pinned):
-    """LLM_PROVIDER pins the choice even when other credentials are present."""
-    s = _Settings(tencent=True, openai=True, provider=pinned)
-    assert get_provider(s).name == pinned
+    """LLM_PROVIDER pins the choice regardless of which credentials exist."""
+    assert get_provider(_Settings(tencent=True, provider=pinned)).name == pinned
 
 
 def test_explicit_provider_is_case_and_space_insensitive():
-    assert get_provider(_Settings(openai=True, provider="  OpenAI ")).name == "openai"
+    assert get_provider(_Settings(tencent=True, provider="  Hunyuan ")).name == "hunyuan"
+
+
+def test_pinned_hunyuan_without_credentials_does_not_fall_back_to_stub():
+    """The demo-safety property: pinning hunyuan with no key must NOT quietly
+    serve stub output. Selection still succeeds (construction needs no SDK or
+    network); the failure surfaces at call time as a ProviderError -> 502,
+    rather than as plausible-looking stub plans."""
+    assert get_provider(_Settings(tencent=False, provider="hunyuan")).name == "hunyuan"
 
 
 def test_unknown_provider_name_is_rejected():
@@ -72,12 +70,12 @@ def test_unknown_provider_name_is_rejected():
     stub — silently serving stub output in live mode would look like the model
     working while it is not running at all."""
     with pytest.raises(UnknownProvider):
-        get_provider(_Settings(openai=True, provider="gpt4"))
+        get_provider(_Settings(tencent=True, provider="gpt4"))
 
 
 def test_selection_never_imports_an_sdk():
-    """Selecting the stub must not require the Tencent or OpenAI SDKs — CI and
-    the security suite run without either configured."""
+    """Selecting the stub must not require the Tencent SDK — CI and the
+    security suite run without credentials configured."""
     assert isinstance(get_provider(_Settings()), StubProvider)
 
 
