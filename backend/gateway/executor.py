@@ -22,7 +22,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from backend.data.db import DB_PATH, connect
+from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
+
+# Contact fields a signed change may write -> their column. A fixed map, so a
+# column name never comes from a payload.
+_CONTACT_COLUMNS = {"nickname": "nickname", "phone": "phone"}
 
 
 class MockExecutor:
@@ -63,6 +68,35 @@ class MockExecutor:
             conn.close()
         return {"draft_id": plan.draft_id, "legs": results,
                 "status": "FAILED" if aborted else "EXECUTED"}
+
+    def apply_contact_change(self, change: ResolvedContactChange) -> dict:
+        """Write a signed contact change. All edits or none.
+
+        Each UPDATE is conditional on the stored value still being the OLD value
+        the user saw and signed. If it changed since (another edit, another
+        device), nothing is written: the user approved "X -> Y", not "whatever
+        it is now -> Y"."""
+        conn = connect(self.db_path)
+        results = []
+        try:
+            for e in change.edits:
+                col = _CONTACT_COLUMNS[e.field]
+                cur = conn.execute(
+                    f"UPDATE payees SET {col}=? WHERE id=? AND COALESCE({col}, '')=?",
+                    (e.new_value, e.payee_id, e.old_value))
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return {"draft_id": change.draft_id, "status": "FAILED",
+                            "error": f"{e.payee_display}'s {e.field} changed since this "
+                                     "draft was made — nothing was updated",
+                            "changes": []}
+                results.append({"payee_display": e.payee_display, "field": e.field,
+                                "old_value": e.old_value, "new_value": e.new_value,
+                                "status": "UPDATED"})
+            conn.commit()
+        finally:
+            conn.close()
+        return {"draft_id": change.draft_id, "status": "UPDATED", "changes": results}
 
     def _record_leg(self, conn, leg) -> None:
         """Append EVERY executed leg to transaction_history, so the M5 daily and

@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DCTA Request Trace</title>
+  <!-- MOCK / demo: shows, per request, the exact prompt sent to the LLM, its
+       raw reply, and what every deterministic step did next. Would not exist
+       in a deployment (it shows transcripts). Every value is set with
+       textContent — prompts and replies are displayed, never parsed as HTML. -->
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    body { display: block; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+    .top { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+    .top h1 { margin: 4px 0 6px; font-size: 26px; letter-spacing: -.3px; }
+    .top p { margin: 0; color: var(--muted); max-width: 620px; }
+    .brand { margin: 0; font-weight: 800; letter-spacing: 2px; color: var(--accent); font-size: 13px; }
+    .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 5px 10px;
+            border-radius: 999px; background: var(--surface); border: 1px solid var(--line); color: var(--muted); }
+    .pill .live { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }
+    .legend { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12px; color: var(--muted); margin: 0 0 18px; }
+    .actor { display: inline-block; font-size: 10px; font-weight: 800; letter-spacing: .7px; padding: 2px 7px;
+           border-radius: 6px; vertical-align: 1px; }
+    .actor.llm { background: #efe7ff; color: #6d28d9; }
+    .actor.code { background: var(--surface-2); color: var(--muted); }
+    .actor.you { background: var(--accent-soft); color: var(--accent); }
+    @media (prefers-color-scheme: dark) { .actor.llm { background: #2a1f4d; color: #c4b5fd; } }
+
+    .req { background: var(--surface); border: 1px solid var(--line); border-radius: 16px;
+           margin: 0 0 12px; box-shadow: var(--shadow); overflow: hidden; }
+    .req > summary { list-style: none; cursor: pointer; padding: 14px 16px; display: grid;
+                     grid-template-columns: 1fr auto; gap: 4px 12px; align-items: center; }
+    .req > summary::-webkit-details-marker { display: none; }
+    .req .said { font-weight: 600; font-size: 15px; }
+    .req .said::before { content: "“"; color: var(--muted); }
+    .req .said::after { content: "”"; color: var(--muted); }
+    .req .sub { font-size: 12px; color: var(--muted); }
+    .outcome { font-size: 11px; font-weight: 800; letter-spacing: .6px; padding: 4px 9px; border-radius: 8px;
+               grid-row: span 2; background: var(--surface-2); color: var(--muted); }
+    .outcome.ok { background: var(--ok-soft); color: var(--ok); }
+    .outcome.bad { background: var(--bad-soft); color: var(--bad); }
+    .outcome.wait { background: var(--warn-soft); color: var(--warn); }
+
+    .steps { border-top: 1px solid var(--line); padding: 6px 16px 14px; }
+    .step { display: grid; grid-template-columns: 22px 1fr; gap: 0 10px; padding: 10px 0; border-top: 1px dashed var(--line); }
+    .step:first-child { border-top: 0; }
+    .step .n { width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 11px;
+               font-weight: 700; background: var(--surface-2); color: var(--muted); margin-top: 1px; }
+    .step h3 { margin: 0 0 4px; font-size: 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .step p { margin: 2px 0; font-size: 13px; }
+    .step .muted { margin: 2px 0; font-size: 13px; }
+    .checks { list-style: none; margin: 6px 0 0; padding: 0; font-size: 13px; }
+    .checks li { padding: 2px 0; }
+    .checks .pass::before { content: "✓ "; color: var(--ok); font-weight: 700; }
+    .checks .fail::before { content: "✗ "; color: var(--bad); font-weight: 700; }
+    .checks .info::before { content: "• "; color: var(--muted); }
+    details.blk { margin: 6px 0 0; }
+    details.blk > summary { cursor: pointer; font-size: 12px; color: var(--accent); font-weight: 600; }
+    pre { margin: 6px 0 0; padding: 10px 12px; border-radius: 10px; background: var(--surface-2);
+          font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; }
+    pre.reply { border-left: 3px solid #8b5cf6; }
+    .empty { text-align: center; color: var(--muted); padding: 60px 16px; border: 1px dashed var(--line); border-radius: 16px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <p class="brand">DCTA · REQUEST TRACE</p>
+        <h1>Exactly what the AI was told, and what happened next</h1>
+        <p>Every request from the assistant, step by step. The LLM's whole job
+          is step&nbsp;1 — turning your sentence into a JSON draft. Everything
+          after it is ordinary code, and nothing moves without you.</p>
+      </div>
+      <span class="pill"><span class="live"></span><span id="prov">LLM: …</span> · live</span>
+    </div>
+    <div class="legend">
+      <span><span class="actor llm">LLM</span> the language model</span>
+      <span><span class="actor code">CODE</span> deterministic code — no AI</span>
+      <span><span class="actor you">YOU</span> your answer, code or biometric</span>
+    </div>
+    <div id="list"><p class="empty">No requests yet. Say or type something in the
+      <a href="/">assistant</a> and it appears here.</p></div>
+  </div>
+
+  <script>
+  "use strict";
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const who = (w) => el("span", "actor " + w, w === "llm" ? "LLM" : w === "you" ? "YOU" : "CODE");
+  const json = (o) => JSON.stringify(o, null, 2);
+  const money = (c) => "$" + (c / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  function block(label, text, open, cls) {
+    const d = el("details", "blk"); if (open) d.open = true;
+    d.append(el("summary", null, label));
+    const p = el("pre", cls); p.textContent = text; d.append(p);
+    return d;
+  }
+
+  function legsText(plan) {
+    return (plan.plan || []).map((l) =>
+      `${l.type} ${l.payee_display || l.biller_display || l.ticker || ""} ${money(l.amount_cents)}`
+      + (l.estimated_shares != null ? ` (${l.estimated_shares} shares)` : "")
+      + ` from ${l.source_account}`).join("\n");
+  }
+
+  const RENDER = {
+    parse(e) {
+      const calls = e.llm_calls || [];
+      const box = [];
+      const h = el("h3"); h.append(who("llm"), document.createTextNode("Sentence → JSON draft"));
+      box.push(h);
+      box.push(el("p", "muted",
+        e.provider === "stub"
+          ? "Provider: stub — the rule-based stand-in is answering in the LLM's place (same prompt in, same JSON format out)."
+          : `Provider: ${e.provider}`));
+      calls.forEach((c, i) => {
+        const tag = calls.length > 1 ? ` (attempt ${i + 1})` : "";
+        box.push(block("System prompt — the rules it is given" + tag, c.system, false));
+        box.push(block("User prompt — the data and your words" + tag, c.user, i === 0));
+        box.push(c.error ? block("Call failed" + tag, c.error, true)
+                         : block(`Raw reply${tag} · ${c.ms} ms`, c.output, true, "reply"));
+      });
+      if (e.result) box.push(block("After schema validation — the draft handed to the code", json(e.result), false));
+      if (e.error) box.push(el("p", null, "Rejected: " + e.error));
+      return box;
+    },
+    contacts(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Contacts list"));
+      return [h, el("p", "muted", `${e.note}. ${e.count} contacts shown.`)];
+    },
+    resolve(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Resolver — words → real accounts & amounts"));
+      if (e.outcome === "question") {
+        const out = [h, el("p", null, "Asked: " + e.question)];
+        if (e.choices && e.choices.length) out.push(el("p", "muted", "Choices: " + e.choices.map((c) => c.display).join(", ")));
+        return out;
+      }
+      if (e.contact_change) {
+        const t = e.contact_change.edits.map((x) => `${x.payee_display} ${x.field}: ${x.old_value || "none"} → ${x.new_value}`).join("\n");
+        return [h, el("pre", null, t), block("Signable payload", json(e.contact_change), false)];
+      }
+      return [h, el("pre", null, legsText(e.resolved_plan)), block("Signable payload", json(e.resolved_plan), false)];
+    },
+    policy(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Policy — limits, KYC, unusual amounts"));
+      const ul = el("ul", "checks");
+      for (const v of e.verdicts || []) ul.append(el("li", v.decision === "BLOCK" ? "fail" : "pass",
+        `${v.leg_id}: ${v.decision}${v.reason ? " — " + v.reason : ""}`));
+      return [h, el("p", null, "Decision: " + e.decision), ul];
+    },
+    validate(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Validator — does the draft match what you said?"));
+      const ul = el("ul", "checks");
+      for (const c of e.checks || []) ul.append(el("li", c.outcome === "fail" ? "fail" : "pass", `${c.check} (${c.leg}): ${c.detail}`));
+      for (const s of e.soft_signals || []) ul.append(el("li", "info", `soft signal: ${s.check || ""} ${s.detail || JSON.stringify(s)}`));
+      const out = [h, el("p", null, e.frozen ? "FROZEN — this draft can't be signed." : "Passed."), ul];
+      const second = el("p", "muted");
+      second.append(who("llm"), document.createTextNode(" second opinion: " + (e.llm_check || "n/a")
+        + (e.llm_check === "unavailable" ? " (not run — no real model; it can never approve or block on its own)" : "")));
+      out.push(second);
+      (e.llm_calls || []).forEach((c) => {
+        out.push(block("Auditor prompt", c.user, false));
+        out.push(c.error ? block("Auditor call failed", c.error, true) : block("Auditor reply", c.output, true, "reply"));
+      });
+      return out;
+    },
+    step_up(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Extra confirmation — code texted to your phone"));
+      return [h, el("p", null, (e.reasons || []).join(" ")), el("p", "muted", "The code itself is never shown here.")];
+    },
+    answer(e) {
+      const h = el("h3"); h.append(who("you"), document.createTextNode("You answered the question"));
+      return [h, el("p", null, `${e.field} = ${e.choice_id}`)];
+    },
+    confirm(e) {
+      const h = el("h3"); h.append(who("you"), document.createTextNode("You entered the texted code"));
+      return [h, el("p", null, e.ok ? "Accepted." : `Rejected: ${e.error}` + (e.attempts_left != null ? ` (${e.attempts_left} tries left)` : ""))];
+    },
+    nonce(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Signing challenge issued"));
+      return [h, el("p", null, e.issued ? `Single-use nonce, valid ${e.ttl_seconds}s.` : "Refused: " + e.reason)];
+    },
+    gateway(e) {
+      const h = el("h3"); h.append(who("you"), document.createTextNode(`Signed (${e.path}) → `), who("code"), document.createTextNode("Gateway"));
+      const out = [h, el("p", null, e.accepted ? "Accepted: " + ((e.execution && e.execution.status) || "EXECUTED")
+                                               : `Rejected (${e.rejection}): ${e.reason || ""}`)];
+      if (e.execution) out.push(block("What it did", json(e.execution), false));
+      return out;
+    },
+  };
+
+  function outcomeOf(tr) {
+    const ev = tr.events;
+    const last = (s) => [...ev].reverse().find((x) => x.step === s);
+    const gw = last("gateway");
+    if (gw) return gw.accepted ? ["ok", (gw.execution && gw.execution.status) || "EXECUTED"] : ["bad", "REJECTED"];
+    const v = last("validate"); if (v && v.frozen) return ["bad", "FROZEN"];
+    const p = last("policy"); if (p && p.decision === "BLOCK") return ["bad", "BLOCKED"];
+    const parse = last("parse"); if (parse && parse.error) return ["bad", "PARSE FAILED"];
+    if (last("contacts")) return ["ok", "LISTED"];
+    const r = last("resolve"); const lastEv = ev[ev.length - 1];
+    if (lastEv && lastEv.step === "resolve" && r.outcome === "question") return ["wait", "ASKED"];
+    if (last("step_up") && !(last("confirm") || {}).ok) return ["wait", "AWAITING CODE"];
+    return ["wait", "AWAITING SIGNATURE"];
+  }
+
+  const open = new Set();
+  let touched = false;          // once the user opens/closes one, stop auto-opening
+  let lastKey = "";
+  async function refresh() {
+    let body;
+    try { body = await (await fetch("/api/data")).json(); } catch (_) { return; }
+    document.getElementById("prov").textContent = "LLM: " + (body.provider === "stub" ? "stub (stand-in)" : body.provider);
+    const key = JSON.stringify(body.traces);
+    if (key === lastKey) return;
+    lastKey = key;
+    const list = document.getElementById("list");
+    list.replaceChildren();
+    if (!body.traces.length) {
+      const p = el("p", "empty", "No requests yet. Say or type something in the assistant and it appears here.");
+      list.append(p); return;
+    }
+    body.traces.forEach((tr, idx) => {
+      const d = el("details", "req");
+      if (open.has(tr.id) || (idx === 0 && !touched)) d.open = true;
+      d.addEventListener("toggle", (ev) => {
+        if (ev.isTrusted) touched = true;
+        d.open ? open.add(tr.id) : open.delete(tr.id);
+      });
+      const s = el("summary");
+      const [cls, label] = outcomeOf(tr);
+      s.append(el("div", "said", tr.transcript == null ? "(direct call — no sentence)" : tr.transcript),
+               el("span", "outcome " + cls, label),
+               el("div", "sub", `${new Date(tr.started_at * 1000).toLocaleTimeString()} · ${tr.route.replace("_", " ")} · ${tr.events.length} step${tr.events.length === 1 ? "" : "s"}`));
+      d.append(s);
+      const steps = el("div", "steps");
+      tr.events.forEach((e, i) => {
+        const r = RENDER[e.step]; if (!r) return;
+        const row = el("div", "step");
+        const body = el("div");
+        body.append(...r(e));
+        row.append(el("span", "n", String(i + 1)), body);
+        steps.append(row);
+      });
+      d.append(steps);
+      list.append(d);
+    });
+  }
+  refresh();
+  setInterval(refresh, 1500);
+  </script>
+</body>
+</html>

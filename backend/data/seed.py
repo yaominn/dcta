@@ -33,11 +33,11 @@ ACCOUNTS = [
 ]
 
 PAYEES = [
-    # id,        user_id,  nickname,  legal_name,     last4
-    ("payee_17", "u_alice", "Mom",     "Jane Tan",      "3310"),   # normal ~$500/mo
-    ("payee_21", "u_alice", "John",    "John Doe",      "4521"),   # usual $50 (anomaly baseline)
-    ("payee_22", "u_alice", "John",    "John Smith",    "8892"),   # forces disambiguation
-    ("payee_30", "u_alice", "Landlord","Property Mgmt", "7001"),   # large-but-normal
+    # id,        user_id,  nickname,  legal_name,     last4,  phone (fictional)
+    ("payee_17", "u_alice", "Mom",     "Jane Tan",      "3310", "+65 9123 3310"),  # normal ~$500/mo
+    ("payee_21", "u_alice", "John",    "John Doe",      "4521", "+65 8123 4521"),  # usual $50 (anomaly baseline)
+    ("payee_22", "u_alice", "John",    "John Smith",    "8892", "+65 9876 8892"),  # forces disambiguation
+    ("payee_30", "u_alice", "Landlord","Property Mgmt", "7001", "+65 6123 7001"),  # large-but-normal
 ]
 
 BILLERS = [
@@ -77,20 +77,34 @@ def _history_rows() -> list[tuple]:
 
 
 # --------------------------------------------------------------------------- driver
-def seed(db_path: Path = DB_PATH) -> None:
-    """Seed (or re-seed) the mock ledger at db_path. Idempotent: drops + recreates."""
+def seed(db_path: Path = DB_PATH, *, reset_audit: bool = False) -> None:
+    """Seed (or re-seed) the mock ledger at db_path. Idempotent: drops + recreates.
+
+    `reset_audit` additionally drops and recreates the hash-chained audit log.
+    It defaults to FALSE because the log is append-only by design and surviving
+    a re-seed is usually what you want.
+
+    Pass it after a tamper demo. verify_chain() reports the FIRST break, so once
+    an entry has been edited the chain stays broken for every later run, and a
+    plain re-seed cannot repair it — the only other cure is deleting dcta.db.
+    Discovering that at the submission demo, with /api/audit/verify showing
+    ok=false and no explanation, is an avoidable way to lose the scenario that
+    exists to prove the log works."""
     Path(db_path).parent.mkdir(parents=True, exist_ok=True)
     conn = connect(db_path)
     try:
         # drop + recreate so seeding is fully idempotent
-        for t in ["webauthn_credentials", "transaction_history", "limits",
-                  "equities", "billers", "payees", "accounts", "users"]:
+        tables = ["webauthn_credentials", "transaction_history", "limits",
+                  "equities", "billers", "payees", "accounts", "users"]
+        if reset_audit:
+            tables.append("audit_log")
+        for t in tables:
             conn.execute(f"DROP TABLE IF EXISTS {t}")
         init_schema(conn)
 
         conn.executemany("INSERT INTO users VALUES (?,?,?,?)", USERS)
         conn.executemany("INSERT INTO accounts VALUES (?,?,?,?,?)", ACCOUNTS)
-        conn.executemany("INSERT INTO payees VALUES (?,?,?,?,?)", PAYEES)
+        conn.executemany("INSERT INTO payees VALUES (?,?,?,?,?,?)", PAYEES)
         conn.executemany("INSERT INTO billers VALUES (?,?,?)", BILLERS)
         conn.executemany("INSERT INTO equities VALUES (?,?)", EQUITIES)
         conn.executemany("INSERT INTO limits VALUES (?,?)",
@@ -103,6 +117,13 @@ def seed(db_path: Path = DB_PATH) -> None:
     finally:
         conn.close()
 
+    if reset_audit:
+        # audit_log is created by AuditLog, not init_schema. Re-create it now
+        # so a reset leaves an empty, usable chain rather than a missing table
+        # for the next append() to discover.
+        from backend.audit.log import AuditLog   # local: avoids an import cycle
+        AuditLog(db_path)
+
     # report what we seeded
     print(f"Seeded {db_path}")
     c = connect(db_path)
@@ -113,4 +134,8 @@ def seed(db_path: Path = DB_PATH) -> None:
 
 
 if __name__ == "__main__":
-    seed()
+    import sys
+    _reset = "--reset-audit" in sys.argv
+    seed(reset_audit=_reset)
+    if _reset:
+        print("  audit_log            dropped and recreated (chain starts clean)")

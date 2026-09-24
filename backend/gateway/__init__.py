@@ -14,6 +14,7 @@ from backend.gateway.gateway import Gateway
 from backend.gateway.nonce import NonceStore, NonceError
 from backend.gateway.signer import MockSigner, WebAuthnVerifier
 from backend.gateway.executor import MockExecutor
+from backend.gateway.stepup import SimulatedPhone, StepUpError, StepUpStore
 
 __all__ = [
     "Gateway",
@@ -22,4 +23,7 @@ __all__ = [
     "MockSigner",
     "WebAuthnVerifier",
     "MockExecutor",
+    "StepUpStore",
+    "StepUpError",
+    "SimulatedPhone",
 ]

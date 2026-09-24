@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import MAX_AUTH_WINDOW_S, ResolvedPlan
 
 
@@ -51,12 +52,19 @@ class Draft:
     transcript: str
     intent_plan: dict
     created_at: float
+    kind: str = "payment"             # payment | contact_edit
     status: str = "clarify"
     answers: dict[str, str] = field(default_factory=dict)
     resolved_plan: ResolvedPlan | None = None
+    resolved_change: ResolvedContactChange | None = None     # kind == contact_edit
     policy: dict | None = None
     validation: dict | None = None
     question: dict | None = None
+
+    @property
+    def payload(self):
+        """Whatever this draft would have the user sign, or None."""
+        return self.resolved_plan if self.kind == "payment" else self.resolved_change
 
     def is_expired(self, now: float, ttl: int) -> bool:
         return (now - self.created_at) > ttl

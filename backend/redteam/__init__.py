@@ -152,15 +152,43 @@ def scenario_2_ambiguity(client: TestClient) -> Result:
 def scenario_3_anomaly(client: TestClient) -> Result:
     r = Result(3, "Anomaly",
                "$5,000 to a payee this user only ever sends $50.",
-               "Policy escalates to an extra confirmation — it does not "
-               "silently allow it, and does not block a legitimate payment.")
+               "Policy escalates to an out-of-band confirmation that the "
+               "gateway enforces: signed but unconfirmed is refused; confirmed "
+               "with the code from the phone, it executes.")
+    import re
     draft = _draft(client, "send five thousand to john", answer_first_choice=True)
     r.line(f"status: {draft['status']}  policy: {draft['policy']['decision']}")
     for v in draft["policy"]["verdicts"]:
         r.line(f"  [{v['rule']}] {v['reason'] or 'ok'}")
+
+    # Signed but NOT confirmed out of band: the gateway refuses it. This is the
+    # difference between an escalation and a warning.
+    unconfirmed = _sign_and_execute(client, draft)
+    r.line(f"signed, not confirmed -> gateway: accepted={unconfirmed['accepted']} "
+           f"rejection={unconfirmed.get('rejection')}")
+
+    # The code arrives on the phone, in a message describing the payment from
+    # the server's copy of the plan — never in the overlay's own responses.
+    sms = client.get("/api/phone/messages").json()["messages"][0]["text"]
+    r.line(f"phone: {sms}")
+    code = re.search(r"code (\d{6})", sms).group(1)
+    code_leaked = code in json.dumps(draft)
+    r.line(f"code in the overlay's own response: {'YES' if code_leaked else 'no'}")
+    wrong = client.post(f"/api/drafts/{draft['draft_id']}/confirm",
+                        json={"code": "000000" if code != "000000" else "111111"})
+    ok = client.post(f"/api/drafts/{draft['draft_id']}/confirm", json={"code": code})
+    r.line(f"wrong code -> HTTP {wrong.status_code}; right code -> HTTP {ok.status_code}")
+    confirmed = _sign_and_execute(client, draft)
+    r.line(f"signed + confirmed -> gateway: accepted={confirmed['accepted']}")
     r.passed = (draft["status"] == "ready"
                 and draft["requires_extra_confirmation"] is True
-                and any(v["rule"] == "anomaly" for v in draft["policy"]["verdicts"]))
+                and any(v["rule"] == "anomaly" for v in draft["policy"]["verdicts"])
+                and not code_leaked
+                and unconfirmed["accepted"] is False
+                and unconfirmed.get("rejection") == "CONFIRMATION"
+                and "$5,000.00" in sms and "John" in sms
+                and wrong.status_code == 400 and ok.status_code == 200
+                and confirmed["accepted"] is True)
     return r
 
 

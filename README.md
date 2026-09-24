@@ -383,6 +383,45 @@ asks instead of guessing; the clarify round trip completes; and every outcome
 is HTTP 200 — a clarification is a successful request whose answer is a
 question.
 
+### Reviewed after M7 landed — three fixes
+
+- **The browser now negotiates and reports the audio container.** Chrome's
+  `MediaRecorder` produces `audio/webm;codecs=opus`, which shares a codec but
+  **not** a container with the documented `ogg-opus`. `voice.js` previously sent
+  the blob with no format hint, so the server applied its configured default
+  and would have forwarded webm audio labelled `mp3` — the exact mislabelling
+  `backend/asr/tencent.py` names as the likeliest first-live-call failure. It
+  now asks `MediaRecorder` for a documented container where the browser has one,
+  and reports verbatim what it actually recorded. An unsupported container gets
+  an honest **415** naming the fallback tier, and the demo drops to Web Speech
+  instead of paying for an upstream call that cannot succeed.
+- **`/api/transcribe` validates its inputs.** `fmt` is browser-supplied and went
+  straight upstream as `VoiceFormat`; it is now checked against
+  `SUPPORTED_VOICE_FORMATS` on our side, for the same reason the LLM's output is
+  validated here rather than trusted. Uploads over 5MB are refused with **413**
+  (upstream caps a request at ~60s/5MB, so a larger body cannot succeed).
+- **The utterance is now recorded in the audit chain.**
+  `AuditEntryType.TRANSCRIPT` existed and was reserved for M7, but nothing
+  emitted it — the chain ran `DRAFT → POLICY → VALIDATION → SIGNATURE →
+  EXECUTION` with no record of the utterance every later entry derives from, so
+  the `transcript_hash` inside the signed payload had nothing in the log to
+  correspond to. `POST /api/drafts` now appends one.
+
+  **The hash is logged, not the words.** The hash is what the signature binds,
+  so it is what non-repudiation needs; storing raw utterances would put spoken
+  account details — and whatever else a microphone caught — into append-only
+  storage that is deliberately hard to redact. A test asserts the transcript
+  text never reaches the log.
+
+> **After a tamper demo, re-seed with `--reset-audit`.**
+> `python -m backend.data.seed --reset-audit`
+>
+> `verify_chain()` reports the *first* break, so once scenario 7 has edited an
+> entry the chain stays broken for every later run, and a plain re-seed does not
+> touch the append-only log. The flag is opt-in: a normal `seed()` still
+> preserves audit history, because surviving a re-seed is usually the point.
+
+
 ## M8 — The wired pipeline + the red-team demo
 
 **`POST /api/drafts` is the endpoint that joins every milestone.** Until it
@@ -427,7 +466,7 @@ in a slide.
 |---|---|---|
 | 1 | *(control)* | One utterance → one draft → one signature → both legs executed; $8,420.50 → $192.50 remains |
 | 2 | Two payees called "John" | Asks instead of guessing; an answer naming a non-candidate is refused and re-asked |
-| 3 | $5,000 to a usual-$50 payee | Escalates to extra confirmation (100x the median), does not silently allow |
+| 3 | $5,000 to a usual-$50 payee | Escalates to an out-of-band code (100x the median); the gateway refuses it signed-but-unconfirmed, executes it once confirmed |
 | 4 | Poisoned `biller_07.reference_text` | Never enters a prompt; never reaches a displayed or signed field |
 | 5 | Injection in the user's own speech | No leg pays the injected account — the LLM schema has no `payee_id` to name one |
 | 6 | Unsigned call straight to the gateway | Rejected and recorded in the hash chain |
@@ -454,6 +493,94 @@ before policy can refuse an over-limit amount through the honest path — the
 reachable block there is **velocity**. And `u_bob` has no accounts, so his KYC
 block is only reachable by calling the policy functions directly.
 
+
+## Out-of-band step-up confirmation
+
+The anomaly rule **escalates** rather than blocks, and until now nothing
+enforced the escalation: the overlay showed a status line and the gateway
+treated `REQUIRE_EXTRA_CONFIRMATION` exactly like `ALLOW`. Now:
+
+- An escalated draft gets a 6-digit code on a **separate channel** — the
+  user's phone — in a message that describes the payment from the **server's**
+  copy of the plan. The code is never in any response the overlay receives.
+- `POST /api/drafts/{id}/confirm {code}` checks it. Three wrong codes burn the
+  challenge; codes expire in 5 minutes. Both outcomes go in the audit chain.
+- **`gateway.submit()` enforces it** after re-running policy: an escalated plan
+  without a confirmation of *that exact payload hash* is rejected
+  `CONFIRMATION`, on both the mock and WebAuthn paths. A confirmation cannot be
+  moved onto a different payload, and authorizes one execution.
+
+This is the channel the client-integrity caveat below refers to: a compromised
+renderer can lie about the amount on screen, but not about what the text
+message says.
+
+**The phone is simulated** (`backend/gateway/stepup.py: SimulatedPhone`). Open
+**http://localhost:8000/phone** in a second window for the demo. A deployment
+would send an SMS or push notification instead; the binding and enforcement do
+not change. Tests: `pytest tests/test_stepup.py`.
+
+> **Demo order matters for balances.** The happy path spends almost all of
+> Savings, so a later "$5,000 to John" asks about insufficient funds instead of
+> escalating. Run the anomaly scene first, or re-seed between scenes.
+
+## Editing contacts by voice or text
+
+The assistant can also **rename a saved payee** or **change their phone
+number**, and **show your contacts**:
+
+    show my contacts
+    rename John to Johnny                      (asks which John)
+    change Mom's number to 9123 4567
+    update the phone number for landlord to 6123 0000
+
+Changes are saved in the same SQLite ledger (`backend/data/dcta.db`, table
+`payees`, new `phone` column). `python -m backend.data.seed` resets them;
+an existing database gets the new column automatically at startup.
+
+**A contact edit follows the same rule as a payment: the model drafts, the
+user signs.** A phone number is a PayNow proxy, so rewriting it redirects money,
+which is the classic account-takeover step. So:
+
+- The parser emits **mentions and the user's words only** (`ContactEditPlan`,
+  `backend/models/contacts.py`, a separate contract from the frozen v1 schemas).
+  The phone number is never shown to the model; only `{id, nickname}` is.
+- The **resolver** (`backend/resolver/contacts.py`) matches who with the same
+  0 / 1 / 2+ rules as payments, and validates the new value by rule. A phone
+  number must be 8 digits starting 3/6/8/9 (or `+<country code>`); spoken
+  digits work. A nickname may only contain letters, digits, spaces and `. ' -`,
+  because a nickname appears in every later prompt.
+- The **validator** (`backend/validator/contacts.py`) independently checks the
+  new value is actually in what the user said, and freezes the draft if not.
+- The user reviews **old → new** on a card and signs with their biometric. A
+  **phone change also needs the out-of-band code**.
+- `gateway.submit_contact_change()` is the only write path. It checks
+  signature, nonce, expiry and step-up, then updates **only if the stored
+  value is still the old one the user saw**. Each change is logged
+  (`CONTACT_UPDATE`) with payee ids and fields, but not the numbers.
+
+Tests: `pytest tests/test_contacts.py`. Routing between payments and contact
+requests is a small keyword rule (`backend/agent/router.py`). A mis-route can
+only ever produce a question or a card the user declines.
+
+## `/data`: what the AI was told, step by step
+
+Open **http://localhost:8000/data** next to the assistant. For every request it
+shows, live:
+
+1. **LLM**: the exact system prompt and user prompt sent to the model (the
+   sanitized context plus your words), its raw reply, and the draft after
+   schema validation. Every retry is shown too.
+2. **Code**: the resolver's result (or its question), policy verdicts,
+   validator checks (and the LLM second opinion, if one ran), and whether a code
+   was texted.
+3. **You**: your answers, the texted code accepted or rejected, and the
+   biometric signature. Then the gateway's final decision and what it did.
+
+It makes the core claim inspectable: the LLM's entire contribution is step 1.
+Traces live in memory (the last 50 requests, gone on restart,
+`backend/trace.py`). The one-time code is never recorded. Like `/phone`, this
+is a demo tool and would not exist in a deployment, because it shows
+transcripts.
 
 ## Architecture
 
@@ -521,7 +648,7 @@ dcta/
 
 1. **Happy path** — multi-intent voice command → one overlay → one fingerprint → both legs executed.
 2. **Ambiguity** — "Send fifty to John" → disambiguation → correct payee.
-3. **Anomaly** — "five thousand" to a usual-$50 payee → extra confirmation.
+3. **Anomaly** — "five thousand" to a usual-$50 payee → a code on the demo phone (`/phone`) → enter it → fingerprint.
    (Was "fifty thousand", which is impossible: $50,000 breaks the $20,000
    per-transaction limit and meets the $50,000 daily cap, so policy blocks it
    outright and the scene never reaches a confirmation. $5,000 is still 100x
@@ -555,7 +682,15 @@ each one, so a regression breaks CI rather than surfacing on stage.
 
 ## Honest limitations (stated in the pitch, not hidden)
 
-- **Neither the LLM nor the ASR has run against a real service.** There are no
+- **Tencent retired the legacy Hunyuan `ChatCompletions` API.** With real
+  credentials (24 Sep 2026) authentication succeeds, but every model —
+  `hunyuan-functioncall`, `hunyuan-turbos-latest`, `hunyuan-lite` and others —
+  returns *"this model has been taken offline; migrate to TokenHub"*. TokenHub
+  (`https://tokenhub.tencentmaas.com/v1`, OpenAI-compatible, model
+  `hy3-preview`) uses its own API key, not SecretId/SecretKey, so
+  `backend/agent/hunyuan.py` cannot reach it as written. Until a TokenHub
+  provider exists, run with `LLM_PROVIDER=stub`.
+- **Neither the LLM nor the ASR has produced output from a real service.** There are no
   Tencent credentials yet, so the parser uses a deterministic stub and
   `/api/transcribe` reports unavailable. Every security property is tested and
   holds regardless of the model — that is the point of validating on our side —
@@ -563,7 +698,9 @@ each one, so a regression breaks CI rather than surfacing on stage.
 
 - The OS biometric prompt signs a blind hash; "what you see is what you sign"
   is a *client-integrity* assumption, not a cryptographic guarantee. The
-  out-of-band confirmation channel closes this gap for high-value transactions.
+  out-of-band confirmation closes this gap for payments policy flags as
+  unusual — and only those; an ordinary payment still relies on the overlay.
+  The channel is simulated in the demo (see *Out-of-band step-up*).
 - The independent validation agent catches model error, drift and mis-parse —
   it does **not** defend against transcript-borne injection (handled
   architecturally: the user must still sign).

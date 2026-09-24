@@ -21,11 +21,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.config import settings
-from backend.data.db import DB_PATH, get_conn
+from backend.data.db import DB_PATH, get_conn, migrate
 from backend.audit import AuditLog
 from backend.audit.log import AuditEntryType
 from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
-from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor, WebAuthnVerifier
+from backend.gateway import (Gateway, NonceStore, MockSigner, MockExecutor, WebAuthnVerifier,
+                             SimulatedPhone, StepUpError, StepUpStore)
 from backend.auth import (
     MockCredentialStore,
     WebAuthnCredentialStore,
@@ -34,13 +35,21 @@ from backend.auth import (
 )
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
-                           get_provider, parse_transcript)
-from backend.asr import ASRUnavailable, get_asr_provider
+                           classify_request, get_provider, parse_contact_edit,
+                           parse_transcript)
+from backend.models.contacts import ContactEditPlan, ResolvedContactChange
+from backend.policy import contact_change_step_up
+from backend.resolver.contacts import resolve_contact_edit
+from backend.validator.contacts import validate_contact_change
+from backend.asr import (MAX_AUDIO_BYTES, SUPPORTED_VOICE_FORMATS,
+                         ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
 from backend.drafts import Draft, DraftStore
+from backend.trace import RecordingProvider, TraceStore
+from backend.display import change_summary, plan_summary
 
 from pathlib import Path
 
@@ -54,6 +63,14 @@ app = FastAPI(
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+# Bring an existing ledger up to date (e.g. add payees.phone) without a re-seed,
+# which would wipe the user's own contact edits and registered passkeys.
+_mconn = get_conn()
+try:
+    migrate(_mconn)
+finally:
+    _mconn.close()
 
 
 @app.get("/")
@@ -166,6 +183,10 @@ _credentials = MockCredentialStore()
 _credentials.register("cred_alice", _signer.public_key)   # MOCK demo credential
 
 _nonce_store = NonceStore(ttl_seconds=120)
+# Out-of-band step-up (gateway/stepup.py): an anomaly verdict needs a code sent
+# to the user's phone before the gateway will execute. Shared by both gateways.
+_step_up = StepUpStore()
+_phone = SimulatedPhone()    # MOCK: the "phone" the code is delivered to
 _audit = AuditLog(DB_PATH)
 _executor = MockExecutor(DB_PATH)
 _gateway = Gateway(
@@ -175,6 +196,7 @@ _gateway = Gateway(
     executor=_executor,
     credentials=_credentials,
     policy_db_path=DB_PATH,      # M5: policy is enforced at the chokepoint
+    step_up=_step_up,
 )
 
 
@@ -199,6 +221,7 @@ _webauthn_gateway = Gateway(
     executor=_executor,           # shared (one ledger)
     credentials=_webauthn_credentials,
     policy_db_path=DB_PATH,       # shared — the same limits on both paths
+    step_up=_step_up,             # shared — one confirmation, either path
 )
 
 # In-memory registration challenges (user_id -> (challenge bytes, issued_at)).
@@ -223,10 +246,12 @@ def issue_nonce(draft_id: str = Query(...)):
     validator is read-only and reaches neither gateway/ nor auth/ (CI-checked);
     it records the freeze, and this one line enforces it."""
     if draft_id in default_freeze_set:
+        _traces.event(draft_id, "nonce", issued=False, reason="frozen by the validator")
         raise HTTPException(
             status_code=403,
             detail={"error": "draft frozen by validator", "draft_id": draft_id},
         )
+    _traces.event(draft_id, "nonce", issued=True, ttl_seconds=_nonce_store.ttl)
     return {"nonce": _nonce_store.issue(draft_id),
             "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
 
@@ -272,7 +297,16 @@ def gateway_execute(req: ExecuteRequest):
     """The single execution chokepoint. Verifies nonce -> signature -> executes.
     Returns accepted=True on success; accepted=False (rejected+logged) on any
     verification failure (brief acceptance test: unsigned request rejected+logged)."""
-    return _gateway.submit(req.resolved_plan, req.signature, req.nonce, req.credential_id)
+    return _traced_gateway(req.resolved_plan.draft_id, "mock signer",
+                           _gateway.submit(req.resolved_plan, req.signature,
+                                           req.nonce, req.credential_id))
+
+
+def _traced_gateway(draft_id: str, path: str, out: dict) -> dict:
+    _traces.event(draft_id, "gateway", path=path, accepted=out.get("accepted"),
+                  rejection=out.get("rejection"), reason=out.get("reason"),
+                  execution=out.get("execution"), payload_hash=out.get("payload_hash"))
+    return out
 
 
 @app.get("/api/audit/chain")
@@ -395,7 +429,9 @@ def webauthn_execute(req: WebAuthnExecuteRequest):
     mock path: expiry -> nonce -> signature -> execute -> audit. The verifier
     rejects a non-biometric assertion (UV flag unset), a wrong-origin/wrong-RP
     assertion, a stale challenge, or a replayed sign count."""
-    return _webauthn_gateway.submit(req.resolved_plan, req.assertion, req.nonce, req.credential_id)
+    return _traced_gateway(req.resolved_plan.draft_id, "WebAuthn",
+                           _webauthn_gateway.submit(req.resolved_plan, req.assertion,
+                                                    req.nonce, req.credential_id))
 
 
 # --------------------------------------------------------------------------- M3: LLM parser + opaque IDs
@@ -512,11 +548,40 @@ async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
     failure — it is the degradation path working as designed (brief §5).
     """
     provider = get_asr_provider(settings)
+
+    # `fmt` is what the BROWSER says it recorded, so it is caller-supplied input
+    # that would otherwise go straight upstream as VoiceFormat. Checked against
+    # the documented containers on our side, before a byte leaves the building
+    # — the same reason the LLM's output is validated here rather than trusted.
+    #
+    # 415 rather than 503: the service is up, this container is the problem.
+    # The client treats both as "drop a tier", so the user still gets Web Speech
+    # — which is the honest answer when Chrome can only hand us webm.
+    container = (fmt or settings.asr_voice_format).lower()
+    if container not in SUPPORTED_VOICE_FORMATS:
+        raise HTTPException(status_code=415, detail={
+            "error": f"unsupported audio container {container!r}; "
+                     f"Tencent SentenceRecognition accepts "
+                     f"{', '.join(sorted(SUPPORTED_VOICE_FORMATS))}",
+            "provider": provider.name,
+            "fallback": "webspeech",
+        })
+
     raw = await audio.read()
     if not raw:
         raise HTTPException(status_code=400, detail={"error": "empty audio upload"})
+    # Upstream caps a request at 60s / 5MB, so a larger body cannot succeed.
+    # Refusing it here keeps an oversized upload from being forwarded (and from
+    # sitting in memory any longer than the read that produced it).
+    if len(raw) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": f"audio too large: {len(raw)} bytes exceeds the "
+                     f"{MAX_AUDIO_BYTES}-byte limit (~60s)",
+            "fallback": "webspeech",
+        })
+
     try:
-        text = provider.transcribe(raw, fmt=fmt or settings.asr_voice_format)
+        text = provider.transcribe(raw, fmt=container)
     except ASRUnavailable as exc:
         raise HTTPException(status_code=503, detail={
             "error": str(exc),
@@ -537,6 +602,7 @@ async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
 # Each stage can stop the pipeline, and a stage that stops it produces NO
 # signable draft — the fail-closed direction, every time.
 _drafts = DraftStore()
+_traces = TraceStore()      # MOCK/demo: what each request was told and did (/data)
 
 
 class DraftRequest(BaseModel):
@@ -574,10 +640,13 @@ def _pipeline(draft: Draft) -> dict:
         draft.resolved_plan = None
         draft.question = {"question": outcome.question, "field": outcome.field,
                           "kind": outcome.kind, "choices": outcome.choices}
+        _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
         return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
 
     resolved = outcome.plan
     draft.question = None
+    _traces.event(draft.draft_id, "resolve", outcome="resolved",
+                  resolved_plan=resolved.model_dump(mode="json"))
 
     # --- policy (M5). A BLOCKED draft keeps NO plan: there is nothing to sign.
     verdicts = evaluate(resolved, load_context(draft.user_id, db_path=DB_PATH))
@@ -587,6 +656,7 @@ def _pipeline(draft: Draft) -> dict:
                       "rule": v.rule, "reason": v.reason} for v in verdicts.verdicts],
     }
     _audit.append(AuditEntryType.POLICY, verdicts.to_audit_payload(draft.draft_id))
+    _traces.event(draft.draft_id, "policy", **draft.policy)
     if verdicts.blocked:
         draft.status = "blocked"
         draft.resolved_plan = None
@@ -595,23 +665,44 @@ def _pipeline(draft: Draft) -> dict:
 
     # --- validator (M6). A frozen draft keeps its plan for display, but
     #     /api/auth/nonce refuses a nonce, so it is unsignable.
-    report = validate(plan, resolved, draft.transcript,
-                      provider=get_provider(settings), audit=_audit)
+    auditor = RecordingProvider(get_provider(settings))
+    report = validate(plan, resolved, draft.transcript, provider=auditor, audit=_audit)
     draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
                         "checks": report.checks, "soft_signals": report.soft_signals,
                         "llm_check": report.llm_check}
     draft.resolved_plan = resolved
     draft.status = "frozen" if report.frozen else "ready"
+    p_hash = payload_hash(resolved)
+    _traces.event(draft.draft_id, "validate", verdict=report.verdict, frozen=report.frozen,
+                  checks=report.checks, soft_signals=report.soft_signals,
+                  llm_check=report.llm_check, llm_calls=auditor.calls)
+
+    # --- step-up. An escalated plan gets a code on the out-of-band channel,
+    #     bound to THIS payload hash. The code is never in this response: the
+    #     point is that it arrives somewhere the overlay cannot touch, with the
+    #     transaction described from the server's copy of the plan.
+    needs_step_up = (draft.status == "ready"
+                     and verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION)
+    if needs_step_up:
+        code = _step_up.issue(draft.draft_id, p_hash)
+        _traces.event(draft.draft_id, "step_up", sent=True, channel="phone (simulated)",
+                      reasons=verdicts.reasons())
+        _phone.deliver(draft.user_id,
+                       f"DCTA: to {plan_summary(resolved)}, enter code {code}. "
+                       f"Valid 5 min. Never share this code. If this wasn't "
+                       f"you, ignore this message.")
 
     return {
         "status": draft.status,
         "draft_id": draft.draft_id,
         "resolved_plan": resolved.model_dump(mode="json"),
-        "payload_hash": payload_hash(resolved),
+        "payload_hash": p_hash,
         "policy": draft.policy,
         "validation": draft.validation,
-        "requires_extra_confirmation":
-            verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION,
+        "requires_extra_confirmation": needs_step_up,
+        "confirmation": ({"channel": "your registered phone",
+                          "reasons": verdicts.reasons()}
+                         if needs_step_up else None),
     }
 
 
@@ -634,24 +725,139 @@ def create_draft(req: DraftRequest):
     for flag in context.flags:
         logging.warning("injection tripwire: stored field flagged: %s", flag)
 
-    provider = get_provider(settings)
+    # Which pipeline. Not a security decision: every route ends at a draft the
+    # user must sign, or (the list) a read-only view of their own contacts.
+    route = classify_request(req.transcript)
+    if route == "contact_list":
+        view = _contacts_view(req.user_id)
+        tid = "list-" + DraftStore.new_id()
+        _traces.start(tid, transcript=req.transcript, route=route, user_id=req.user_id)
+        _traces.event(tid, "contacts", note="read-only; the LLM is not called",
+                      count=len(view["contacts"]))
+        return view
+
+    provider = RecordingProvider(get_provider(settings))
     try:
-        plan = parse_transcript(req.transcript, provider=provider, context=context)
-    except ProviderUnavailable as exc:
+        if route == "contact_edit":
+            plan = parse_contact_edit(req.transcript, provider=provider, context=context)
+        else:
+            plan = parse_transcript(req.transcript, provider=provider, context=context)
+    except (ProviderUnavailable, ParseFailure) as exc:
+        tid = "failed-" + DraftStore.new_id()
+        _traces.start(tid, transcript=req.transcript, route=route, user_id=req.user_id)
+        _traces.event(tid, "parse", provider=provider.name, llm_calls=provider.calls,
+                      error=str(exc))
+        if isinstance(exc, ParseFailure):
+            raise HTTPException(status_code=422, detail={
+                "error": "could not produce a schema-valid plan within the retry budget",
+                "attempts": exc.errors})
         raise HTTPException(status_code=502, detail={
             "error": "LLM provider unavailable", "provider": provider.name,
-            "attempts": exc.errors})
-    except ParseFailure as exc:
-        raise HTTPException(status_code=422, detail={
-            "error": "could not produce a schema-valid plan within the retry budget",
             "attempts": exc.errors})
 
     draft = _drafts.put(Draft(
         draft_id=DraftStore.new_id(), user_id=req.user_id,
         transcript=req.transcript, intent_plan=plan.model_dump(),
         created_at=time.time(),
+        kind="contact_edit" if route == "contact_edit" else "payment",
     ))
-    return _pipeline(draft)
+    _traces.start(draft.draft_id, transcript=req.transcript, route=route, user_id=req.user_id)
+    _traces.event(draft.draft_id, "parse", provider=provider.name, llm_calls=provider.calls,
+                  context=context.to_prompt_json(), result=plan.model_dump(mode="json"))
+
+    # AuditEntryType.TRANSCRIPT exists and was reserved for M7 ("every step" —
+    # brief 4.5 / docs/ARCHITECTURE.md), but nothing emitted it: the chain went
+    # DRAFT -> POLICY -> VALIDATION -> SIGNATURE -> EXECUTION with no record of
+    # the utterance any of it came from. The signed ResolvedPlan binds
+    # transcript_hash, so without this entry the hash in the payload had nothing
+    # in the log to correspond to.
+    #
+    # The HASH is logged, not the words. The hash is what the signature binds,
+    # so it is what non-repudiation needs; storing the raw utterance would put
+    # spoken account details and whatever else a microphone caught into
+    # append-only storage that is deliberately hard to redact. `chars` keeps a
+    # truncation or an empty transcript visible without retaining the content.
+    _audit.append(AuditEntryType.TRANSCRIPT, {
+        "draft_id": draft.draft_id,
+        "transcript_hash": hash_transcript(req.transcript),
+        "chars": len(req.transcript),
+        "parser_provider": provider.name,
+        "user_id": req.user_id,
+        "kind": draft.kind,
+    })
+    return _run(draft)
+
+
+def _run(draft: Draft) -> dict:
+    return _contact_pipeline(draft) if draft.kind == "contact_edit" else _pipeline(draft)
+
+
+def _contacts_view(user_id: str) -> dict:
+    """The user's own contacts, read-only. Never the legal name (it stays
+    server-side, like everywhere else) and never an id."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT nickname, last4, phone FROM payees WHERE user_id=? ORDER BY nickname, last4",
+            (user_id,)).fetchall()
+    finally:
+        conn.close()
+    return {"status": "info", "kind": "contacts", "contacts": [
+        {"display": f"{r['nickname']} ··{r['last4']}", "nickname": r["nickname"],
+         "last4": r["last4"], "phone": r["phone"] or ""} for r in rows]}
+
+
+def _contact_pipeline(draft: Draft) -> dict:
+    """resolve -> validate -> (step-up) over a contact-edit draft. Same shape
+    as _pipeline: re-run in full after every clarification answer."""
+    plan = ContactEditPlan.model_validate(draft.intent_plan)
+    outcome = resolve_contact_edit(plan, transcript=draft.transcript, user_id=draft.user_id,
+                                   draft_id=draft.draft_id, answers=draft.answers)
+    if isinstance(outcome, Clarify):
+        draft.status = "clarify"
+        draft.resolved_change = None
+        draft.question = {"question": outcome.question, "field": outcome.field,
+                          "kind": outcome.kind, "choices": outcome.choices}
+        _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
+        # `kind` here is the QUESTION's kind (payee / invalid_phone / ...), as
+        # for payment questions.
+        return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
+
+    change = outcome.change
+    draft.question = None
+    _traces.event(draft.draft_id, "resolve", outcome="resolved",
+                  contact_change=change.model_dump(mode="json"))
+    report = validate_contact_change(plan, change, draft.transcript,
+                                     answers=draft.answers, audit=_audit)
+    draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
+                        "checks": report.checks}
+    draft.resolved_change = change
+    draft.status = "frozen" if report.frozen else "ready"
+    p_hash = payload_hash(change)
+    _traces.event(draft.draft_id, "validate", verdict=report.verdict, frozen=report.frozen,
+                  checks=report.checks, llm_check=report.llm_check, llm_calls=[])
+
+    reasons = contact_change_step_up(change)
+    needs_step_up = draft.status == "ready" and bool(reasons)
+    if needs_step_up:
+        code = _step_up.issue(draft.draft_id, p_hash)
+        _traces.event(draft.draft_id, "step_up", sent=True, channel="phone (simulated)",
+                      reasons=reasons)
+        _phone.deliver(draft.user_id,
+                       f"DCTA: to {change_summary(change)}, enter code {code}. "
+                       f"Valid 5 min. Never share this code. If this wasn't "
+                       f"you, ignore this message.")
+    return {
+        "status": draft.status,
+        "kind": "contact_edit",
+        "draft_id": draft.draft_id,
+        "contact_change": change.model_dump(mode="json"),
+        "payload_hash": p_hash,
+        "validation": draft.validation,
+        "requires_extra_confirmation": needs_step_up,
+        "confirmation": ({"channel": "your registered phone", "reasons": reasons}
+                         if needs_step_up else None),
+    }
 
 
 @app.post("/api/drafts/{draft_id}/clarify", response_model=None)
@@ -664,7 +870,52 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
         raise HTTPException(404, {"error": "no such draft (or it expired)",
                                   "draft_id": draft_id})
     draft.answers[answer.field] = answer.choice_id
-    return _pipeline(draft)
+    _traces.event(draft_id, "answer", field=answer.field, choice_id=answer.choice_id)
+    return _run(draft)
+
+
+class ConfirmRequest(BaseModel):
+    code: str
+
+
+@app.post("/api/drafts/{draft_id}/confirm", response_model=None)
+def confirm_draft(draft_id: str, req: ConfirmRequest):
+    """Enter the out-of-band code for an escalated draft. Records the
+    confirmation (bound to the draft's payload hash) for the gateway, and logs
+    the attempt either way. Three wrong codes burn the challenge."""
+    draft = _drafts.get(draft_id)
+    if draft is None or draft.payload is None:
+        raise HTTPException(404, {"error": "no such draft (or it expired)",
+                                  "draft_id": draft_id})
+    p_hash = payload_hash(draft.payload)
+    try:
+        _step_up.confirm(draft_id, req.code)
+    except StepUpError as exc:
+        _traces.event(draft_id, "confirm", ok=False, error=str(exc),
+                      attempts_left=exc.attempts_left)
+        _audit.append(AuditEntryType.CONFIRMATION, {
+            "draft_id": draft_id, "payload_hash": p_hash,
+            "confirmed": False, "attempts_left": exc.attempts_left})
+        raise HTTPException(400, {"error": str(exc),
+                                  "attempts_left": exc.attempts_left})
+    _audit.append(AuditEntryType.CONFIRMATION, {
+        "draft_id": draft_id, "payload_hash": p_hash, "confirmed": True})
+    _traces.event(draft_id, "confirm", ok=True)
+    return {"confirmed": True, "draft_id": draft_id}
+
+
+@app.get("/api/phone/messages", response_model=None)
+def phone_messages(user_id: str = Query(DEMO_USER_ID)):
+    """# MOCK: the simulated phone's inbox, rendered by /phone. Stands in for
+    an SMS gateway so the demo can show the second channel on a second screen.
+    Would NOT exist in a deployment — like /api/auth/mock-sign."""
+    return {"user_id": user_id, "messages": _phone.messages(user_id)}
+
+
+@app.get("/phone")
+def phone_page():
+    """The simulated phone (open it in a second window for the demo)."""
+    return FileResponse(FRONTEND_DIR / "phone.html")
 
 
 @app.get("/api/drafts/{draft_id}", response_model=None)
@@ -676,13 +927,66 @@ def get_draft(draft_id: str):
         raise HTTPException(404, {"error": "no such draft (or it expired)",
                                   "draft_id": draft_id})
     return {
-        "status": draft.status, "draft_id": draft.draft_id,
+        "status": draft.status, "draft_id": draft.draft_id, "kind": draft.kind,
         "transcript": draft.transcript,
+        "contact_change": (draft.resolved_change.model_dump(mode="json")
+                           if draft.resolved_change else None),
         "resolved_plan": (draft.resolved_plan.model_dump(mode="json")
                           if draft.resolved_plan else None),
         "policy": draft.policy, "validation": draft.validation,
         "question": draft.question,
     }
+
+
+# --------------------------------------------------------------------------- /data: request traces
+@app.get("/api/data", response_model=None)
+def data_traces():
+    """# MOCK/demo: the last requests, step by step — the exact prompts sent to
+    the LLM, its raw replies, and what every deterministic step did next."""
+    return {"provider": get_provider(settings).name, "traces": _traces.recent()}
+
+
+@app.get("/data")
+def data_page():
+    return FileResponse(FRONTEND_DIR / "data.html")
+
+
+# --------------------------------------------------------------------------- contacts
+@app.get("/api/contacts", response_model=None)
+def list_contacts(user_id: str = Query(DEMO_USER_ID)):
+    """The user's contacts (nickname, last 4, phone) — read-only."""
+    return _contacts_view(user_id)
+
+
+class ContactApplyRequest(BaseModel):
+    """Mock-signer path, like /api/gateway/execute: payload + signature + nonce."""
+    contact_change: ResolvedContactChange
+    signature: str | None = None
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/contacts/apply")
+def contacts_apply(req: ContactApplyRequest):
+    return _traced_gateway(req.contact_change.draft_id, "mock signer",
+                           _gateway.submit_contact_change(req.contact_change, req.signature,
+                                                          req.nonce, req.credential_id))
+
+
+class ContactApplyWebAuthnRequest(BaseModel):
+    """The real path: a WebAuthn assertion over sha256(payload_hash + nonce)."""
+    contact_change: ResolvedContactChange
+    assertion: dict
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/contacts/apply-webauthn")
+def contacts_apply_webauthn(req: ContactApplyWebAuthnRequest):
+    """The only route by which a contact's name or number changes."""
+    return _traced_gateway(req.contact_change.draft_id, "WebAuthn",
+                           _webauthn_gateway.submit_contact_change(req.contact_change, req.assertion,
+                                                                   req.nonce, req.credential_id))
 
 
 # Serve frontend assets (canonical.js, app.js, style.css). Mounted LAST so the

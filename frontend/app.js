@@ -1,5 +1,5 @@
 /*
- * DCTA overlay — transaction confirmation. (brief 4.2 / 4.5)
+ * DCTA assistant — a chat that drafts payments; the user signs them. (brief 4.2 / 4.5)
  *
  * SECURITY MODEL (read before editing):
  *  - The overlay renders the ResolvedPlan via a FIXED template (known fields
@@ -67,82 +67,6 @@ async function jpost(url, body) {
   return { status: r.status, json: await r.json().catch(() => ({})) };
 }
 
-/* ---------- fixed-template render (no innerHTML for data) ---------- */
-function el(tag, cls) {
-  const n = document.createElement(tag);
-  if (cls) n.className = cls;
-  return n;
-}
-function row(dt, dd) {
-  const dl = el("dl");
-  const k = el("dt"); k.textContent = dt;
-  const v = el("dd"); v.textContent = dd;
-  dl.append(k, v);
-  return dl;
-}
-/* The overlay is the one surface we tell the user to trust, so it must not
-   show database internals. These are pure, deterministic transforms of the
-   SIGNED payload — no extra inputs, no new trust surface, and the template
-   stays fixed (brief 4.2). */
-function acctLabel(id) {
-  // "acct_savings" -> "Savings". Deterministic and local; falls back to the
-  // raw id rather than inventing a name it cannot derive.
-  const m = /^acct_(.+)$/.exec(id || "");
-  if (!m) return id || "";
-  return m[1].charAt(0).toUpperCase() + m[1].slice(1);
-}
-function windowLabel(created, expires) {
-  // Unix seconds are correct in the payload and meaningless on screen.
-  const mins = Math.max(0, Math.round((expires - created) / 60));
-  const until = new Date(expires * 1000).toLocaleTimeString([], {
-    hour: "2-digit", minute: "2-digit", second: "2-digit",
-  });
-  return `${mins} min — expires ${until}`;
-}
-
-function renderPlan(plan) {
-  const legsEl = document.getElementById("legs");
-  legsEl.replaceChildren();
-  for (const leg of plan.plan) {
-    const card = el("div", "leg");
-    const badge = el("span", "type"); badge.textContent = leg.type;
-    card.append(badge);
-    const dl = el("dl");
-    const addRow = (k, v) => {
-      const dt = el("dt"); dt.textContent = k;
-      const dd = el("dd"); dd.textContent = v;
-      dl.append(dt, dd);
-    };
-    addRow("From", acctLabel(leg.source_account));
-    // payee_display is already the safe DB-sourced label (nickname + last 4).
-    // The raw payee_id is an internal identifier and does not belong on the
-    // confirmation screen.
-    if (leg.payee_display) addRow("To", leg.payee_display);
-    if (leg.biller_display) addRow("To", leg.biller_display);
-    if (leg.amount_cents != null) {
-      const dt = el("dt"); dt.textContent = "Amount";
-      const dd = el("dd"); dd.className = "amt"; dd.textContent = centsToDisplay(leg.amount_cents);
-      dl.append(dt, dd);
-    }
-    if (leg.ticker) addRow("Ticker", leg.ticker);
-    if (leg.estimated_shares != null) addRow("Est. shares", String(leg.estimated_shares));
-    card.append(dl);
-    legsEl.append(card);
-  }
-  document.getElementById("window").textContent =
-    windowLabel(plan.created_at, plan.expires_at);
-  document.getElementById("txhash").textContent = plan.transcript_hash.slice(0, 16) + "\u2026";
-  // Computed at sign time; show a placeholder rather than an empty row, which
-  // reads as broken.
-  document.getElementById("phash").textContent = "computed when you confirm";
-}
-
-function showErr(msg) {
-  const e = document.getElementById("err");
-  e.textContent = msg;
-  e.hidden = false;
-}
-
 /* ---------- registration ---------- */
 function prepareCreateOptions(opts) {
   // options_to_json gives base64url STRINGS; navigator.credentials.create
@@ -189,7 +113,9 @@ function assertionToJson(a) {
     authenticatorAttachment: a.authenticatorAttachment || null,
   };
 }
-async function signAndExecute(plan, credentialIds, rpId) {
+async function signAndExecute(plan, credentialIds, rpId,
+                              endpoint = "/api/gateway/execute-webauthn",
+                              field = "resolved_plan") {
   // rpId comes from the server (/api/auth/config) so registration and signing
   // cannot disagree (M1: location.hostname would differ from settings.rp_id
   // when the app is reached at 127.0.0.1 instead of localhost).
@@ -220,57 +146,359 @@ async function signAndExecute(plan, credentialIds, rpId) {
   });
 
   // 5. submit to the gateway.
-  return jpost(API + "/api/gateway/execute-webauthn", {
-    resolved_plan: plan,
+  return jpost(API + endpoint, {
+    [field]: plan,
     assertion: assertionToJson(assertion),
     nonce: nonce,
     credential_id: assertion.id,
   });
 }
 
-function showResult(res) {
-  const box = document.getElementById("result");
-  const status = res.json.accepted ? "EXECUTED" : res.json.rejection || "REJECTED";
-  // status + body are TEXT, never parsed as HTML. A rejection reason carries
-  // executor/LLM-influenced text (e.g. a failed account "<img src=x ...>");
-  // this is the trusted overlay -- the surface the "what you see is what you
-  // sign" argument presumes renders faithfully -- so markup must appear as
-  // literal characters, not as a parsed element. Same textContent-only rule
-  // renderPlan() follows for every field. (H1: this was an innerHTML sink;
-  // JSON.stringify escapes quotes but not </>, so the tag parsed.)
-  const h3 = el("h3"); h3.textContent = status;
-  const pre = el("pre");
-  pre.textContent = JSON.stringify(
-    res.json.accepted ? res.json.execution : res.json, null, 2);
-  box.replaceChildren(h3, pre);           // clears any prior content, appends
-  box.className = "result " + (res.json.accepted ? "ok" : "bad");
-  box.hidden = false;
+/* ---------- chat rendering (no innerHTML for data, ever) ---------- */
+/* The page is a conversation. Messages are built with createElement +
+   textContent only. A payment is rendered as a FIXED-TEMPLATE card from the
+   ResolvedPlan JSON (known fields -> fixed labels); the assistant never shows
+   LLM-generated text as a transaction summary. */
+function el(tag, cls, text) {
+  const n = document.createElement(tag);
+  if (cls) n.className = cls;
+  if (text != null) n.textContent = text;
+  return n;
+}
+const thread = () => document.getElementById("thread");
+
+function scrollDown() {
+  const t = thread();
+  requestAnimationFrame(() => { t.scrollTop = t.scrollHeight; });
+}
+function addMsg(who, ...children) {
+  const m = el("section", "msg " + who);
+  m.append(...children);
+  thread().append(m);
+  scrollDown();
+  return m;
+}
+function botSay(text, cls) {
+  return addMsg("bot", el("div", "bubble" + (cls ? " " + cls : ""), text));
+}
+function userSay(text) {
+  return addMsg("user", el("div", "bubble", text));
 }
 
-/* ---------- M7: transcript -> draft, with the clarify loop ---------- */
+let typingEl = null;
+function typing(on) {
+  if (typingEl) { typingEl.remove(); typingEl = null; }
+  if (!on) return;
+  const b = el("div", "bubble typing");
+  b.append(el("i"), el("i"), el("i"));
+  typingEl = addMsg("bot", b);
+}
+
+/* The latest payment card owns the element ids (#plan, #sign, #stepup, …) so
+   the live controls are unambiguous. A newer card retires the older one:
+   its ids are dropped and its controls disabled — an old draft can't be
+   signed from further up the conversation. */
+const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign",
+                  "stepup", "stepup-reason", "stepup-form", "stepup-code"];
+function retireLiveCard() {
+  for (const id of LIVE_IDS) {
+    const n = document.getElementById(id);
+    if (!n) continue;
+    n.removeAttribute("id");
+    if (n.tagName === "BUTTON" || n.tagName === "INPUT") n.disabled = true;
+  }
+  document.querySelectorAll(".chips.live").forEach((c) => {
+    c.classList.remove("live");
+    c.querySelectorAll("button").forEach((b) => { b.disabled = true; });
+  });
+}
+
+/* The payment card is the one surface we tell the user to trust, so it must
+   not show database internals. These are pure, deterministic transforms of
+   the SIGNED payload — no extra inputs, no new trust surface (brief 4.2). */
+function acctLabel(id) {
+  // "acct_savings" -> "Savings". Deterministic and local; falls back to the
+  // raw id rather than inventing a name it cannot derive.
+  const m = /^acct_(.+)$/.exec(id || "");
+  if (!m) return id || "";
+  return m[1].charAt(0).toUpperCase() + m[1].slice(1);
+}
+function windowLabel(created, expires) {
+  // Unix seconds are correct in the payload and meaningless on screen.
+  const mins = Math.max(0, Math.round((expires - created) / 60));
+  const until = new Date(expires * 1000).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  return `${mins} min — expires ${until}`;
+}
+const LEG_ICON = { TRANSFER: "→", PAY_BILL: "≡", BUY_EQUITY: "↗" };
+const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "Buy shares" };
+
+function legRow(leg) {
+  const row = el("div", "leg");
+  row.append(el("div", "icon", LEG_ICON[leg.type] || "•"));
+  // payee_display / biller_display are already the safe DB-sourced labels
+  // (nickname + last 4). Raw ids are internal and never shown.
+  let title = LEG_NAME[leg.type] || leg.type;
+  if (leg.payee_display) title = "To " + leg.payee_display;
+  if (leg.biller_display) title = "To " + leg.biller_display;
+  if (leg.type === "BUY_EQUITY" && leg.ticker) {
+    title = (leg.estimated_shares != null ? leg.estimated_shares + " × " : "") + leg.ticker;
+  }
+  row.append(el("div", "title", title));
+  row.append(el("div", "amt", leg.amount_cents != null ? centsToDisplay(leg.amount_cents) : ""));
+  const sub = el("div", "sub");
+  sub.textContent = (LEG_NAME[leg.type] || leg.type) + " · from " + acctLabel(leg.source_account);
+  row.append(sub);
+  row.append(el("div", "sub right",
+    leg.type === "BUY_EQUITY" && leg.estimated_fill_price_cents
+      ? "@ " + centsToDisplay(leg.estimated_fill_price_cents) : ""));
+  return row;
+}
+
+function buildPlanCard(plan, confirmation) {
+  retireLiveCard();
+  const card = el("div", "bubble card plan-card plan");
+  card.id = "plan";
+  card.append(el("p", "card-title", "Review payment"));
+
+  const legs = el("div", "legs"); legs.id = "legs";
+  for (const leg of plan.plan) legs.append(legRow(leg));
+  card.append(legs);
+
+  const sec = el("details", "sec");
+  sec.append(el("summary", null, "Security details"));
+  const dl = el("dl", "meta");
+  const add = (k, v, id, cls) => {
+    const dd = el("dd", cls, v); if (id) dd.id = id;
+    dl.append(el("dt", null, k), dd);
+  };
+  add("Authorization window", windowLabel(plan.created_at, plan.expires_at), "window");
+  add("Transcript hash", plan.transcript_hash.slice(0, 16) + "…", "txhash", "mono");
+  // Computed at sign time; a placeholder reads better than an empty row.
+  add("Payload hash (your browser)", "computed when you confirm", "phash", "mono");
+  sec.append(dl);
+  card.append(sec);
+
+  if (confirmation) card.append(buildStepUp(confirmation));
+
+  const btn = el("button", "btn primary", "Confirm with biometric");
+  btn.id = "sign";
+  // Escalated: signing stays disabled until the out-of-band code is verified.
+  // That is UX only — the gateway refuses an unconfirmed escalated plan
+  // whatever this page does (gateway/stepup.py).
+  btn.disabled = !!confirmation;
+  btn.onclick = onSign;
+  card.append(btn);
+  card.append(el("p", "hint",
+    "Your device signs a hash of exactly this payment, recomputed in your browser."));
+  return card;
+}
+
+/* A contact change, through the same fixed template rules as a payment:
+   DB-sourced labels, textContent only, old value shown next to the new one so
+   the user sees exactly what they are overwriting. */
+function buildChangeCard(change, confirmation) {
+  retireLiveCard();
+  const card = el("div", "bubble card plan-card plan");
+  card.id = "plan";
+  card.append(el("p", "card-title", "Review change"));
+  const legs = el("div", "legs"); legs.id = "legs";
+  for (const e of change.edits) {
+    const row = el("div", "leg change");
+    row.append(el("div", "icon", e.field === "phone" ? "☎" : "✎"));
+    row.append(el("div", "title", e.payee_display));
+    row.append(el("div", "amt", ""));
+    const sub = el("div", "sub diff");
+    sub.append(el("span", null, (e.field === "phone" ? "Phone" : "Name") + ": "),
+               el("s", "old", e.old_value || "none"),
+               el("span", "arrow", " → "),
+               el("b", "new", e.new_value));
+    row.append(sub);
+    legs.append(row);
+  }
+  card.append(legs);
+
+  const sec = el("details", "sec");
+  sec.append(el("summary", null, "Security details"));
+  const dl = el("dl", "meta");
+  const add = (k, v, id, cls) => {
+    const dd = el("dd", cls, v); if (id) dd.id = id;
+    dl.append(el("dt", null, k), dd);
+  };
+  add("Authorization window", windowLabel(change.created_at, change.expires_at), "window");
+  add("Transcript hash", change.transcript_hash.slice(0, 16) + "\u2026", "txhash", "mono");
+  add("Payload hash (your browser)", "computed when you confirm", "phash", "mono");
+  sec.append(dl);
+  card.append(sec);
+
+  if (confirmation) card.append(buildStepUp(confirmation));
+  const btn = el("button", "btn primary", "Confirm with biometric");
+  btn.id = "sign";
+  btn.disabled = !!confirmation;
+  btn.onclick = onSign;
+  card.append(btn);
+  card.append(el("p", "hint",
+    "Nothing changes until you confirm. Your device signs exactly this change."));
+  return card;
+}
+
+function buildContactsCard(contacts) {
+  const card = el("div", "bubble card contacts");
+  card.append(el("p", "card-title", "Contacts"));
+  const ul = el("ul", "contact-list");
+  for (const c of contacts) {
+    const li = el("li");
+    const av = el("div", "cavatar", (c.nickname || "?").charAt(0).toUpperCase());
+    const who = el("div", "cwho");
+    who.append(el("div", "cname", c.display), el("div", "cphone", c.phone || "No phone number"));
+    li.append(av, who);
+    ul.append(li);
+  }
+  card.append(ul);
+  card.append(el("p", "hint", "Say \"rename John to Johnny\" or \"change Mom's number to 9123 4567\"."));
+  return card;
+}
+
+/* Out-of-band step-up. The code is NOT in any response this page receives: it
+   goes to the user's phone, in a message describing the payment from the
+   server's copy of the plan. */
+function buildStepUp(conf) {
+  const box = el("div", "stepup"); box.id = "stepup";
+  box.append(el("p", "stepup-title", "Extra confirmation needed"));
+  const reason = el("p", "stepup-reason", (conf.reasons || []).join(" "));
+  reason.id = "stepup-reason";
+  box.append(reason);
+  const hint = el("p", "hint", "We texted a 6-digit code to your phone. Check the details there, then enter it. ");
+  const a = el("a", null, "Open the demo phone");
+  a.href = "/phone"; a.target = "dcta-phone";
+  hint.append(a);
+  box.append(hint);
+
+  const form = el("form", "stepup-form"); form.id = "stepup-form";
+  const input = el("input"); input.id = "stepup-code";
+  input.inputMode = "numeric"; input.autocomplete = "one-time-code";
+  input.maxLength = 6; input.placeholder = "••••••";
+  const go = el("button", "btn primary", "Verify"); go.type = "submit";
+  form.append(input, go);
+  box.append(form);
+
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const code = input.value.trim();
+    if (!code) return;
+    go.disabled = true;
+    const res = await jpost(
+      API + "/api/drafts/" + encodeURIComponent(CURRENT.draftId) + "/confirm", { code });
+    if (res.status === 200) {
+      input.disabled = true;
+      box.classList.add("done");
+      box.querySelector(".stepup-title").textContent = "Confirmed on your phone";
+      form.remove();
+      const sign = document.getElementById("sign");
+      if (sign) sign.disabled = false;
+      botSay("Code accepted. Confirm with your biometric to send it.");
+      return;
+    }
+    go.disabled = false;
+    const d = res.json.detail || {};
+    showErr(d.error || `confirmation failed (${res.status})`);
+    if (d.attempts_left === 0) { input.disabled = true; go.disabled = true; }
+    else { input.select(); }
+  };
+  return box;
+}
+
+function showErr(msg) {
+  typing(false);
+  botSay(msg, "error");
+}
+
+/* ---------- results ---------- */
+/* #result is always the LATEST outcome card. showResult / showRefusal move the
+   id to a new card; an empty placeholder (the static one) is removed. */
+function newResultCard(ok) {
+  typing(false);
+  const prev = document.getElementById("result");
+  if (prev) {
+    prev.removeAttribute("id");
+    if (!prev.childElementCount) prev.remove();
+  }
+  const box = el("section", "msg bot result " + (ok ? "ok" : "bad"));
+  box.id = "result";
+  const card = el("div", "bubble card");
+  box.append(card);
+  thread().append(box);
+  scrollDown();
+  return card;
+}
+
+function showResult(res) {
+  const ok = !!res.json.accepted;
+  const exec = res.json.execution || {};
+  const status = ok ? (exec.status || "EXECUTED") : res.json.rejection || "REJECTED";
+  const card = newResultCard(ok);
+  // status + body are TEXT, never parsed as HTML. A rejection reason carries
+  // executor/LLM-influenced text (e.g. a failed account "<img src=x ...>");
+  // this is the trusted surface the "what you see is what you sign" argument
+  // presumes renders faithfully, so markup must appear as literal characters.
+  // (H1: this was an innerHTML sink; JSON.stringify escapes quotes but not </>.)
+  card.append(el("h3", null, status));
+  if (ok) {
+    card.append(el("p", "lead", "Done. Here's what went through:"));
+    const ul = el("ul");
+    for (const c of exec.changes || []) {
+      const li = el("li");
+      li.append(el("span", null, c.payee_display + " · " + (c.field === "phone" ? "phone" : "name")),
+                el("span", null, c.new_value));
+      ul.append(li);
+    }
+    for (const leg of exec.legs || []) {
+      const li = el("li");
+      li.append(el("span", null, LEG_NAME[leg.type] || leg.type),
+                el("span", null, (leg.amount_cents != null ? centsToDisplay(leg.amount_cents) + " · " : "") + leg.status));
+      ul.append(li);
+    }
+    card.append(ul);
+  } else {
+    card.append(el("p", "lead", res.json.reason || "The gateway refused this payment."));
+    const pre = el("pre");
+    pre.textContent = JSON.stringify(res.json, null, 2);
+    card.append(pre);
+  }
+}
+
+function showRefusal(title, detail, explanation) {
+  const card = newResultCard(false);
+  card.append(el("h3", null, title));
+  card.append(el("p", "lead", explanation));
+  const pre = el("pre");
+  pre.textContent = JSON.stringify(detail, null, 2);   // textContent, never innerHTML (H1)
+  card.append(pre);
+}
+
+/* ---------- the conversation: transcript -> draft, with the clarify loop ---------- */
 /* The draft lives SERVER-SIDE (backend/drafts.py). We send a transcript and get
    a draft_id back; answering a question sends only {field, choice_id} for that
    id. The client never holds or returns the plan — so it cannot substitute one,
    and a clarify round-trip re-RESOLVES against the stored IntentPlan rather
-   than re-parsing the transcript, which with a real model could otherwise
-   produce a different plan on every turn. */
-let CURRENT = { draftId: null, plan: null, credentialIds: [], transcript: "" };
+   than re-parsing the transcript. */
+let CURRENT = { draftId: null, plan: null, kind: "payment", credentialIds: [], rpId: undefined, transcript: "" };
 
 function setStatus(msg) {
-  const el = document.getElementById("status");
-  if (el) { el.textContent = msg; el.hidden = !msg; }
+  const s = document.getElementById("status");
+  if (s) { s.textContent = msg; s.hidden = !msg; }
 }
 
 function handleDraft(res) {
+  typing(false);
   if (res.status !== 200) {
     const d = res.json.detail || {};
-    showErr(d.error || `request failed (${res.status})`);
-    setStatus("");
+    showErr(d.error || `Something went wrong (${res.status}).`);
     return;
   }
   const body = res.json;
   CURRENT.draftId = body.draft_id;
-  setStatus("");
 
   // Four outcomes, and the user must be able to tell them apart. All are HTTP
   // 200: needing to ask is a normal conversational result, and a refusal is a
@@ -281,153 +509,188 @@ function handleDraft(res) {
     return;
   }
   if (body.status === "blocked") {                 // M5 policy refusal
-    showRefusal("BLOCKED BY POLICY", body.reasons || [],
-      "A policy rule refused this before it could be drafted.");
+    showRefusal("Blocked by policy", body.reasons || [],
+      "A policy rule refused this before it could be drafted. Nothing was sent.");
     return;
   }
   if (body.status === "frozen") {                  // M6 validator freeze
-    showRefusal("FROZEN BY VALIDATOR",
+    showRefusal("Frozen by validator",
       (body.validation && body.validation.checks) || body.validation || [],
       "The independent validator found a mismatch between what you said and "
       + "what was drafted. This draft cannot be signed.");
     return;
   }
 
-  CURRENT.plan = body.resolved_plan;
-  renderPlan(body.resolved_plan);
-  document.getElementById("plan").hidden = false;
-  if (body.requires_extra_confirmation) {
-    setStatus("This amount needs an extra out-of-band confirmation.");
+  if (body.kind === "contacts") {                  // read-only list
+    addMsg("bot", el("div", "bubble", "Here are your saved contacts."),
+           buildContactsCard(body.contacts || []));
+    return;
   }
-  const btn = document.getElementById("sign");
-  btn.disabled = false;
-  btn.onclick = onSign;
+  const conf = body.requires_extra_confirmation ? (body.confirmation || {}) : null;
+  if (body.kind === "contact_edit") {
+    CURRENT.plan = body.contact_change;
+    CURRENT.kind = "contact_edit";
+    const intro = el("div", "bubble",
+      conf ? "Here's the change. A new phone number changes where payments go, so I need one more check first."
+           : "Here's the change. Check it, then confirm with your biometric.");
+    addMsg("bot", intro, buildChangeCard(body.contact_change, conf));
+    if (conf) { const code = document.getElementById("stepup-code"); if (code) code.focus(); }
+    return;
+  }
+
+  CURRENT.plan = body.resolved_plan;
+  CURRENT.kind = "payment";
+  const intro = el("div", "bubble",
+    conf ? "Here's the draft. It's unusual for you, so I need one more check first."
+         : "Here's the draft. Check it, then confirm with your biometric.");
+  addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf));
+  if (conf) {
+    const code = document.getElementById("stepup-code");
+    if (code) code.focus();
+  }
 }
 
-async function submitTranscript(transcript) {
-  setStatus("Working…");
+async function submitTranscript(transcript, via) {
   CURRENT.transcript = transcript;
-  handleDraft(await jpost(API + "/api/drafts", {
-    transcript, user_id: DEMO_USER,
-  }));
+  userSay(transcript);
+  if (via) {
+    const last = thread().lastElementChild;
+    last.append(el("p", "meta-note", "via " + via));
+  }
+  typing(true);
+  handleDraft(await jpost(API + "/api/drafts", { transcript, user_id: DEMO_USER }));
 }
 
 async function answerClarification(field, choiceId) {
-  setStatus("Working…");
+  typing(true);
   handleDraft(await jpost(
     API + "/api/drafts/" + encodeURIComponent(CURRENT.draftId) + "/clarify",
     { field, choice_id: choiceId },
   ));
 }
 
-function showRefusal(title, detail, explanation) {
-  const box = document.getElementById("result");
-  box.replaceChildren();
-  const h = el("h3"); h.textContent = title;
-  const p = el("p"); p.textContent = explanation;
-  const pre = el("pre");
-  pre.textContent = JSON.stringify(detail, null, 2);   // textContent, never innerHTML (H1)
-  box.append(h, p, pre);
-  box.className = "result bad";
-  box.hidden = false;
-}
-
 function renderClarify(body) {
-  const box = document.getElementById("clarify");
-  box.replaceChildren();
-  const q = el("p", "question"); q.textContent = body.question;
-  box.append(q);
-
+  retireLiveCard();
+  const m = addMsg("bot", el("div", "bubble", body.question));
   if (body.choices && body.choices.length) {
     // 2+ disambiguation: the user picks, and we resume with `answers`. The
     // resolver re-validates the chosen id against a fresh deterministic match,
     // so a tampered choice cannot inject a payee the mention never justified.
-    const row = el("div", "choices");
+    const chips = el("div", "chips live");
     for (const c of body.choices) {
-      const b = el("button", "choice");
-      b.textContent = c.display;                 // textContent: DB-sourced, still never innerHTML
+      const b = el("button", "chip choice", c.display);  // textContent: DB-sourced
+      b.type = "button";
       b.onclick = () => {
-        box.hidden = true;
+        chips.classList.remove("live");
+        chips.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+        b.classList.add("chosen");
+        userSay(c.display);
         answerClarification(body.field, c.id);
       };
-      row.append(b);
+      chips.append(b);
     }
-    box.append(row);
+    m.append(chips);
   } else {
     // 0-match / empty / insufficient: no candidate list to choose from, so the
     // user re-states the request and it re-enters the pipeline from the top.
-    const hint = el("p", "hint");
-    hint.textContent = "Say or type it again with more detail.";
-    box.append(hint);
+    m.append(el("p", "meta-note", "Say or type it again with more detail."));
   }
-  box.hidden = false;
-}
-
-function showFrozen(body) {
-  const box = document.getElementById("result");
-  box.replaceChildren();
-  const h = el("h3"); h.textContent = "FROZEN";
-  const p = el("p");
-  p.textContent = "The independent validator found a mismatch between what you "
-    + "said and what was drafted. This draft cannot be signed.";
-  const pre = el("pre");
-  pre.textContent = JSON.stringify(body.reasons, null, 2);   // never innerHTML (H1)
-  box.append(h, p, pre);
-  box.className = "result bad";
-  box.hidden = false;
 }
 
 async function onSign() {
   const btn = document.getElementById("sign");
+  if (!btn) return;
   btn.disabled = true;
   try {
-    const res = await signAndExecute(CURRENT.plan, CURRENT.credentialIds);
+    const res = CURRENT.kind === "contact_edit"
+      ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
+                             "/api/contacts/apply-webauthn", "contact_change")
+      : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId);
     showResult(res);
+    // One draft, one signature: the card is spent whatever the outcome.
+    retireLiveCard();
   } catch (e) {
-    showErr(String(e));
-  } finally {
+    showErr(e && e.name === "NotAllowedError"
+      ? "Biometric cancelled — nothing was sent. Tap confirm to try again."
+      : String(e));
     btn.disabled = false;
   }
 }
 
-/* ---------- M7: voice input, three tiers ---------- */
+/* ---------- voice input, three tiers ---------- */
+/* Readable messages for the Web Speech API's error codes. */
+const SPEECH_ERRORS = {
+  "not-allowed": "Microphone access is blocked. Allow it in the address bar, or type instead.",
+  "service-not-allowed": "This browser won't run speech recognition here. Type it instead.",
+  "no-speech": "I didn't hear anything. Tap the mic and try again.",
+  "audio-capture": "No microphone was found. Type it instead.",
+  "network": "The browser's speech service couldn't be reached. Type it instead.",
+  "aborted": "",
+};
+
 function wireVoice() {
   const mic = document.getElementById("mic");
   const textForm = document.getElementById("say-form");
   const textIn = document.getElementById("say");
-  if (!mic) return;
+
+  // Once server-side ASR has said "not available" (503/415/413), skip it for
+  // the rest of the session: otherwise every press records, uploads, gets
+  // refused, and asks the user to say it all a second time.
+  let serverAsrDown = false;
+  let active = null;               // { stop() } for whichever tier is listening
 
   const onText = (t, provider) => {
-    textIn.value = t;
-    setStatus(`Heard (${provider}): "${t}"`);
-    submitTranscript(t);
+    active = null;
+    setStatus("");
+    if (!t || !t.trim()) { showErr("I didn't catch that. Tap the mic and try again."); return; }
+    submitTranscript(t.trim(), provider === "webspeech" ? "browser speech" : provider);
   };
-  const onError = (e) => { setStatus(""); mic.classList.remove("live"); showErr(String(e.message || e)); };
+  const onError = (e) => {
+    active = null;
+    setStatus("");
+    mic.classList.remove("live");
+    const m = /^speech recognition: (.+)$/.exec(String(e && e.message || e));
+    const msg = m ? SPEECH_ERRORS[m[1]] ?? ("Speech recognition failed (" + m[1] + "). Type it instead.")
+                  : String(e && e.message || e);
+    if (msg) showErr(msg);
+  };
   const onState = (st) => {
+    // "idle" = the browser recognizer ended on its own (pause, result, error).
+    if (st === "idle") active = null;
     mic.classList.toggle("live", st === "listening");
-    setStatus(st === "listening" ? "Listening…" : st === "thinking" ? "Transcribing…" : "");
+    setStatus(st === "listening" ? "Listening… tap the mic when you're done"
+      : st === "thinking" ? "Transcribing…" : "");
   };
 
-  let active = null;
+  function startWebSpeech() {
+    if (!Voice.speechRecognitionAvailable()) {
+      setStatus("");
+      showErr("Speech isn't available in this browser — type it instead.");
+      textIn.focus();
+      return;
+    }
+    const rec = Voice.listenWebSpeech({ onText, onError, onState });
+    active = rec ? { stop: () => rec.stop() } : null;
+  }
+
   mic.onclick = async () => {
-    if (active) { Voice.stop(); active = null; return; }
-    document.getElementById("err").hidden = true;
-    // Tier 1 first (server-side Tencent ASR). On 503 we drop to tier 2 without
-    // telling the user anything went wrong — nothing did.
-    active = await Voice.recordAndUpload({
-      onText: (t, p) => { active = null; onText(t, p); },
-      onError: (e) => { active = null; onError(e); },
-      onState,
+    // A second press stops whichever tier is listening.
+    if (active) { active.stop(); active = null; return; }
+    if (serverAsrDown) { startWebSpeech(); return; }
+    // Tier 1 first (server-side Tencent ASR).
+    const rec = await Voice.recordAndUpload({
+      onText, onError, onState,
       onFallback: () => {
+        // The recording can't be reused by the browser tier, so say so rather
+        // than silently listening again.
+        serverAsrDown = true;
         active = null;
-        if (!Voice.speechRecognitionAvailable()) {
-          setStatus("Speech unavailable — type it instead.");
-          textIn.focus();
-          return;
-        }
-        Voice.listenWebSpeech({ onText, onError, onState });
+        botSay("Tencent speech recognition isn't available right now, so I'll "
+          + "use your browser's instead. Please say it again.");
+        startWebSpeech();
       },
     });
+    active = rec ? { stop: () => Voice.stop() } : null;
   };
 
   // Tier 3, always present: typing the same sentence must always work.
@@ -435,31 +698,70 @@ function wireVoice() {
     e.preventDefault();
     const t = textIn.value.trim();
     if (!t) return;
-    document.getElementById("err").hidden = true;
-    document.getElementById("clarify").hidden = true;
+    textIn.value = "";
     submitTranscript(t);
   };
 }
 
+const SUGGESTIONS = [
+  "Pay mom five hundred then buy Apple with the rest",
+  "Send fifty to John",
+  "Send five thousand to John",
+  "Show my contacts",
+  "Change Mom's number to 9123 4567",
+];
+
+function greet() {
+  const m = botSay("Hi Alice. Tell me what you'd like to do — pay someone, "
+    + "pay a bill, buy shares, or update a contact. I'll draft it, and nothing moves until you "
+    + "approve it with your biometric.");
+  const chips = el("div", "chips");
+  for (const s of SUGGESTIONS) {
+    const b = el("button", "chip", s);
+    b.type = "button";
+    b.onclick = () => submitTranscript(s);
+    chips.append(b);
+  }
+  m.append(chips);
+}
+
+function tickClock() {
+  const c = document.getElementById("clock");
+  if (c) c.textContent = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }).replace(/\s?[AP]M$/i, "");
+}
+
 /* ---------- bootstrap ---------- */
 async function init() {
-  const creds = await jget(API + "/api/auth/credentials?user_id=" + DEMO_USER);
-  const hasPasskey = creds.credential_ids && creds.credential_ids.length > 0;
+  tickClock();
+  setInterval(tickClock, 15000);
+  const [creds, cfg] = await Promise.all([
+    jget(API + "/api/auth/credentials?user_id=" + DEMO_USER),
+    jget(API + "/api/auth/config").catch(() => ({})),
+  ]);
   CURRENT.credentialIds = creds.credential_ids || [];
+  CURRENT.rpId = cfg.rp_id || undefined;
 
-  if (!hasPasskey) {
+  if (!CURRENT.credentialIds.length) {
     const reg = document.getElementById("register");
     reg.hidden = false;
-    document.getElementById("register-btn").onclick = async () => {
+    const btn = document.getElementById("register-btn");
+    btn.onclick = async () => {
+      btn.disabled = true;
       try {
         await registerPasskey();
-        reg.hidden = true;
         location.reload();
-      } catch (e) { showErr(String(e)); }
+      } catch (e) {
+        btn.disabled = false;
+        showErr(e && e.name === "NotAllowedError"
+          ? "Passkey setup was cancelled. Tap Register passkey to try again."
+          : String(e));
+      }
     };
     return;
   }
   wireVoice();
   document.getElementById("say-box").hidden = false;
+  greet();
 }
 window.addEventListener("DOMContentLoaded", init);
+

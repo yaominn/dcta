@@ -16,11 +16,13 @@ Two things are pinned here:
 from __future__ import annotations
 
 import io
+import json
 
 import pytest
 from fastapi.testclient import TestClient
 
 from backend.asr import ASRUnavailable, UnavailableASR, get_asr_provider
+from backend.data.seed import seed
 from backend.config import settings
 from backend.main import app
 
@@ -108,3 +110,92 @@ def test_every_outcome_is_http_200():
               "send fifty to john from savings",
               "mmmm"]:
         assert _draft(t).status_code == 200
+
+
+# --------------------------------------------------------------------------- M7 review additions
+def test_unsupported_container_is_refused_before_it_is_forwarded():
+    """Chrome's MediaRecorder produces audio/webm;codecs=opus, which shares a
+    codec but NOT a container with the documented ogg-opus. The browser now
+    reports what it actually recorded, and we refuse it HERE rather than paying
+    for an upstream call that cannot succeed — 415, naming the fallback tier."""
+    from backend.asr import SUPPORTED_VOICE_FORMATS
+    assert "webm" not in SUPPORTED_VOICE_FORMATS
+
+    client = TestClient(app)
+    r = client.post("/api/transcribe?fmt=webm",
+                    files={"audio": ("utterance", b"\x1aE\xdf\xa3fake-webm", "audio/webm")})
+    assert r.status_code == 415
+    detail = r.json()["detail"]
+    assert detail["fallback"] == "webspeech"
+    assert "webm" in detail["error"]
+
+
+def test_a_caller_supplied_format_cannot_reach_the_upstream_request():
+    """`fmt` is browser-supplied input that would otherwise go straight into a
+    paid upstream call as VoiceFormat. Validated on our side, like the LLM's
+    output — not trusted because it came from our own page."""
+    client = TestClient(app)
+    r = client.post("/api/transcribe?fmt=../../etc/passwd",
+                    files={"audio": ("utterance", b"audio-bytes", "audio/wav")})
+    assert r.status_code == 415
+
+
+def test_oversized_audio_is_refused():
+    """Upstream caps a request at ~60s / 5MB, so a larger body cannot succeed."""
+    from backend.asr import MAX_AUDIO_BYTES
+    client = TestClient(app)
+    r = client.post("/api/transcribe?fmt=wav",
+                    files={"audio": ("utterance", b"\x00" * (MAX_AUDIO_BYTES + 1),
+                                     "audio/wav")})
+    assert r.status_code == 413
+    assert r.json()["detail"]["fallback"] == "webspeech"
+
+
+def test_a_supported_container_reaches_the_provider():
+    """The guard must not swallow a legitimate request: a documented container
+    gets through to the provider, which (with no credentials) answers 503."""
+    client = TestClient(app)
+    r = client.post("/api/transcribe?fmt=wav",
+                    files={"audio": ("utterance", b"RIFFfake-wav", "audio/wav")})
+    assert r.status_code == 503                      # reached the provider
+    assert r.json()["detail"]["fallback"] == "webspeech"
+
+
+def test_the_utterance_is_recorded_in_the_audit_chain():
+    """AuditEntryType.TRANSCRIPT was reserved for M7 and nothing emitted it, so
+    the chain had no record of the utterance every later entry derives from.
+    The signed ResolvedPlan binds transcript_hash; this is what that hash
+    corresponds to."""
+    from backend.audit.canonical import hash_transcript
+    # reset_audit: verify_chain() reports the FIRST break, so a dev DB whose
+    # chain an earlier tamper demo broke would fail this for the wrong reason.
+    seed(reset_audit=True)
+    client = TestClient(app)
+    transcript = "pay mom five hundred then buy aapl with the rest"
+    draft = client.post("/api/drafts", json={"transcript": transcript}).json()
+    assert draft["status"] == "ready"
+
+    entries = client.get("/api/audit/chain").json()["entries"]
+    transcripts = [json.loads(e["payload"]) for e in entries
+                   if e["entry_type"] == "TRANSCRIPT"]
+    mine = [t for t in transcripts if t["draft_id"] == draft["draft_id"]]
+    assert len(mine) == 1, "the utterance was not recorded in the audit chain"
+    assert mine[0]["transcript_hash"] == hash_transcript(transcript)
+    # the same hash the user signs, so the payload and the log correspond
+    assert mine[0]["transcript_hash"] == draft["resolved_plan"]["transcript_hash"]
+    assert client.get("/api/audit/verify").json()["ok"] is True
+
+
+def test_the_audit_log_stores_the_hash_not_the_words():
+    """A microphone catches more than the instruction. The hash is what the
+    signature binds, so it is what non-repudiation needs; the raw utterance
+    would put spoken details into append-only storage that is deliberately hard
+    to redact."""
+    seed()
+    client = TestClient(app)
+    secret = "pay mom five hundred my passport number is X1234567Z"
+    client.post("/api/drafts", json={"transcript": secret})
+    entries = client.get("/api/audit/chain").json()["entries"]
+    blob = json.dumps(entries)
+    assert "X1234567Z" not in blob
+    assert "passport" not in blob
