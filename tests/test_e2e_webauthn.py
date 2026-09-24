@@ -30,7 +30,11 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 
 def _add_virtual_authenticator(client) -> str:
     """Enable the CDP WebAuthn domain and add a platform (ctap2/internal)
-    authenticator that auto-verifies + auto-consents -> "mock biometrics"."""
+    authenticator that auto-verifies + auto-consents -> "mock biometrics".
+
+    As of M7 this is a TRUE end-to-end test: the draft is produced by the real
+    pipeline (parse -> resolve -> validate) from a typed utterance, not a
+    hard-coded fixture."""
     client.send("WebAuthn.enable", {})
     res = client.send("WebAuthn.addVirtualAuthenticator", {
         "options": {
@@ -62,17 +66,26 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             # 1. register a passkey — the virtual authenticator auto-creates it.
             page.click("#register-btn")
             # registerPasskey() does begin -> create -> complete -> reload();
-            # wait for the reloaded overlay (plan + enabled sign button).
+            # after M7 the reloaded page shows the say-box, not a draft — a
+            # draft only exists once the user has said something.
+            page.wait_for_selector("#say-box", state="visible", timeout=20000)
+
+            # 2. M7: drive the pipeline the way a user does. The text tier is
+            #    used deliberately — it is the one that must ALWAYS work, and
+            #    it exercises parse -> resolve -> validate -> overlay without
+            #    depending on a microphone in CI.
+            page.fill("#say", "transfer five hundred from my savings to mom")
+            page.click("#say-form button[type=submit]")
             page.wait_for_selector(
-                "#sign:not([disabled])", state="visible", timeout=20000,
+                "#sign:not([disabled])", state="visible", timeout=30000,
             )
 
-            # 2. the overlay rendered the hard-coded demo plan ($500 -> Mom).
+            # 3. the overlay rendered the RESOLVED plan ($500 -> Mom).
             plan_text = page.inner_text("#plan")
             assert "Mom" in plan_text, "payee_display 'Mom' must be rendered"
             assert "$500.00" in plan_text, "amount $500.00 must be rendered"
 
-            # 3. biometric sign -> gateway execute. The virtual authenticator
+            # 4. biometric sign -> gateway execute. The virtual authenticator
             #    auto-approves (UV flag set), so navigator.credentials.get
             #    resolves with a genuine assertion over sha256(phash + nonce).
             page.click("#sign")
@@ -82,7 +95,7 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             cls = page.get_attribute("#result", "class") or ""
             assert "ok" in cls, f"result box class should contain 'ok': {cls!r}"
 
-            # 4. balance debited on the mock ledger: 842050 - 50000 = 792050 cents.
+            # 5. balance debited on the mock ledger: 842050 - 50000 = 792050 cents.
             accts = requests.get(
                 server_url + "/api/seed/accounts?user_id=u_alice", timeout=5,
             ).json()
@@ -91,7 +104,7 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
                 f"savings should be 792050 after $500 debit, got {savings['balance']}"
             )
 
-            # 5. the hash-chained audit log verifies end to end.
+            # 6. the hash-chained audit log verifies end to end.
             verify = requests.get(server_url + "/api/audit/verify", timeout=5).json()
             assert verify["ok"] is True, f"audit chain must verify: {verify}"
         finally:

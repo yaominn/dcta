@@ -79,3 +79,32 @@ button {
 .result.bad { color: var(--bad); }
 .result h3 { margin: 0 0 6px; }
 .result pre { background: #0b1220; border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; font-size: 12px; }
+
+
+/* ---------- M7: voice + clarify ---------- */
+.say-box { margin: 1rem 0 1.25rem; }
+.say-row { display: flex; gap: .5rem; align-items: center; }
+.say-form { display: flex; gap: .5rem; flex: 1; }
+.say-form input {
+  flex: 1; padding: .6rem .7rem; border-radius: 8px;
+  border: 1px solid var(--line, #3a3a3a); background: #1b1b1b; color: inherit;
+  font: inherit;
+}
+.mic {
+  width: 44px; height: 44px; border-radius: 50%; font-size: 1.1rem;
+  border: 1px solid var(--line, #3a3a3a); background: #1b1b1b; color: inherit;
+  cursor: pointer; flex: none;
+}
+.mic.live { background: #7f1d1d; border-color: #b91c1c; animation: pulse 1.2s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .55 } }
+.status { margin: .5rem 0 0; font-size: .85rem; opacity: .75; }
+.clarify { margin: 1rem 0; padding: .9rem 1rem; border-radius: 10px;
+           background: #1e1b13; border: 1px solid #5a4a1e; }
+.clarify .question { margin: 0 0 .6rem; font-weight: 600; }
+.clarify .choices { display: flex; gap: .5rem; flex-wrap: wrap; }
+.clarify .choice {
+  padding: .45rem .8rem; border-radius: 999px; cursor: pointer; font: inherit;
+  border: 1px solid var(--line, #3a3a3a); background: #232323; color: inherit;
+}
+.clarify .choice:hover { background: #2e2e2e; }
+.clarify .hint { margin: .4rem 0 0; font-size: .85rem; opacity: .7; }

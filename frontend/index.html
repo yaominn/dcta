@@ -14,11 +14,32 @@
       <p class="scenario">Scenario 1 — Voice-Enabled Payment &amp; Transaction</p>
     </header>
 
+    <!-- M7: say it, or type it. Voice has three tiers (Tencent ASR -> Web
+         Speech API -> this text box). The text box is ALWAYS present: if the
+         room beats the microphone on stage, you type the same sentence and the
+         demo continues (brief §5). -->
+    <section id="say-box" class="say-box" hidden>
+      <h2>What would you like to do?</h2>
+      <div class="say-row">
+        <button id="mic" class="mic" title="Hold a conversation">🎙</button>
+        <form id="say-form" class="say-form">
+          <input id="say" type="text" autocomplete="off"
+                 placeholder="Pay mom five hundred then buy Apple with the rest" />
+          <button type="submit" class="primary">Go</button>
+        </form>
+      </div>
+      <p id="status" class="status" hidden></p>
+    </section>
+
+    <!-- One short question at a time, voice-first (brief §5.3). Choice buttons
+         appear only for a 2+ disambiguation; the resolver re-validates the
+         chosen id against a fresh deterministic match. -->
+    <section id="clarify" class="clarify" hidden></section>
+
     <!-- The confirmation overlay. Renders from the ResolvedPlan JSON via a
          FIXED template (brief 4.2): known fields -> fixed labels. It NEVER
-         displays LLM-generated text as the transaction summary. For M2 the
-         plan is hard-coded (no LLM yet); the template is the same one the
-         resolver (M4) will feed. -->
+         displays LLM-generated text as the transaction summary. As of M7 the
+         plan comes from the real pipeline: parse -> resolve -> validate. -->
     <section id="plan" class="plan" hidden>
       <h2>Confirm this transaction</h2>
       <div id="legs"></div>
@@ -48,6 +69,7 @@
   </main>
 
   <script src="/static/canonical.js"></script>
+  <script src="/static/voice.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

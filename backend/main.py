@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -34,6 +34,8 @@ from backend.auth import (
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
                            get_provider, parse_transcript)
+from backend.asr import ASRUnavailable, get_asr_provider
+from backend.resolver import Clarify, resolve
 from backend.validator import default_freeze_set, validate
 
 from pathlib import Path
@@ -484,6 +486,128 @@ def validate_draft(req: ValidateRequest):
         "checks": report.checks,
         "soft_signals": report.soft_signals,
         "llm_check": report.llm_check,
+    }
+
+
+
+# --------------------------------------------------------------------------- M7: speech to text
+class TranscribeResponse(BaseModel):
+    transcript: str
+    provider: str
+
+
+@app.post("/api/transcribe", response_model=None)
+async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
+    """Server-side speech-to-text (tier 1 of 3).
+
+    Credentials cannot reach the browser, so the Tencent path is necessarily
+    browser -> here -> Tencent. With no credentials configured this returns 503
+    and names the tier to fall back to; the browser then uses the Web Speech
+    API, and text input always works regardless. A 503 here is NOT a product
+    failure — it is the degradation path working as designed (brief §5).
+    """
+    provider = get_asr_provider(settings)
+    raw = await audio.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail={"error": "empty audio upload"})
+    try:
+        text = provider.transcribe(raw, fmt=fmt or settings.asr_voice_format)
+    except ASRUnavailable as exc:
+        raise HTTPException(status_code=503, detail={
+            "error": str(exc),
+            "provider": provider.name,
+            "fallback": "webspeech",     # the client drops a tier on this
+        })
+    return TranscribeResponse(transcript=text, provider=provider.name)
+
+
+# --------------------------------------------------------------------------- M7: the whole pipeline
+class DraftRequest(BaseModel):
+    """One utterance in, one signable draft (or one question) out."""
+    transcript: str
+    user_id: str = "u_alice"
+    answers: dict[str, str] = {}
+
+
+@app.post("/api/draft", response_model=None)
+def build_draft(req: DraftRequest):
+    """transcript -> parse -> resolve -> validate -> a draft the overlay renders.
+
+    This is the product in one call, and the first place the milestones are
+    wired end to end. Three outcomes, and the caller must distinguish them:
+
+      200 {"status": "draft"}    a ResolvedPlan ready to display and sign
+      200 {"status": "clarify"}  ONE question; resubmit with `answers`
+      200 {"status": "frozen"}   the validator froze it; no nonce will be issued
+
+    `clarify` is a 200 on purpose: needing to ask is a normal conversational
+    outcome, not an error. `frozen` is also 200 — the request succeeded, the
+    answer is "no". The HTTP layer reports whether we could respond; the body
+    reports what the answer was.
+
+    M5 (policy) is not built yet. Its seam is marked below: it belongs between
+    resolution and validation, so a policy rejection never reaches the
+    validator or the user as a signable draft.
+    """
+    conn = get_conn()
+    try:
+        payees = [dict(r) for r in conn.execute(
+            "SELECT * FROM payees WHERE user_id=?", (req.user_id,)).fetchall()]
+        billers = [dict(r) for r in conn.execute("SELECT * FROM billers").fetchall()]
+        accounts = [dict(r) for r in conn.execute(
+            "SELECT * FROM accounts WHERE user_id=?", (req.user_id,)).fetchall()]
+        equities = [dict(r) for r in conn.execute("SELECT * FROM equities").fetchall()]
+    finally:
+        conn.close()
+
+    context = build_context(payees=payees, billers=billers,
+                            accounts=accounts, equities=equities)
+    for flag in context.flags:
+        logging.warning("injection tripwire: stored field flagged: %s", flag)
+
+    provider = get_provider(settings)
+    try:
+        intent_plan = parse_transcript(req.transcript, provider=provider, context=context)
+    except ProviderUnavailable as exc:
+        raise HTTPException(status_code=502, detail={
+            "error": "LLM provider unavailable", "provider": provider.name,
+            "attempts": exc.errors})
+    except ParseFailure as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "could not produce a schema-valid plan within the retry budget",
+            "attempts": exc.errors})
+
+    outcome = resolve(intent_plan, transcript=req.transcript,
+                      user_id=req.user_id, answers=req.answers)
+    if isinstance(outcome, Clarify):
+        return {
+            "status": "clarify",
+            "question": outcome.question,
+            "field": outcome.field,
+            "kind": outcome.kind,
+            "choices": outcome.choices,
+        }
+
+    # --- M5 SEAM: the policy engine belongs HERE ------------------------------
+    # KYC, balances, per-transaction and daily limits, velocity, anomaly. It
+    # must run BEFORE validation so a policy rejection never reaches the user as
+    # a signable draft. Deliberately absent rather than stubbed silently:
+    # a no-op that looks like a check is worse than an obvious gap.
+    # -------------------------------------------------------------------------
+
+    report = validate(intent_plan, outcome.plan, req.transcript)
+    if report.frozen:
+        return {
+            "status": "frozen",
+            "draft_id": report.draft_id,
+            "reasons": [c for c in report.checks if c.get("outcome") == "fail"],
+        }
+
+    return {
+        "status": "draft",
+        "plan": outcome.plan.model_dump(mode="json"),
+        "validation": {"verdict": report.verdict, "llm_check": report.llm_check},
+        "provider": provider.name,
     }
 
 

@@ -7,6 +7,10 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 pydantic>=2.5
 python-dotenv>=1.0
+# Required by FastAPI's UploadFile (POST /api/transcribe, M7). Without it the
+# app fails to start — declared here, never installed ad hoc, so a clean clone
+# and CI catch it.
+python-multipart>=0.0.9
 
 # --- Tencent Cloud (real services, wired in M3/M7; stubs used until then) ---
 tencentcloud-sdk-python>=3.0

@@ -27,6 +27,13 @@ class Settings:
     # Services (regions/models). Singapore is the spike-confirmed region for ASR.
     asr_region: str = os.getenv("TENCENT_ASR_REGION", "ap-singapore")
     asr_endpoint: str = os.getenv("TENCENT_ASR_ENDPOINT", "asr.ap-singapore.tencentcloudapi.com")
+    # Engine must match the spoken language: 16k_en English, 16k_zh Mandarin.
+    asr_engine: str = os.getenv("ASR_ENGINE", "16k_en")
+    # Container the browser uploads. Chrome's MediaRecorder gives webm-opus,
+    # which shares a codec but NOT a container with the documented ogg-opus —
+    # configurable because that is the likeliest first-call failure.
+    asr_voice_format: str = os.getenv("ASR_VOICE_FORMAT", "mp3")
+    asr_timeout_s: float = float(os.getenv("ASR_TIMEOUT_S", "20"))
     hunyuan_model: str = os.getenv("HUNYUAN_MODEL", "hunyuan-functioncall")
 
     # --- LLM behaviour (provider-independent) ---

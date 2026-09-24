@@ -80,6 +80,26 @@ function row(dt, dd) {
   dl.append(k, v);
   return dl;
 }
+/* The overlay is the one surface we tell the user to trust, so it must not
+   show database internals. These are pure, deterministic transforms of the
+   SIGNED payload — no extra inputs, no new trust surface, and the template
+   stays fixed (brief 4.2). */
+function acctLabel(id) {
+  // "acct_savings" -> "Savings". Deterministic and local; falls back to the
+  // raw id rather than inventing a name it cannot derive.
+  const m = /^acct_(.+)$/.exec(id || "");
+  if (!m) return id || "";
+  return m[1].charAt(0).toUpperCase() + m[1].slice(1);
+}
+function windowLabel(created, expires) {
+  // Unix seconds are correct in the payload and meaningless on screen.
+  const mins = Math.max(0, Math.round((expires - created) / 60));
+  const until = new Date(expires * 1000).toLocaleTimeString([], {
+    hour: "2-digit", minute: "2-digit", second: "2-digit",
+  });
+  return `${mins} min — expires ${until}`;
+}
+
 function renderPlan(plan) {
   const legsEl = document.getElementById("legs");
   legsEl.replaceChildren();
@@ -93,8 +113,12 @@ function renderPlan(plan) {
       const dd = el("dd"); dd.textContent = v;
       dl.append(dt, dd);
     };
-    addRow("From", leg.source_account);
-    if (leg.payee_display) addRow("To", leg.payee_display + " (" + leg.payee_id + ")");
+    addRow("From", acctLabel(leg.source_account));
+    // payee_display is already the safe DB-sourced label (nickname + last 4).
+    // The raw payee_id is an internal identifier and does not belong on the
+    // confirmation screen.
+    if (leg.payee_display) addRow("To", leg.payee_display);
+    if (leg.biller_display) addRow("To", leg.biller_display);
     if (leg.amount_cents != null) {
       const dt = el("dt"); dt.textContent = "Amount";
       const dd = el("dd"); dd.className = "amt"; dd.textContent = centsToDisplay(leg.amount_cents);
@@ -106,8 +130,11 @@ function renderPlan(plan) {
     legsEl.append(card);
   }
   document.getElementById("window").textContent =
-    plan.created_at + " \u2192 " + plan.expires_at + " (Unix sec UTC)";
+    windowLabel(plan.created_at, plan.expires_at);
   document.getElementById("txhash").textContent = plan.transcript_hash.slice(0, 16) + "\u2026";
+  // Computed at sign time; show a placeholder rather than an empty row, which
+  // reads as broken.
+  document.getElementById("phash").textContent = "computed when you confirm";
 }
 
 function showErr(msg) {
@@ -220,10 +247,170 @@ function showResult(res) {
   box.hidden = false;
 }
 
+/* ---------- M7: transcript -> draft, with the clarify loop ---------- */
+let CURRENT = { plan: null, credentialIds: [], answers: {}, transcript: "" };
+
+function setStatus(msg) {
+  const el = document.getElementById("status");
+  if (el) { el.textContent = msg; el.hidden = !msg; }
+}
+
+async function submitTranscript(transcript, answers) {
+  // One utterance in, one of three outcomes out. `clarify` and `frozen` are
+  // both HTTP 200: needing to ask is a normal conversational outcome, and a
+  // freeze is a successful request whose answer is "no". Only a genuine
+  // failure to respond is a non-200.
+  setStatus("Working…");
+  const res = await jpost(API + "/api/draft", {
+    transcript, user_id: DEMO_USER, answers: answers || {},
+  });
+  if (res.status !== 200) {
+    const d = res.json.detail || {};
+    showErr(d.error ? `${d.error}` : `request failed (${res.status})`);
+    setStatus("");
+    return;
+  }
+  const body = res.json;
+
+  if (body.status === "clarify") {
+    // Voice-first: ONE short question at a time, spoken as well as shown.
+    CURRENT.transcript = transcript;
+    setStatus("");
+    renderClarify(body);
+    Voice.speak(body.question);
+    return;
+  }
+
+  if (body.status === "frozen") {
+    setStatus("");
+    showFrozen(body);
+    return;
+  }
+
+  CURRENT.plan = body.plan;
+  CURRENT.answers = {};
+  setStatus("");
+  renderPlan(body.plan);
+  document.getElementById("plan").hidden = false;
+  const btn = document.getElementById("sign");
+  btn.disabled = false;
+  btn.onclick = onSign;
+}
+
+function renderClarify(body) {
+  const box = document.getElementById("clarify");
+  box.replaceChildren();
+  const q = el("p", "question"); q.textContent = body.question;
+  box.append(q);
+
+  if (body.choices && body.choices.length) {
+    // 2+ disambiguation: the user picks, and we resume with `answers`. The
+    // resolver re-validates the chosen id against a fresh deterministic match,
+    // so a tampered choice cannot inject a payee the mention never justified.
+    const row = el("div", "choices");
+    for (const c of body.choices) {
+      const b = el("button", "choice");
+      b.textContent = c.display;                 // textContent: DB-sourced, still never innerHTML
+      b.onclick = () => {
+        box.hidden = true;
+        submitTranscript(CURRENT.transcript, { ...CURRENT.answers, [body.field]: c.id });
+      };
+      row.append(b);
+    }
+    box.append(row);
+  } else {
+    // 0-match / empty / insufficient: no candidate list to choose from, so the
+    // user re-states the request and it re-enters the pipeline from the top.
+    const hint = el("p", "hint");
+    hint.textContent = "Say or type it again with more detail.";
+    box.append(hint);
+  }
+  box.hidden = false;
+}
+
+function showFrozen(body) {
+  const box = document.getElementById("result");
+  box.replaceChildren();
+  const h = el("h3"); h.textContent = "FROZEN";
+  const p = el("p");
+  p.textContent = "The independent validator found a mismatch between what you "
+    + "said and what was drafted. This draft cannot be signed.";
+  const pre = el("pre");
+  pre.textContent = JSON.stringify(body.reasons, null, 2);   // never innerHTML (H1)
+  box.append(h, p, pre);
+  box.className = "result bad";
+  box.hidden = false;
+}
+
+async function onSign() {
+  const btn = document.getElementById("sign");
+  btn.disabled = true;
+  try {
+    const res = await signAndExecute(CURRENT.plan, CURRENT.credentialIds);
+    showResult(res);
+  } catch (e) {
+    showErr(String(e));
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- M7: voice input, three tiers ---------- */
+function wireVoice() {
+  const mic = document.getElementById("mic");
+  const textForm = document.getElementById("say-form");
+  const textIn = document.getElementById("say");
+  if (!mic) return;
+
+  const onText = (t, provider) => {
+    textIn.value = t;
+    setStatus(`Heard (${provider}): "${t}"`);
+    submitTranscript(t);
+  };
+  const onError = (e) => { setStatus(""); mic.classList.remove("live"); showErr(String(e.message || e)); };
+  const onState = (st) => {
+    mic.classList.toggle("live", st === "listening");
+    setStatus(st === "listening" ? "Listening…" : st === "thinking" ? "Transcribing…" : "");
+  };
+
+  let active = null;
+  mic.onclick = async () => {
+    if (active) { Voice.stop(); active = null; return; }
+    document.getElementById("err").hidden = true;
+    // Tier 1 first (server-side Tencent ASR). On 503 we drop to tier 2 without
+    // telling the user anything went wrong — nothing did.
+    active = await Voice.recordAndUpload({
+      onText: (t, p) => { active = null; onText(t, p); },
+      onError: (e) => { active = null; onError(e); },
+      onState,
+      onFallback: () => {
+        active = null;
+        if (!Voice.speechRecognitionAvailable()) {
+          setStatus("Speech unavailable — type it instead.");
+          textIn.focus();
+          return;
+        }
+        Voice.listenWebSpeech({ onText, onError, onState });
+      },
+    });
+  };
+
+  // Tier 3, always present: typing the same sentence must always work.
+  textForm.onsubmit = (e) => {
+    e.preventDefault();
+    const t = textIn.value.trim();
+    if (!t) return;
+    document.getElementById("err").hidden = true;
+    document.getElementById("clarify").hidden = true;
+    submitTranscript(t);
+  };
+}
+
 /* ---------- bootstrap ---------- */
 async function init() {
   const creds = await jget(API + "/api/auth/credentials?user_id=" + DEMO_USER);
   const hasPasskey = creds.credential_ids && creds.credential_ids.length > 0;
+  CURRENT.credentialIds = creds.credential_ids || [];
 
   if (!hasPasskey) {
     const reg = document.getElementById("register");
@@ -237,24 +424,7 @@ async function init() {
     };
     return;
   }
-
-  // passkey exists -> show the overlay + sign button
-  const plan = await jget(API + "/api/drafts/demo");
-  const cfg = await jget(API + "/api/auth/config");   // server RP id (M1)
-  renderPlan(plan);
-  document.getElementById("plan").hidden = false;
-  const btn = document.getElementById("sign");
-  btn.disabled = false;
-  btn.onclick = async () => {
-    btn.disabled = true;
-    try {
-      const res = await signAndExecute(plan, creds.credential_ids, cfg.rp_id);
-      showResult(res);
-    } catch (e) {
-      showErr(String(e));
-    } finally {
-      btn.disabled = false;
-    }
-  };
+  wireVoice();
+  document.getElementById("say-box").hidden = false;
 }
 window.addEventListener("DOMContentLoaded", init);
