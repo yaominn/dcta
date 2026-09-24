@@ -34,6 +34,7 @@ from backend.auth import (
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
                            get_provider, parse_transcript)
+from backend.validator import default_freeze_set, validate
 
 from pathlib import Path
 
@@ -206,7 +207,18 @@ DEMO_USER_ID = "u_alice"
 @app.get("/api/auth/nonce")
 def issue_nonce(draft_id: str = Query(...)):
     """Issue a draft-bound, single-use, 120s-TTL nonce (brief 4.5).
-    The nonce binds to this draft_id — a swap-after-approval fails at the gateway."""
+    The nonce binds to this draft_id — a swap-after-approval fails at the gateway.
+
+    M6 freeze (brief §6): a draft the validator froze is unsignable, not merely
+    labelled frozen. Freeze = no nonce is ever issued for that draft_id, so no
+    WebAuthn challenge can be created and the gateway rejects any submission. The
+    validator is read-only and reaches neither gateway/ nor auth/ (CI-checked);
+    it records the freeze, and this one line enforces it."""
+    if draft_id in default_freeze_set:
+        raise HTTPException(
+            status_code=403,
+            detail={"error": "draft frozen by validator", "draft_id": draft_id},
+        )
     return {"nonce": _nonce_store.issue(draft_id),
             "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
 
@@ -438,6 +450,40 @@ def create_plan(req: PlanRequest):
         "intent_plan": plan.model_dump(mode="json"),
         "provider": provider.name,
         "transcript_hash": hash_transcript(req.transcript),
+    }
+
+
+# --------------------------------------------------------------------------- M6: independent validator
+class ValidateRequest(BaseModel):
+    """The three inputs the validator audits (brief §3): what the LLM said, what
+    the resolver produced, and what the user said. The resolved_plan is what
+    would be signed; the intent_plan carries the literal-vs-symbolic distinction
+    that decides which amount check runs (brief §4.1)."""
+    intent_plan: IntentPlan
+    resolved_plan: ResolvedPlan
+    transcript: str
+
+
+@app.post("/api/validate", response_model=None)
+def validate_draft(req: ValidateRequest):
+    """M6: a second, read-only audit of the draft before the user sees it.
+
+    Deterministic checks (beneficiary, amount) freeze on mismatch; the freeze is
+    enforced at /api/auth/nonce. The LLM half uses a SEPARATE prompt via the
+    existing provider interface; with no credentials it is recorded as
+    'unavailable' and never freezes (brief §5)."""
+    provider = get_provider(settings)
+    report = validate(
+        req.intent_plan, req.resolved_plan, req.transcript,
+        provider=provider, audit=_audit,
+    )
+    return {
+        "verdict": report.verdict,
+        "draft_id": report.draft_id,
+        "frozen": report.frozen,
+        "checks": report.checks,
+        "soft_signals": report.soft_signals,
+        "llm_check": report.llm_check,
     }
 
 

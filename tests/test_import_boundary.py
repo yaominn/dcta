@@ -8,6 +8,10 @@ Walks the module import graph and enforces every trust boundary:
   - any module under backend/resolver/ that transitively imports backend/agent/
     is a violation (M4) — the resolver is deterministic by definition and must
     not reach the LLM side.
+  - any module under backend/validator/ that transitively imports backend/gateway/
+    or backend/auth/ is a violation (M6) — the validator is read-only by
+    construction: it can freeze a draft, never execute one. CI checks that rather
+    than the docstring asserting it.
 
 Pure static AST analysis (no modules imported/executed, so no side effects).
 Runs in CI.
@@ -20,6 +24,10 @@ Real tests, not a trivially-green stub:
   4. a planted resolver->agent forbidden import is flagged (M4)         (proves the new
                                                                          boundary catches)
   5. clean agent->resolver and resolver->data imports stay green        (proves it doesn't
+                                                                         false-fire)
+  6. a planted validator->gateway forbidden import is flagged (M6)      (proves the new
+                                                                         boundary catches)
+  7. clean validator->data/audit imports stay green                     (proves it doesn't
                                                                          false-fire)
 """
 from __future__ import annotations
@@ -38,9 +46,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #     code path to execution or signing keys)
 #   - resolver must not reach agent/             (M4: the resolver is LLM-free by
 #     construction; "deterministic" is enforced, not asserted)
+#   - validator must not reach gateway/ or auth/  (M6: the validator is read-only
+#     by construction — it can freeze a draft, never execute one. Enforced, not
+#     asserted in a docstring.)
 BOUNDARIES = [
     ("backend.agent", ("backend.gateway", "backend.auth")),
     ("backend.resolver", ("backend.agent",)),
+    ("backend.validator", ("backend.gateway", "backend.auth")),
 ]
 
 
@@ -227,5 +239,53 @@ def test_agent_importing_resolver_is_allowed(tmp_path):
         "backend/agent/__init__.py": "",
         "backend/agent/clean.py": "import backend.resolver\n",
         "backend/resolver/__init__.py": "",
+    })
+    assert find_violations(root) == []
+
+
+def test_planted_validator_gateway_violation_is_flagged(tmp_path):
+    """M6 (brief §8): the validator must not reach gateway or auth (it is
+    read-only by construction — it can freeze a draft, never execute one).
+    Proves the new boundary catches a validator->gateway import."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/validator/__init__.py": "",
+        "backend/validator/evil.py": "import backend.gateway\n",  # read-only must not reach execution
+        "backend/gateway/__init__.py": "",
+    })
+    v = find_violations(root)
+    assert any(
+        x["root"].startswith("backend.validator")
+        and x["reaches"].startswith("backend.gateway")
+        for x in v
+    ), v
+
+
+def test_planted_validator_auth_violation_is_flagged(tmp_path):
+    """The validator must not reach auth/ either — no code path to signing keys."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/validator/__init__.py": "",
+        "backend/validator/evil.py": "import backend.auth\n",  # read-only must not reach signing keys
+        "backend/auth/__init__.py": "",
+    })
+    v = find_violations(root)
+    assert any(
+        x["root"].startswith("backend.validator")
+        and x["reaches"].startswith("backend.auth")
+        for x in v
+    ), v
+
+
+def test_clean_validator_passes(tmp_path):
+    """Non-forbidden validator imports (data, audit) must NOT trip the checker —
+    only gateway/auth are forbidden to the validator. The real validator reads
+    the DB and writes only audit entries, so data/ and audit/ are allowed."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/validator/__init__.py": "",
+        "backend/validator/clean.py": "import backend.data\nimport backend.audit\n",  # allowed
+        "backend/data/__init__.py": "",
+        "backend/audit/__init__.py": "",
     })
     assert find_violations(root) == []
