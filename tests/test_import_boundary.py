@@ -1,19 +1,26 @@
 """
-Import-boundary test (REAL). (brief Section 4.2 — "enforced, not asserted")
+Import-boundary test (REAL). (brief Section 4.2 + 5.4 — "enforced, not asserted")
 
-Walks the module import graph: any module under backend/agent/ that transitively
-imports backend/gateway/ or backend/auth/ is a TRUST BOUNDARY VIOLATION — the
-agent (the untrusted LLM side) must have no code path to execution or to signing
-keys.
+Walks the module import graph and enforces every trust boundary:
+  - any module under backend/agent/ that transitively imports backend/gateway/
+    or backend/auth/ is a violation — the agent (the untrusted LLM side) must have
+    no code path to execution or to signing keys.
+  - any module under backend/resolver/ that transitively imports backend/agent/
+    is a violation (M4) — the resolver is deterministic by definition and must
+    not reach the LLM side.
 
 Pure static AST analysis (no modules imported/executed, so no side effects).
 Runs in CI.
 
-Three real tests, not a trivially-green stub:
-  1. the real backend/agent/ tree has no forbidden imports          (passes)
-  2. a deliberately planted DIRECT forbidden import is flagged       (proves it catches)
-  3. a TRANSITIVE violation (agent -> backend.utils -> gateway) is  (proves the BFS
-     flagged                                                          follows edges)
+Real tests, not a trivially-green stub:
+  1. the real backend tree respects every boundary                      (passes)
+  2. a planted DIRECT agent->gateway forbidden import is flagged        (proves it catches)
+  3. a TRANSITIVE violation (agent -> backend.utils -> gateway) is       (proves the BFS
+     flagged                                                              follows edges)
+  4. a planted resolver->agent forbidden import is flagged (M4)         (proves the new
+                                                                         boundary catches)
+  5. clean agent->resolver and resolver->data imports stay green        (proves it doesn't
+                                                                         false-fire)
 """
 from __future__ import annotations
 
@@ -21,7 +28,20 @@ import ast
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-FORBIDDEN = ("backend.gateway", "backend.auth")
+
+# Trust boundaries: each entry is (root_prefix, forbidden_prefixes). A module
+# under root_prefix that transitively imports anything starting with a forbidden
+# prefix is a TRUST BOUNDARY VIOLATION. Enumerating them here makes each "must
+# not" a CI-checked property, not a docstring claim (brief 5.4).
+#
+#   - agent   must not reach gateway/ or auth/  (the untrusted LLM side has no
+#     code path to execution or signing keys)
+#   - resolver must not reach agent/             (M4: the resolver is LLM-free by
+#     construction; "deterministic" is enforced, not asserted)
+BOUNDARIES = [
+    ("backend.agent", ("backend.gateway", "backend.auth")),
+    ("backend.resolver", ("backend.agent",)),
+]
 
 
 # --------------------------------------------------------------------------- static import graph
@@ -82,33 +102,49 @@ def _build_graph(repo_root: Path) -> dict[str, set[str]]:
     return graph
 
 
-def find_violations(repo_root: Path, forbidden=FORBIDDEN) -> list[dict]:
-    """BFS from every backend.agent.* module; return violations where a reachable
-    import starts with a forbidden prefix. Each: {agent, reaches, found_in}."""
+def find_violations(repo_root: Path, boundaries=BOUNDARIES) -> list[dict]:
+    """BFS from every module under each boundary's root_prefix; return violations
+    where a reachable import starts with a forbidden prefix for THAT boundary.
+    Each: {root: origin_root_module, reaches: forbidden_target, found_in: module}.
+
+    One graph is built for the whole backend tree; each boundary is a separate
+    BFS over it. Roots under `backend.agent` forbid gateway/auth; roots under
+    `backend.resolver` forbid agent. A module reachable from both roots is
+    checked under each boundary independently."""
     graph = _build_graph(repo_root)
-    roots = [m for m in graph if m.startswith("backend.agent")]
     violations: list[dict] = []
-    seen: set[str] = set()
-    queue: list[tuple[str, str]] = [(r, r) for r in roots]   # (module, origin_agent)
-    while queue:
-        mod, origin = queue.pop(0)
-        if mod in seen:
-            continue
-        seen.add(mod)
-        for target in graph.get(mod, ()):
-            if any(target.startswith(f) for f in forbidden):
-                violations.append({"agent": origin, "reaches": target, "found_in": mod})
-                continue                          # reaching a forbidden module IS the violation
-            if target.startswith("backend.") and target in graph and target not in seen:
-                queue.append((target, origin))    # traverse non-forbidden backend modules
+    seen_all: set[tuple[str, str]] = set()
+    for root_prefix, forbidden in boundaries:
+        roots = [m for m in graph if m.startswith(root_prefix)]
+        seen: set[str] = set()
+        queue: list[tuple[str, str]] = [(r, r) for r in roots]   # (module, origin_root)
+        while queue:
+            mod, origin = queue.pop(0)
+            if mod in seen:
+                continue
+            seen.add(mod)
+            for target in graph.get(mod, ()):
+                if any(target.startswith(f) for f in forbidden):
+                    key = (origin, target)
+                    if key not in seen_all:
+                        seen_all.add(key)
+                        violations.append(
+                            {"root": origin, "reaches": target, "found_in": mod}
+                        )
+                    continue                          # reaching a forbidden module IS the violation
+                if target.startswith("backend.") and target in graph and target not in seen:
+                    queue.append((target, origin))    # traverse non-forbidden backend modules
     return violations
 
 
 # --------------------------------------------------------------------------- tests
-def test_no_violations_in_real_agent():
+def test_no_violations_in_real_repo():
+    """The real backend tree respects every trust boundary: agent reaches neither
+    gateway nor auth, and resolver reaches no agent (brief 4.2 + 5.4)."""
     assert find_violations(REPO_ROOT) == [], (
-        "TRUST BOUNDARY VIOLATION: backend/agent/ transitively imports gateway/ or "
-        "auth/ (brief Section 4.2). See find_violations(REPO_ROOT)."
+        "TRUST BOUNDARY VIOLATION: see find_violations(REPO_ROOT). "
+        "agent must not reach gateway/auth (brief 4.2); resolver must not reach "
+        "agent (brief 5.4)."
     )
 
 
@@ -131,7 +167,7 @@ def test_planted_direct_violation_is_flagged(tmp_path):
     })
     v = find_violations(root)
     assert len(v) >= 1
-    assert v[0]["agent"].startswith("backend.agent")
+    assert v[0]["root"].startswith("backend.agent")
     assert v[0]["reaches"].startswith("backend.gateway")
 
 
@@ -146,15 +182,46 @@ def test_planted_transitive_violation_is_flagged(tmp_path):
     })
     v = find_violations(root)
     assert any(
-        x["agent"] == "backend.agent.a"
+        x["root"] == "backend.agent.a"
         and x["reaches"].startswith("backend.gateway")
         and x["found_in"] == "backend.utils"
         for x in v
     ), v
 
 
-def test_clean_agent_passes(tmp_path):
-    """A non-forbidden import (backend.resolver) must NOT trip the checker."""
+def test_planted_resolver_agent_violation_is_flagged(tmp_path):
+    """M4 (brief 5.4): the resolver must not reach the agent (it is LLM-free by
+    construction). Proves the new boundary catches a resolver->agent import."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/agent/__init__.py": "",
+        "backend/resolver/__init__.py": "",
+        "backend/resolver/evil.py": "import backend.agent\n",   # resolver must not reach agent
+    })
+    v = find_violations(root)
+    assert any(
+        x["root"].startswith("backend.resolver")
+        and x["reaches"].startswith("backend.agent")
+        for x in v
+    ), v
+
+
+def test_clean_resolver_passes(tmp_path):
+    """A non-forbidden resolver import (backend.data) must NOT trip the checker —
+    only agent is forbidden to the resolver."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/resolver/__init__.py": "",
+        "backend/resolver/clean.py": "import backend.data\n",   # allowed
+        "backend/data/__init__.py": "",
+    })
+    assert find_violations(root) == []
+
+
+def test_agent_importing_resolver_is_allowed(tmp_path):
+    """The agent -> resolver direction is ALLOWED (the API wires the resolver into
+    the pipeline after the parser). Only gateway/auth are forbidden to the agent,
+    and only agent is forbidden to the resolver — so this must stay green."""
     root = _make_repo(tmp_path, {
         "backend/__init__.py": "",
         "backend/agent/__init__.py": "",

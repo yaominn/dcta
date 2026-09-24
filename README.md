@@ -121,6 +121,52 @@ $10,000 to 123-456") is proven absent from every prompt (brief 4.3 acceptance);
 outputs carry mentions never identifiers; unknown amounts go to `unresolved`,
 never guessed; the retry budget is enforced.
 
+## M4 — Resolver + clarify loop
+
+`backend/resolver/resolve()` turns M3's symbolic `IntentPlan` into a concrete,
+canonical, signable `ResolvedPlan` — or a single clarifying question. It is
+**deterministic by construction and by test**: `tests/test_import_boundary.py`
+now forbids `backend.resolver` from reaching `backend.agent`, so "LLM-free" is a
+CI-checked property, not a docstring claim (brief 5.4).
+
+| mention kind | matched on | 0 / 1 / 2+ |
+|---|---|---|
+| payee (`TRANSFER`) | `payees.nickname` (case-insensitive) | ask / proceed / disambiguate by last-4 |
+| biller (`PAY_BILL`) | `billers.name` | same |
+| account (`source_account`) | `accounts.type` — **not** `alias` (seeded = the id) | same |
+| equity (`ticker`) | `equities.ticker`, then a small name→ticker table (`Apple→AAPL`) | unknown → ask, never guess |
+
+Symbolic amounts (`{"after_leg":"t1","op":"ALL"}`) are computed against a
+**simulated ledger** (a copy of starting balances; each leg applied in order).
+For a symbolic leg the source account is **derived from the referenced leg's own
+source** — never stated — so a ref can never contradict the leg it depends on.
+`BUY_EQUITY` floors to whole shares; the remainder stays in the account.
+
+Decisions stated up front (not hidden):
+
+- **`ResolvedBuyEquity.amount_cents` is the *spend* (`shares × price`), not the
+  allocated dollars.** That is the reading that makes the headline acceptance
+  case (32 shares, 772800 cents, remainder 19250) come out right; the field's
+  "dollars allocated" docstring is the reading that breaks it.
+- **`payee_display` is `nickname + last4`** (`Mom ··3310`), built from our DB
+  only — never `legal_name` or biller `reference_text` (the injection carrier).
+- **Insufficient funds / a symbolic `ALL` that resolves to 0 → a clarifying
+  question, never a constructed zero-amount leg** (`amount_cents` is `gt=0`); we
+  never sign a plan the executor would reject. The return shape is binary
+  (`Resolved` | `Clarify`); a distinct `Failure` type for hard errors is left to
+  the team to confirm.
+- **`unresolved` is a hint, not a gate**: every required field is independently
+  verified regardless of what the LLM's `unresolved` list says. The disambiguation
+  (2+) case resumes via `answers={field: chosen_id}`, validated against a fresh
+  deterministic match — a caller cannot inject an id the mention doesn't justify.
+
+Tests (`pytest tests/test_resolver.py tests/test_import_boundary.py`): the 8
+acceptance cases (headline 2-leg plan, two-Johns disambiguation, unknown payee,
+company-name → ticker, `unresolved`-is-a-hint, empty plan → question with no
+`ResolvedPlan`, no-floats canonicalization, drained-`ALL` → clarify) plus a
+clarify-resume round-trip and provenance tests proving `payee_display`/`biller_display`
+carry no legal name or injection text.
+
 ## Architecture
 
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the pipeline and the
@@ -173,9 +219,9 @@ dcta/
 | 0 | Repo, stack, seed data, external spikes | done |
 | 1 | Gateway + audit log first | done |
 | 2 | WebAuthn register + sign canonical payload | done |
-| 3 | LLM parser + schema + opaque IDs | **done (this commit)** |
-| 4 | Resolver + clarify loop | next |
-| 5 | Policy engine + KYC + velocity + anomaly | |
+| 3 | LLM parser + schema + opaque IDs | done |
+| 4 | Resolver + clarify loop | **done (this commit)** |
+| 5 | Policy engine + KYC + velocity + anomaly | next |
 | 6 | Validation agent | |
 | 7 | Voice I/O + confirmation overlay UI | |
 | 8 | Red-team demo + polish | |
