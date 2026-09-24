@@ -32,7 +32,8 @@ from backend.auth import (
     verify_registration,
 )
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
-from backend.agent import ParseFailure, build_context, get_provider, parse_transcript
+from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
+                           get_provider, parse_transcript)
 
 from pathlib import Path
 
@@ -418,6 +419,15 @@ def create_plan(req: PlanRequest):
     provider = get_provider(settings)
     try:
         plan = parse_transcript(req.transcript, provider=provider, context=context)
+    except ProviderUnavailable as exc:
+        # The upstream model could not be reached at all (bad key, rate limit,
+        # timeout, transport error). That is not an internal error and not a
+        # parse failure: 502, with no stack trace leaking to the caller.
+        raise HTTPException(status_code=502, detail={
+            "error": "LLM provider unavailable",
+            "provider": provider.name,
+            "attempts": exc.errors,
+        })
     except ParseFailure as exc:
         # fail closed: a model that can't produce a valid plan produces no draft
         raise HTTPException(status_code=422, detail={

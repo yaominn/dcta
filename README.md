@@ -67,7 +67,28 @@ pytest -q
 
 The LLM parser (M3) runs on a deterministic stub provider until credentials
 exist, so local dev, CI and the security tests need no keys and no network.
-To swap stub → Hunyuan (M7 ASR follows the same pattern):
+
+**Three providers, selected by config — never by a code edit:**
+
+| `LLM_PROVIDER` | Uses | When |
+|---|---|---|
+| `auto` (default) | Hunyuan → OpenAI → stub | picks by which credentials exist |
+| `hunyuan` | Tencent Hunyuan | the submission path |
+| `openai` | OpenAI GPT | while Tencent access is pending |
+| `stub` | deterministic rules | CI, tests, offline dev |
+
+`auto` prefers **Hunyuan whenever its credentials exist**, even if an OpenAI
+key is also present: the hackathon judges "use of AI tools" and the tracks are
+built on Tencent Cloud services, so the Tencent path is the one that should
+win by default. OpenAI exists so the build is not blocked waiting on access.
+
+Whichever provider runs, the schema constraint is enforced **on our side** —
+generate → validate against the frozen Pydantic schema → retry, bounded. A
+provider failure (bad key, rate limit, timeout) is retried and then returned
+as **502**, distinct from a 422 "could not produce a valid plan". Neither is
+a 500.
+
+To swap stub → a real provider (M7 ASR follows the same pattern):
 
 1. `cp .env.example .env`
 2. Fill `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` from the Tencent

@@ -197,9 +197,12 @@ def test_provider_selection_stub_without_credentials(ctx):
 def test_provider_selection_hunyuan_with_credentials():
     from types import SimpleNamespace
     fake = SimpleNamespace(
-        has_credentials=True,
+        has_credentials=True, has_openai_credentials=False,
         tencent_secret_id="sid", tencent_secret_key="skey",
         hunyuan_model="hunyuan-functioncall", hunyuan_region="ap-guangzhou",
+        # provider-independent LLM tuning (backend.config.Settings); a stub that
+        # drifts from the real Settings shape hides configuration bugs.
+        llm_provider="auto", llm_temperature=0.0, llm_timeout_s=30.0,
     )
     provider = get_provider(fake)                 # construction needs no SDK/network
     assert provider.name == "hunyuan"

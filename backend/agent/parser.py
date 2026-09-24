@@ -16,6 +16,7 @@ import json
 from backend.agent import prompts
 from backend.agent.context import PromptContext
 from backend.agent.provider import LLMProvider
+from backend.agent.errors import ProviderError, ProviderUnavailable
 from backend.models.schemas import IntentPlan
 
 MAX_ATTEMPTS = 3   # 1 initial try + 2 repairs; then fail closed
@@ -61,7 +62,19 @@ def parse_transcript(transcript: str, *, provider: LLMProvider,
     errors: list[str] = []
 
     for attempt in range(1, max_attempts + 1):
-        raw = provider.complete(system=system, user=user)
+        # A provider failure (bad key, rate limit, timeout, transport error) is
+        # NOT a bad plan: there is no model output to correct, so the prompt is
+        # left unchanged and the attempt simply retried. Previously this call
+        # sat outside the try, so any provider exception escaped the retry loop
+        # entirely and surfaced as an unhandled 500.
+        try:
+            raw = provider.complete(system=system, user=user)
+        except ProviderError as exc:
+            errors.append(f"attempt {attempt}: provider unavailable: {exc}")
+            if attempt < max_attempts:
+                continue
+            raise ProviderUnavailable(errors) from exc
+
         try:
             return IntentPlan.model_validate(extract_json(raw))
         except ValueError as exc:     # JSON errors AND pydantic ValidationError

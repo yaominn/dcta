@@ -24,10 +24,12 @@ between stored third-party data and any prompt.
 from backend.agent.context import PromptContext, build_context, scan_stored_text
 from backend.agent.parser import MAX_ATTEMPTS, ParseFailure, extract_json, parse_transcript
 from backend.agent.provider import LLMProvider, get_provider
+from backend.agent.errors import ProviderError, ProviderUnavailable
 from backend.agent.stub import StubProvider
 
 __all__ = [
     "PromptContext", "build_context", "scan_stored_text",
     "MAX_ATTEMPTS", "ParseFailure", "extract_json", "parse_transcript",
     "LLMProvider", "get_provider", "StubProvider",
+    "ProviderError", "ProviderUnavailable",
 ]
