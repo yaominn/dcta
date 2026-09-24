@@ -379,3 +379,65 @@ def test_amount_cents_at_2to53_is_valid():
                "amount_cents": MAX_AMOUNT_CENTS}],
     ))
     assert plan.plan[0].amount_cents == MAX_AMOUNT_CENTS
+
+
+# --------------------------------------------------------------------------- R1: leg ids must be unique
+def test_duplicate_leg_ids_rejected():
+    """R1. `ids.index()` in _check_symbolic_refs returns only the FIRST match,
+    so a duplicate id silently defeats the forward-reference check the
+    validator exists to enforce:
+
+        [t1, t2->t1, t1]   ids.index("t1") == 0, 0 >= 1 is False -> passed
+
+    Leg t2 means "whatever is left after t1", but two legs are named t1 — one
+    already executed, one that has NOT. Uniqueness makes the reference
+    unambiguous, so the earlier-leg guarantee below it actually holds."""
+    dup = _symbolic_plan({"after_leg": "t1", "op": "ALL"})
+    dup["plan"].append({
+        "id": "t1", "type": "TRANSFER",                 # second t1, AFTER t2
+        "source_account": {"mention": "savings"},
+        "target": {"mention": "mom"},
+        "amount": {"literal_cents": 99000},
+    })
+    with pytest.raises(ValidationError, match="duplicate leg ids"):
+        IntentPlan.model_validate(dup)
+
+
+def test_duplicate_leg_ids_rejected_without_any_symbolic_amount():
+    """Uniqueness is a property of the plan, not only of plans that use
+    symbolic refs — duplicate ids make any later reference ambiguous."""
+    plan = _symbolic_plan({"literal_cents": 1000})
+    plan["plan"][1]["id"] = "t1"                        # both legs now t1
+    with pytest.raises(ValidationError, match="duplicate leg ids"):
+        IntentPlan.model_validate(plan)
+
+
+def test_distinct_leg_ids_still_construct():
+    """Guard against over-tightening: the ordinary two-leg plan is unaffected."""
+    plan = IntentPlan.model_validate(_symbolic_plan({"after_leg": "t1", "op": "ALL"}))
+    assert [leg.id for leg in plan.plan] == ["t1", "t2"]
+
+
+# --------------------------------------------------------------------------- R2: a plan must have at least one leg
+def test_empty_intent_plan_is_VALID():
+    """R2, the half that is deliberately permitted. An empty IntentPlan is how
+    the parser says "I understood no intent", with `unresolved` carrying what
+    to ask about. That drives the clarify loop, so it must keep validating."""
+    plan = IntentPlan.model_validate({"plan": [], "unresolved": ["amount for t1"]})
+    assert plan.plan == []
+    assert plan.unresolved == ["amount for t1"]
+
+
+def test_empty_resolved_plan_rejected():
+    """R2. A SIGNED authorization must move something. An empty ResolvedPlan
+    renders an overlay with no legs and asks for a biometric signature over an
+    authorization to do nothing — a valid signature, a valid audit entry, and
+    a meaningless consent. Unlike IntentPlan, nothing downstream of here has
+    anything to clarify: this object exists to be displayed, signed, executed."""
+    with pytest.raises(ValidationError):
+        ResolvedPlan.model_validate(_resolved_dict(plan=[]))
+
+
+def test_single_leg_resolved_plan_is_valid():
+    """min_length=1, not 2: one leg is a perfectly good authorization."""
+    assert len(ResolvedPlan.model_validate(_resolved_dict()).plan) == 1

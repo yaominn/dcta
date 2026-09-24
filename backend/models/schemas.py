@@ -162,6 +162,10 @@ Intent = Annotated[
 class IntentPlan(BaseModel):
     """Top-level LLM output. Matches brief Section 7 exactly."""
     model_config = ConfigDict(extra="forbid")
+    # An EMPTY plan is valid here on purpose: it is how the parser says "I
+    # understood no intent", with `unresolved` carrying what to ask about. That
+    # drives the clarify loop. The no-empty constraint belongs on ResolvedPlan
+    # (what gets signed), not here — see ResolvedPlan.plan.
     plan: list[Intent]
     unresolved: list[str] = Field(
         default_factory=list,
@@ -175,8 +179,19 @@ class IntentPlan(BaseModel):
         or to a later leg (forward/circular) is rejected at construction — the
         contradiction cannot be expressed, rather than detected downstream.
         M4's resolver implements the computation; the schema pins the
-        well-formedness now, before any consumer exists."""
+        well-formedness now, before any consumer exists.
+
+        R1: leg ids must be UNIQUE, checked first. The reference check below
+        uses ids.index(), which returns only the FIRST match — so with a
+        duplicate id, `[t1, t2->t1, t1]` passes: ids.index("t1") == 0 and
+        0 >= 1 is False, while the second t1 sits AFTER t2 and has not
+        executed. That is the forward reference this validator exists to
+        reject, reachable through a duplicate. Uniqueness first makes the
+        index lookup unambiguous, so the check below means what it says."""
         ids = [leg.id for leg in self.plan]
+        if len(ids) != len(set(ids)):
+            dupes = sorted({i for i in ids if ids.count(i) > 1})
+            raise ValueError(f"duplicate leg ids: {dupes} — leg ids must be unique")
         for i, leg in enumerate(self.plan):
             amt = leg.amount
             if isinstance(amt, SymbolicAmount):
@@ -264,7 +279,14 @@ class ResolvedPlan(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["1"] = "1"
     draft_id: str            # server-issued; the WebAuthn nonce binds to THIS (brief 4.5)
-    plan: list[ResolvedIntent]
+    # R2: a signed authorization must move something. An empty ResolvedPlan
+    # renders an overlay with no legs and asks the user for a biometric
+    # signature over an authorization to do nothing — a valid signature, a
+    # valid audit entry, and a meaningless consent. Unlike IntentPlan (where
+    # empty legitimately means "nothing understood, go clarify"), nothing
+    # downstream of here has anything to clarify: this object exists only to
+    # be displayed, signed and executed.
+    plan: list[ResolvedIntent] = Field(min_length=1)
     transcript_hash: str = Field(
         pattern=r"^[0-9a-f]{64}$",
         description="sha256 of the raw UTF-8 transcript this plan was derived from",
