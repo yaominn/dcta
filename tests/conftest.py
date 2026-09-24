@@ -34,6 +34,11 @@ os.environ["OPENAI_API_KEY"] = ""
 os.environ["TOKENHUB_API_KEY"] = ""
 os.environ["LLM_PROVIDER"] = "stub"
 os.environ["ASR_PROVIDER"] = "auto"
+# The mock signer stands in for the user's biometric in the contact and
+# red-team tests. It is OFF on every real server; the suite opts in here, and
+# tests/test_mock_signing_disabled.py switches it back off to prove the
+# default holds.
+os.environ["MOCK_SIGNING"] = "1"
 
 
 def _free_port() -> int:
@@ -69,8 +74,13 @@ def server_url():
 
     port = _free_port()
     origin = f"http://localhost:{port}"
+    # MOCK_SIGNING off: this is a real uvicorn process, configured the way the
+    # demo server is, so the tests that use it prove the passkey path works
+    # WITHOUT the shortcut. "" rather than removing it: load_dotenv never
+    # overrides a set variable, so a developer's .env cannot switch it back on.
     env = {**os.environ,
-           "WEBAUTHN_EXPECTED_ORIGIN": origin, "WEBAUTHN_RP_ID": "localhost"}
+           "WEBAUTHN_EXPECTED_ORIGIN": origin, "WEBAUTHN_RP_ID": "localhost",
+           "MOCK_SIGNING": ""}
     proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "backend.main:app",
          "--host", "127.0.0.1", "--port", str(port), "--no-access-log"],

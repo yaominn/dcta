@@ -52,6 +52,12 @@ class Result:
 
 
 def _client() -> TestClient:
+    # The scenarios sign with the mock signer to stand in for the user's
+    # biometric, so they opt in to it — in THIS process's in-memory app only.
+    # The demo server is a different process with MOCK_SIGNING off, and
+    # nothing here can reach it.
+    from backend.config import settings
+    settings.mock_signing = True
     from backend.main import app
     return TestClient(app)
 

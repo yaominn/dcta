@@ -108,6 +108,30 @@ To swap stub → a real provider (M7 ASR follows the same pattern):
    `settings.has_credentials` is False. Swapping is a config change, never a
    code change.
 
+## Mock signing — tests only, off on every real server
+
+The only thing that may authorize a payment or a contact edit is a **passkey
+assertion with user verification** (`/api/gateway/execute-webauthn`,
+`/api/contacts/apply-webauthn`). The test-suite and the red-team runner also
+need to stand in for the user's biometric, so a mock path exists: an HMAC held
+by the server, issued by `/api/auth/mock-sign` and accepted by
+`/api/gateway/execute` and `/api/contacts/apply`.
+
+`/api/auth/mock-sign` signs **whatever plan it is sent, for any caller** — so
+with it reachable, three HTTP calls (nonce → mock-sign → execute) move money
+from a fabricated plan with no passkey and no human. It is therefore gated:
+
+| `MOCK_SIGNING` | The three mock routes | Who sets it |
+|---|---|---|
+| unset (default), or anything but `1`/`true`/`yes`/`on` | **404**, identical to a route that never existed; absent from `/docs`; refused before the body is parsed; each attempt logged | every real server — **leave it unset** |
+| `1` | enabled, with a startup warning | `tests/conftest.py`; `python -m backend.redteam`, in its own process only |
+
+A typo fails **closed**. The WebAuthn routes are unaffected either way, and
+`tests/test_e2e_webauthn.py` signs against a live server started with the flag
+off, so the real path is proven without the shortcut.
+`tests/test_mock_signing_disabled.py` pins all of this, including the
+three-call attack failing end to end with the balance unchanged.
+
 ## M3 — LLM parser + schema + opaque IDs
 
 `POST /api/plan` turns a text transcript into a schema-valid `IntentPlan`

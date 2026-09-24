@@ -19,6 +19,13 @@ except Exception:
     pass  # .env is a convenience; env vars set directly also work.
 
 
+def env_flag(name: str) -> bool:
+    """A boolean env var. ON only for an explicit 1/true/yes/on — anything
+    else, including unset or a typo, is OFF. For a flag that WEAKENS security,
+    failing closed on an unrecognised value is the only safe reading."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Settings:
     # Tencent Cloud credentials — LEFT EMPTY in M0. Fill .env locally to go live.
     tencent_secret_id: str = os.getenv("TENCENTCLOUD_SECRET_ID", "")
@@ -94,6 +101,15 @@ class Settings:
     # The origin the browser actually speaks. localhost over HTTP for dev;
     # https://<host> for the deployed demo. Verified against clientDataJSON.
     expected_origin: str = os.getenv("WEBAUTHN_EXPECTED_ORIGIN", "http://localhost:8000")
+
+    # --- Mock signing (tests and the red-team runner ONLY) ---
+    # Enables /api/auth/mock-sign, /api/gateway/execute and /api/contacts/apply:
+    # a server-held HMAC stands in for the user's biometric. /api/auth/mock-sign
+    # hands that signature to ANY caller, so with this on, three HTTP calls
+    # move money with no passkey and no human. OFF by default, and it must stay
+    # off on any server a person can reach. The test-suite and
+    # `python -m backend.redteam` switch it on in their own process only.
+    mock_signing: bool = env_flag("MOCK_SIGNING")
 
     @property
     def has_credentials(self) -> bool:

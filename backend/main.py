@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import time
 
-from fastapi import FastAPI, File, HTTPException, UploadFile, Query
+from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -182,6 +182,35 @@ _signer = MockSigner()
 _credentials = MockCredentialStore()
 _credentials.register("cred_alice", _signer.public_key)   # MOCK demo credential
 
+
+# The three routes below that use _signer/_gateway are the MOCK path: a
+# server-held HMAC stands in for the user's biometric, and /api/auth/mock-sign
+# hands that signature to anyone who asks. Left reachable, that is three HTTP
+# calls from a fabricated plan to moved money — no passkey, no human. So they
+# exist only when MOCK_SIGNING is on (tests, the red-team runner), and are
+# otherwise indistinguishable from a route that was never defined: the same
+# 404 body, absent from /docs, checked BEFORE the request body is parsed so a
+# probe learns nothing about the schema either.
+#
+# Checked per request, not at import, so a test can flip it on one process
+# without a restart. cred_alice above is reachable only through these routes;
+# with them off it is inert, and the WebAuthn path never consults it.
+def _require_mock_signing(request: Request) -> None:
+    if not settings.mock_signing:
+        logging.warning("blocked call to disabled mock-signing route %s %s",
+                        request.method, request.url.path)
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+_MOCK_ONLY = {"dependencies": [Depends(_require_mock_signing)],
+              "include_in_schema": settings.mock_signing}
+
+if settings.mock_signing:
+    logging.warning(
+        "MOCK_SIGNING IS ON: /api/auth/mock-sign issues valid signatures to any "
+        "caller, so payments and contact edits can be executed with NO "
+        "biometric. Never run a demo or any reachable server like this.")
+
 _nonce_store = NonceStore(ttl_seconds=120)
 # Out-of-band step-up (gateway/stepup.py): an anomaly verdict needs a code sent
 # to the user's phone before the gateway will execute. Shared by both gateways.
@@ -267,14 +296,15 @@ def webauthn_config():
 
 
 class MockSignRequest(BaseModel):
-    """# MOCK dev-only convenience to demo the happy path. Would NOT exist in M2,
-    where the browser signs via WebAuthn. Lets an HTTP client obtain a valid
-    signature over the canonical challenge without the server's mock secret."""
+    """# MOCK — tests and the red-team runner only (MOCK_SIGNING; 404 otherwise).
+    Lets an HTTP client obtain a valid signature over the canonical challenge
+    without the server's mock secret, which is exactly why it must not be
+    reachable on a demo: the browser signs via WebAuthn."""
     resolved_plan: ResolvedPlan
     nonce: str
 
 
-@app.post("/api/auth/mock-sign")
+@app.post("/api/auth/mock-sign", **_MOCK_ONLY)
 def mock_sign(req: MockSignRequest):
     p_hash = payload_hash(req.resolved_plan)
     challenge = challenge_hash(p_hash, req.nonce)
@@ -292,7 +322,7 @@ class ExecuteRequest(BaseModel):
     credential_id: str
 
 
-@app.post("/api/gateway/execute")
+@app.post("/api/gateway/execute", **_MOCK_ONLY)
 def gateway_execute(req: ExecuteRequest):
     """The single execution chokepoint. Verifies nonce -> signature -> executes.
     Returns accepted=True on success; accepted=False (rejected+logged) on any
@@ -984,7 +1014,7 @@ class ContactApplyRequest(BaseModel):
     credential_id: str
 
 
-@app.post("/api/contacts/apply")
+@app.post("/api/contacts/apply", **_MOCK_ONLY)
 def contacts_apply(req: ContactApplyRequest):
     return _traced_gateway(req.contact_change.draft_id, "mock signer",
                            _gateway.submit_contact_change(req.contact_change, req.signature,
