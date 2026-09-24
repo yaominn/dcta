@@ -343,15 +343,27 @@ tiers, and the bottom one always works**:
 
 | tier | where | needs a key | when it runs |
 |---|---|---|---|
-| Tencent Cloud ASR | our backend | yes | credentials configured |
-| Web Speech API | the browser | no | server ASR returns 503 |
+| OpenAI transcription or Tencent Cloud ASR | our backend | yes | a provider is configured |
+| Web Speech API | the browser | no | server ASR returns 503/415 |
 | **text input** | the browser | no | **always available** |
 
-Tier 1 is necessarily browser → **our backend** → Tencent, because
-SecretId/SecretKey must never reach the browser. That extra hop is part of why
-tier 2 exists: it is key-free *and* lower-latency.
+Tier 1 is selected by `ASR_PROVIDER` (`openai` | `tencent` | `none` | `auto`).
+`auto`, the default, takes Tencent when its credential pair exists, else OpenAI
+when `OPENAI_API_KEY` exists — the same key the LLM uses, so one key covers
+voice and parsing. OpenAI uses `gpt-4o-mini-transcribe` (`OPENAI_ASR_MODEL`)
+with the language pinned to `en` (`OPENAI_ASR_LANGUAGE`; empty = auto-detect).
 
-With no credentials configured — the current state — `/api/transcribe` answers
+Each provider declares the containers it accepts, and `/api/transcribe` checks
+the **active** provider's list. They differ where it matters: **OpenAI accepts
+webm**, Chrome's `MediaRecorder` default, so Chrome audio is transcribed
+server-side as recorded. Tencent does not, so on Tencent, Chrome gets a 415 and
+drops to Web Speech (below).
+
+Tier 1 is necessarily browser → **our backend** → provider, because API keys
+must never reach the browser. That extra hop is part of why tier 2 exists: it
+is key-free *and* lower-latency.
+
+With no provider configured, `/api/transcribe` answers
 **503 with `{"fallback": "webspeech"}`** and the browser drops a tier. That is
 the designed degradation path, not a failure: the user sees a different engine,
 not an error. The `UnavailableASR` provider deliberately raises rather than
@@ -615,8 +627,8 @@ Voice/Text -> ASR -> sanitizer -> LLM parser -> resolver -> policy
   Output handling: generate → validate against the Pydantic schema → reject
   and retry, bounded retries. The schema constraint is enforced **on our side**
   regardless of provider-side enforcement.
-- **ASR/TTS:** Tencent Cloud ASR (Singapore region, English), Web Speech API
-  fallback. Text input always works as a demo floor.
+- **ASR/TTS:** OpenAI transcription or Tencent Cloud ASR (Singapore region,
+  English), Web Speech API fallback. Text input always works as a demo floor.
 - **Auth:** WebAuthn for **transaction signing only**; app login is a mock session.
 
 ## Repo layout (brief Section 8)

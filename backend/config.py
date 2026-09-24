@@ -54,6 +54,18 @@ class Settings:
     openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
+    # --- Speech-to-text provider ---
+    # "openai" | "tencent" | "none" | "auto" (default: Tencent when its
+    # credential pair exists, else OpenAI when OPENAI_API_KEY exists, else
+    # none). With none, /api/transcribe answers 503 and the browser uses Web
+    # Speech — degradation, not failure.
+    asr_provider: str = os.getenv("ASR_PROVIDER", "auto")
+    # OpenAI transcription reuses OPENAI_API_KEY / OPENAI_BASE_URL above.
+    openai_asr_model: str = os.getenv("OPENAI_ASR_MODEL", "gpt-4o-mini-transcribe")
+    # ISO-639-1. Pinned because short command-length clips are exactly where
+    # auto-detection guesses wrong. Empty = let the model detect.
+    openai_asr_language: str = os.getenv("OPENAI_ASR_LANGUAGE", "en")
+
     # --- LLM behaviour (provider-independent) ---
     # "tokenhub" | "openai" | "hunyuan" | "stub" | "auto" (default: the live provider
     # whose credentials exist). Pinning a live provider makes a missing key

@@ -23,12 +23,17 @@ import requests
 REPO = Path(__file__).resolve().parent.parent
 
 # The suite needs no keys and no network, even on a machine whose .env holds
-# real Tencent credentials. Set before backend.config is imported: load_dotenv
-# never overrides a variable that already exists, so these win over .env — and
-# the uvicorn subprocess below inherits them too.
+# real credentials. Set before backend.config is imported: load_dotenv never
+# overrides a variable that already exists, so these win over .env — and the
+# uvicorn subprocess below inherits them too. EVERY live key belongs here: one
+# left out means a developer with it in .env runs paid upstream calls on each
+# `pytest`, and ASR "auto" would pick that provider over the one tests expect.
 os.environ["TENCENTCLOUD_SECRET_ID"] = ""
 os.environ["TENCENTCLOUD_SECRET_KEY"] = ""
+os.environ["OPENAI_API_KEY"] = ""
+os.environ["TOKENHUB_API_KEY"] = ""
 os.environ["LLM_PROVIDER"] = "stub"
+os.environ["ASR_PROVIDER"] = "auto"
 
 
 def _free_port() -> int:

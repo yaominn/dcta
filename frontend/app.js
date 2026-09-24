@@ -677,7 +677,7 @@ function wireVoice() {
     // A second press stops whichever tier is listening.
     if (active) { active.stop(); active = null; return; }
     if (serverAsrDown) { startWebSpeech(); return; }
-    // Tier 1 first (server-side Tencent ASR).
+    // Tier 1 first (server-side ASR: OpenAI or Tencent, the backend decides).
     const rec = await Voice.recordAndUpload({
       onText, onError, onState,
       onFallback: () => {
@@ -685,7 +685,7 @@ function wireVoice() {
         // than silently listening again.
         serverAsrDown = true;
         active = null;
-        botSay("Tencent speech recognition isn't available right now, so I'll "
+        botSay("Server speech recognition isn't available right now, so I'll "
           + "use your browser's instead. Please say it again.");
         startWebSpeech();
       },

@@ -23,10 +23,12 @@ from __future__ import annotations
 import base64
 
 from backend.asr.errors import ASRUnavailable
+from backend.asr.provider import SUPPORTED_VOICE_FORMATS
 
 
 class TencentASRProvider:
     name = "tencent"
+    formats = SUPPORTED_VOICE_FORMATS
 
     def __init__(self, settings):
         self._secret_id = settings.tencent_secret_id

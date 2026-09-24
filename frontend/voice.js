@@ -1,8 +1,9 @@
 /*
  * DCTA voice input — three tiers, degrading gracefully. (M7)
  *
- *   1. Tencent Cloud ASR   POST /api/transcribe (credentials live server-side;
- *                          they must never reach this file)
+ *   1. Server-side ASR     POST /api/transcribe — OpenAI or Tencent, chosen
+ *                          by the backend (keys live server-side; they must
+ *                          never reach this file)
  *   2. Web Speech API      in-browser, free, no keys, lower latency
  *   3. Text input          always works — the demo floor
  *
@@ -28,8 +29,9 @@ const Voice = (() => {
   /* ---------- audio container negotiation ---------- */
   /* Browser MIME type -> the VoiceFormat name the backend allows. Anything not
      listed here is sent without a hint, and the server answers 415 and names
-     the tier to fall back to. Keep in step with SUPPORTED_VOICE_FORMATS in
-     backend/asr/provider.py. */
+     the tier to fall back to. The backend checks the name against the
+     ACTIVE provider's `formats` (backend/asr/): OpenAI also accepts webm,
+     Chrome's default, which arrives here as the verbatim subtype below. */
   const MIME_TO_VOICE_FORMAT = [
     ["audio/ogg", "ogg-opus"],
     ["audio/mpeg", "mp3"],
@@ -61,7 +63,7 @@ const Voice = (() => {
     for (const t of ["audio/ogg;codecs=opus", "audio/ogg", "audio/mp4", "audio/mpeg"]) {
       if (MediaRecorder.isTypeSupported(t)) return { mimeType: t };
     }
-    return undefined;     // browser default (usually webm) -> 415 -> tier 2
+    return undefined;     // browser default, usually webm: OpenAI takes it; Tencent -> 415 -> tier 2
   }
 
   /* ---------- tier 2: Web Speech API ---------- */

@@ -41,7 +41,7 @@ from backend.models.contacts import ContactEditPlan, ResolvedContactChange
 from backend.policy import contact_change_step_up
 from backend.resolver.contacts import resolve_contact_edit
 from backend.validator.contacts import validate_contact_change
-from backend.asr import (MAX_AUDIO_BYTES, SUPPORTED_VOICE_FORMATS,
+from backend.asr import (MAX_AUDIO_BYTES,
                          ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
 from backend.validator import default_freeze_set, validate
@@ -550,19 +550,20 @@ async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
     provider = get_asr_provider(settings)
 
     # `fmt` is what the BROWSER says it recorded, so it is caller-supplied input
-    # that would otherwise go straight upstream as VoiceFormat. Checked against
-    # the documented containers on our side, before a byte leaves the building
+    # that would otherwise go straight upstream. Checked against the containers
+    # THIS provider documents, on our side, before a byte leaves the building
     # — the same reason the LLM's output is validated here rather than trusted.
+    # Per provider because they differ where it matters: OpenAI takes Chrome's
+    # default webm, Tencent does not.
     #
     # 415 rather than 503: the service is up, this container is the problem.
-    # The client treats both as "drop a tier", so the user still gets Web Speech
-    # — which is the honest answer when Chrome can only hand us webm.
+    # The client treats both as "drop a tier", so the user still gets Web Speech.
     container = (fmt or settings.asr_voice_format).lower()
-    if container not in SUPPORTED_VOICE_FORMATS:
+    if container not in provider.formats:
         raise HTTPException(status_code=415, detail={
             "error": f"unsupported audio container {container!r}; "
-                     f"Tencent SentenceRecognition accepts "
-                     f"{', '.join(sorted(SUPPORTED_VOICE_FORMATS))}",
+                     f"the {provider.name} provider accepts "
+                     f"{', '.join(sorted(provider.formats))}",
             "provider": provider.name,
             "fallback": "webspeech",
         })
