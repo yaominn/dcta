@@ -208,6 +208,16 @@ def issue_nonce(draft_id: str = Query(...)):
             "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
 
 
+@app.get("/api/auth/config")
+def webauthn_config():
+    """The RP ID the server verifies against (M1: registration and signing must
+    not disagree). The browser uses THIS for navigator.credentials.get rpId
+    rather than location.hostname — reaching the app at 127.0.0.1 instead of
+    localhost would otherwise register on one RP id and fail to sign on another
+    with an unhelpful error. One source of truth -> the two cannot diverge."""
+    return {"rp_id": settings.rp_id}
+
+
 class MockSignRequest(BaseModel):
     """# MOCK dev-only convenience to demo the happy path. Would NOT exist in M2,
     where the browser signs via WebAuthn. Lets an HTTP client obtain a valid

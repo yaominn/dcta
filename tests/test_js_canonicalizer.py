@@ -18,14 +18,28 @@ the canonicalization contract the resolver's output must satisfy.
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from backend.audit.canonical import canonical_json, payload_hash
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer
 
 REPO = Path(__file__).resolve().parents[1]
 RUNNER = REPO / "tests" / "js" / "canonical_runner.js"
+
+# Node.js is not a pip dependency, so `pip install -r requirements.txt` cannot
+# supply it. Skip (not error) on a clean checkout without Node so the suite is
+# green; the README "Test prerequisites" section installs Node so this test
+# actually RUNS — a skip guard alone would let the "do not skip this one" test
+# silently never run anywhere, which is worse than failing loudly.
+pytestmark = pytest.mark.skipif(
+    not shutil.which("node"),
+    reason="Node.js not found; required for the cross-language canonicalizer "
+           "test (see README Test prerequisites).",
+)
 
 
 def _js_hash(plan_dict: dict) -> tuple[str, str]:

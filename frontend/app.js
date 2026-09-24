@@ -162,7 +162,10 @@ function assertionToJson(a) {
     authenticatorAttachment: a.authenticatorAttachment || null,
   };
 }
-async function signAndExecute(plan, credentialIds) {
+async function signAndExecute(plan, credentialIds, rpId) {
+  // rpId comes from the server (/api/auth/config) so registration and signing
+  // cannot disagree (M1: location.hostname would differ from settings.rp_id
+  // when the app is reached at 127.0.0.1 instead of localhost).
   // 1. recompute payload_hash from the SAME object we rendered (canonical.js
   //    is byte-identical to Python's canonical_json -> the hashes match).
   const canonical = canonicalJson(plan);
@@ -182,7 +185,7 @@ async function signAndExecute(plan, credentialIds) {
   const assertion = await navigator.credentials.get({
     publicKey: {
       challenge: challenge,
-      rpId: location.hostname,
+      rpId: rpId,
       userVerification: "required",
       timeout: 60000,
       allowCredentials: credentialIds.map((id) => ({ type: "public-key", id: b64uToBuf(id) })),
@@ -200,16 +203,21 @@ async function signAndExecute(plan, credentialIds) {
 
 function showResult(res) {
   const box = document.getElementById("result");
-  box.hidden = false;
-  box.className = "result " + (res.json.accepted ? "ok" : "bad");
   const status = res.json.accepted ? "EXECUTED" : res.json.rejection || "REJECTED";
-  let html = `<h3>${status}</h3>`;
-  if (res.json.accepted) {
-    html += `<pre>${JSON.stringify(res.json.execution, null, 2)}</pre>`;
-  } else {
-    html += `<pre>${JSON.stringify(res.json, null, 2)}</pre>`;
-  }
-  box.innerHTML = html;
+  // status + body are TEXT, never parsed as HTML. A rejection reason carries
+  // executor/LLM-influenced text (e.g. a failed account "<img src=x ...>");
+  // this is the trusted overlay -- the surface the "what you see is what you
+  // sign" argument presumes renders faithfully -- so markup must appear as
+  // literal characters, not as a parsed element. Same textContent-only rule
+  // renderPlan() follows for every field. (H1: this was an innerHTML sink;
+  // JSON.stringify escapes quotes but not </>, so the tag parsed.)
+  const h3 = el("h3"); h3.textContent = status;
+  const pre = el("pre");
+  pre.textContent = JSON.stringify(
+    res.json.accepted ? res.json.execution : res.json, null, 2);
+  box.replaceChildren(h3, pre);           // clears any prior content, appends
+  box.className = "result " + (res.json.accepted ? "ok" : "bad");
+  box.hidden = false;
 }
 
 /* ---------- bootstrap ---------- */
@@ -232,6 +240,7 @@ async function init() {
 
   // passkey exists -> show the overlay + sign button
   const plan = await jget(API + "/api/drafts/demo");
+  const cfg = await jget(API + "/api/auth/config");   // server RP id (M1)
   renderPlan(plan);
   document.getElementById("plan").hidden = false;
   const btn = document.getElementById("sign");
@@ -239,7 +248,7 @@ async function init() {
   btn.onclick = async () => {
     btn.disabled = true;
     try {
-      const res = await signAndExecute(plan, creds.credential_ids);
+      const res = await signAndExecute(plan, creds.credential_ids, cfg.rp_id);
       showResult(res);
     } catch (e) {
       showErr(String(e));

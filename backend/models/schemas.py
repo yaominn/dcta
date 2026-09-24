@@ -36,6 +36,15 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 # not a deployment setting. 300s = an approval is minutes-scale, not open-ended.
 MAX_AUTH_WINDOW_S = 300
 
+# Cross-language hash-safety ceiling. JS numbers are IEEE-754 doubles: integers
+# above 2^53 lose precision in JS but not Python, so the two canonicalizers
+# would produce different bytes -> a payload_hash mismatch in the exact field
+# the binding-constraint test exists to prove matches. Bounding amount_cents
+# here makes the byte-identical guarantee unconditional rather than incidental
+# (fails closed on the mismatch either way, but the guarantee should not depend
+# on the value staying small by accident). M5's payment limits sit far below.
+MAX_AMOUNT_CENTS = 2**53 - 1
+
 
 # --------------------------------------------------------------------------- enums
 class IntentType(str, Enum):
@@ -144,7 +153,7 @@ class ResolvedTransfer(BaseModel):
     source_account: str
     payee_id: str            # resolver mapped the mention -> concrete id
     payee_display: str       # safe label for the overlay (user nickname)
-    amount_cents: int = Field(gt=0)   # concrete, computed by the resolver
+    amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)   # concrete, computed by the resolver
 
 
 class ResolvedPayBill(BaseModel):
@@ -154,7 +163,7 @@ class ResolvedPayBill(BaseModel):
     source_account: str
     biller_id: str
     biller_display: str
-    amount_cents: int = Field(gt=0)
+    amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)
 
 
 class ResolvedBuyEquity(BaseModel):
@@ -163,7 +172,7 @@ class ResolvedBuyEquity(BaseModel):
     type: Literal["BUY_EQUITY"] = "BUY_EQUITY"
     source_account: str
     ticker: str
-    amount_cents: int = Field(gt=0)             # dollars allocated, in cents
+    amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)            # dollars allocated, in cents
     estimated_shares: int      # WHOLE shares only (floor) -> the demo's 32 shares
     estimated_fill_price_cents: int             # per-share price, in cents
 

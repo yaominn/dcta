@@ -11,7 +11,9 @@ import pytest
 from pydantic import ValidationError
 
 from backend.audit.canonical import hash_transcript
-from backend.models.schemas import IntentPlan, ResolvedPlan, MAX_AUTH_WINDOW_S
+from backend.models.schemas import (
+    IntentPlan, ResolvedPlan, MAX_AUTH_WINDOW_S, MAX_AMOUNT_CENTS,
+)
 
 _TX = "stub: pay mom five hundred then buy aapl with the rest"
 _TX_HASH = hash_transcript(_TX)
@@ -218,3 +220,30 @@ def test_window_at_cap_is_valid():
         created_at=c, expires_at=c + MAX_AUTH_WINDOW_S,
     ))
     assert plan.expires_at - plan.created_at == MAX_AUTH_WINDOW_S
+
+
+# --------------------------------------------------------------------------- N1: amount_cents is bounded (cross-language hash safety)
+def test_amount_cents_above_2to53_rejected():
+    """N1: JS numbers are doubles; integers above 2^53 lose precision in JS but
+    not Python, so the two canonicalizers would produce different bytes -> a
+    payload_hash mismatch in the exact field the binding-constraint test proves
+    matches. The bound makes that guarantee unconditional, not incidental. A
+    value one above the ceiling is rejected at validation, so it can never be
+    signed."""
+    with pytest.raises(ValidationError):
+        ResolvedPlan.model_validate(_resolved_dict(
+            plan=[{"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+                   "payee_id": "payee_17", "payee_display": "Mom",
+                   "amount_cents": MAX_AMOUNT_CENTS + 1}],
+        ))
+
+
+def test_amount_cents_at_2to53_is_valid():
+    """Boundary: the ceiling itself is acceptable (inclusive). The bound is a
+    hard ceiling on the signed payload, not an off-by-one below it."""
+    plan = ResolvedPlan.model_validate(_resolved_dict(
+        plan=[{"id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+               "payee_id": "payee_17", "payee_display": "Mom",
+               "amount_cents": MAX_AMOUNT_CENTS}],
+    ))
+    assert plan.plan[0].amount_cents == MAX_AMOUNT_CENTS
