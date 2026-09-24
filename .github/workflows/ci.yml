@@ -1,0 +1,74 @@
+# DCTA continuous integration.
+#
+# The point of this workflow is narrow and deliberate: it installs ONLY what
+# requirements.txt declares, in a clean environment, and runs the whole suite.
+# Three milestones in a row shipped green in a developer sandbox and broken on
+# a fresh clone, because the sandbox already had a package that requirements.txt
+# never listed (py_webauthn's wrong PyPI name, then node/Playwright, then
+# httpx2). A clean runner is the only thing that reliably catches that.
+#
+# So: do NOT add `pip install <something>` steps here to make a red build go
+# green. If a dependency is missing, it belongs in requirements.txt. That is
+# the bug this workflow exists to surface.
+#
+# Node and the Playwright browsers are the two exceptions — neither can be a
+# pip dependency, and both are documented as prerequisites in the README. They
+# gate the two tests the security model rests on:
+#   - tests/test_js_canonicalizer.py  (what the browser displays is what it hashes)
+#   - tests/test_e2e_webauthn.py      (a real biometric assertion authorizes execution)
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Set up Node
+        # Required by tests/test_js_canonicalizer.py, which runs
+        # frontend/canonical.js and asserts it is byte-identical to Python's
+        # canonicalizer. Without node those tests skip, and a cross-language
+        # guarantee that never runs is not a guarantee.
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        # requirements.txt ONLY. If this is not enough to run the suite,
+        # requirements.txt is wrong and the build should fail.
+        run: pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        # Browser binaries are a separate download from the pip package.
+        run: playwright install --with-deps chromium
+
+      - name: Run tests
+        # -rs reports skipped tests, so a silently-skipping prerequisite test
+        # is visible in the log rather than hiding inside a green run.
+        run: pytest -q -rs
+
+      - name: Assert the cross-language tests actually ran
+        # Belt and braces: node is installed above, so the canonicalizer tests
+        # must execute. If they report as skipped here, the guard is
+        # misfiring and the byte-identical guarantee is unverified.
+        run: |
+          pytest tests/test_js_canonicalizer.py -q -rs 2>&1 | tee /tmp/js.log
+          if grep -q "skipped" /tmp/js.log; then
+            echo "::error::JS canonicalizer tests skipped despite node being installed"
+            exit 1
+          fi
