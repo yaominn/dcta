@@ -72,13 +72,26 @@ exist, so local dev, CI and the security tests need no keys and no network.
 
 | `LLM_PROVIDER` | Uses | When |
 |---|---|---|
-| `auto` (default) | Hunyuan when credentials exist, else stub | normal use |
-| `hunyuan` | Tencent Hunyuan | pins the real model |
+| `auto` | TokenHub if `TOKENHUB_API_KEY`, else OpenAI if `OPENAI_API_KEY`, else stub | normal use |
+| `tokenhub` | Tencent TokenHub (`hy3-preview`) | the Tencent-native live model |
+| `openai` | OpenAI GPT (`gpt-4.1-mini`, set by `OPENAI_MODEL`) | alternative live model |
+| `hunyuan` | legacy `hunyuan.tencentcloudapi.com` | dead publicly; self-hosted only |
 | `stub` | deterministic rules | CI, tests, offline dev |
 
-Pinning `hunyuan` is worth knowing about for the demo: it makes a missing or
-broken key **fail loudly**, instead of silently falling back to the stub —
+Pinning a live provider is worth knowing about for the demo: it makes a missing
+or broken key **fail loudly**, instead of silently falling back to the stub —
 which would look exactly like the model working.
+
+TokenHub and OpenAI speak the same wire protocol, so both are thin subclasses
+of `backend/agent/openai_compat.py`. **GPT-5-series reasoning models reject
+`temperature=0`** (HTTP 400); the default `gpt-4.1-mini` accepts it. To run a
+reasoning model, also set `LLM_TEMPERATURE=1`.
+
+**`TOKENHUB_API_KEY` is a separate credential from `TENCENTCLOUD_SECRET_ID` /
+`_SECRET_KEY`.** The Tencent pair still signs ASR; it carries no authority on
+TokenHub. Generate a TokenHub key in its console (free trial credits included)
+and put it in `.env` — with it blank, `/api/plan` returns 502 naming the
+variable, by design.
 
 Whichever provider runs, the schema constraint is enforced **on our side** —
 generate → validate against the frozen Pydantic schema → retry, bounded. A
@@ -685,16 +698,21 @@ each one, so a regression breaks CI rather than surfacing on stage.
 - **Tencent retired the legacy Hunyuan `ChatCompletions` API.** With real
   credentials (24 Sep 2026) authentication succeeds, but every model —
   `hunyuan-functioncall`, `hunyuan-turbos-latest`, `hunyuan-lite` and others —
-  returns *"this model has been taken offline; migrate to TokenHub"*. TokenHub
-  (`https://tokenhub.tencentmaas.com/v1`, OpenAI-compatible, model
-  `hy3-preview`) uses its own API key, not SecretId/SecretKey, so
-  `backend/agent/hunyuan.py` cannot reach it as written. Until a TokenHub
-  provider exists, run with `LLM_PROVIDER=stub`.
-- **Neither the LLM nor the ASR has produced output from a real service.** There are no
-  Tencent credentials yet, so the parser uses a deterministic stub and
-  `/api/transcribe` reports unavailable. Every security property is tested and
-  holds regardless of the model — that is the point of validating on our side —
-  but parse quality and the Tencent integrations themselves are unproven.
+  returns *"this model has been taken offline; migrate to TokenHub"*, and that
+  platform shuts down 2026-09-30. **Migrated:** `backend/agent/tokenhub.py`
+  speaks the replacement API (`https://tokenhub.tencentmaas.com/v1`,
+  OpenAI-compatible, model `hy3-preview`, bearer API key) and is what `auto`
+  now prefers. `backend/agent/hunyuan.py` is kept for a self-hosted or
+  grandfathered endpoint. This is exactly the swap the provider interface was
+  built for: one new file, one branch in `get_provider`, and not one line of
+  `parser.py`, `prompts.py` or `context.py` changed.
+- **The LLM has not yet produced output from a real service.** Two live
+  providers are wired — TokenHub and OpenAI — and each needs its own API key;
+  with the chosen provider pinned and its key missing, the parser fails loudly
+  rather than serving stub output.
+  Every security property is tested and holds regardless of the model — that is
+  the point of validating on our side — but parse quality and the Tencent
+  integrations themselves remain unproven.
 
 - The OS biometric prompt signs a blind hash; "what you see is what you sign"
   is a *client-integrity* assumption, not a cryptographic guarantee. The

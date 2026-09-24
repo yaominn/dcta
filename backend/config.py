@@ -36,10 +36,30 @@ class Settings:
     asr_timeout_s: float = float(os.getenv("ASR_TIMEOUT_S", "20"))
     hunyuan_model: str = os.getenv("HUNYUAN_MODEL", "hunyuan-functioncall")
 
+    # --- TokenHub (the live LLM endpoint) ---
+    # Tencent decommissioned the hunyuan.tencentcloudapi.com ChatCompletions
+    # API; every model on it now answers "该模型已下线" and the platform shuts
+    # down 2026-09-30. TokenHub is the replacement: OpenAI-compatible wire
+    # format, and a bearer API KEY that is a SEPARATE credential from
+    # TENCENTCLOUD_SECRET_ID/KEY (those still authenticate ASR, but carry no
+    # authority here). Generate one in the TokenHub console.
+    tokenhub_api_key: str = os.getenv("TOKENHUB_API_KEY", "")
+    tokenhub_base_url: str = os.getenv("TOKENHUB_BASE_URL", "https://tokenhub.tencentmaas.com/v1")
+    tokenhub_model: str = os.getenv("TOKENHUB_MODEL", "hy3-preview")
+
+    # --- OpenAI (GPT) — alternative LLM, LLM_PROVIDER=openai ---
+    # Default model accepts temperature=0; GPT-5-series reasoning models reject
+    # it with HTTP 400, so running one of those needs LLM_TEMPERATURE=1.
+    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
+    openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
     # --- LLM behaviour (provider-independent) ---
-    # "hunyuan" | "stub" | "auto" (default: Hunyuan when credentials exist).
-    # Pinning "hunyuan" makes a missing key fail loudly rather than silently
-    # serving stub output, which would look like the model working.
+    # "tokenhub" | "openai" | "hunyuan" | "stub" | "auto" (default: the live provider
+    # whose credentials exist). Pinning a live provider makes a missing key
+    # fail loudly rather than silently serving stub output, which would look
+    # like the model working. "hunyuan" is retained only to reach a
+    # self-hosted/legacy endpoint; the public one is gone.
     llm_provider: str = os.getenv("LLM_PROVIDER", "auto")
     # Structured extraction, not prose: near-zero so the same transcript yields
     # the same plan and the retry budget is spent on real ambiguity, not
@@ -65,8 +85,18 @@ class Settings:
 
     @property
     def has_credentials(self) -> bool:
-        """True only if real Tencent creds are present. Stubs are used while False."""
+        """True only if real Tencent creds are present. Stubs are used while False.
+
+        This gates ASR (and the legacy Hunyuan endpoint), which still sign with
+        SecretId/SecretKey. The LLM has its own gate below — the two are
+        separate credentials and one can be present without the other.
+        """
         return bool(self.tencent_secret_id and self.tencent_secret_key)
+
+    @property
+    def has_llm_credentials(self) -> bool:
+        """True when a live LLM provider can authenticate."""
+        return bool(self.tokenhub_api_key or self.openai_api_key)
 
 
 settings = Settings()
