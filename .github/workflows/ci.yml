@@ -62,6 +62,13 @@ jobs:
         # is visible in the log rather than hiding inside a green run.
         run: pytest -q -rs
 
+      - name: Run the red-team demo
+        # M8: the nine attack scenarios against the real pipeline. tests/
+        # test_redteam.py already asserts them, but running the demo itself
+        # puts the evidence in the build log -- and a demo that only ever runs
+        # on a laptop the night before is a demo that breaks on stage.
+        run: python -m backend.redteam
+
       - name: Assert the cross-language tests actually ran
         # Belt and braces: node is installed above, so the canonicalizer tests
         # must execute. If they report as skipped here, the guard is

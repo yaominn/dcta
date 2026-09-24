@@ -23,6 +23,7 @@ from pydantic import BaseModel
 from backend.config import settings
 from backend.data.db import DB_PATH, get_conn
 from backend.audit import AuditLog
+from backend.audit.log import AuditEntryType
 from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
 from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor, WebAuthnVerifier
 from backend.auth import (
@@ -35,6 +36,9 @@ from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
                            get_provider, parse_transcript)
 from backend.validator import default_freeze_set, validate
+from backend.resolver import Clarify, Resolved, resolve
+from backend.policy import Decision, evaluate, load_context
+from backend.drafts import Draft, DraftStore
 
 from pathlib import Path
 
@@ -486,6 +490,165 @@ def validate_draft(req: ValidateRequest):
         "checks": report.checks,
         "soft_signals": report.soft_signals,
         "llm_check": report.llm_check,
+    }
+
+
+# --------------------------------------------------------------------------- M8: the wired pipeline
+# The one endpoint that joins every milestone. Until this existed the resolver
+# (M4) and the policy engine (M5) were unreachable over HTTP and the overlay
+# signed a hard-coded draft, so nothing could be demonstrated end to end.
+#
+#   transcript -> parse (M3) -> resolve (M4) -> policy (M5) -> validate (M6)
+#              -> a stored, signable draft -> nonce -> WebAuthn -> gateway (M1/M2)
+#
+# Each stage can stop the pipeline, and a stage that stops it produces NO
+# signable draft — the fail-closed direction, every time.
+_drafts = DraftStore()
+
+
+class DraftRequest(BaseModel):
+    """Text stands in for ASR output (brief: "text input demos the architecture
+    fine"). The transcript is user speech: untrusted but authorized."""
+    transcript: str
+    user_id: str = DEMO_USER_ID
+
+
+class ClarifyAnswer(BaseModel):
+    """The ONLY thing a client sends back to answer a question: which candidate
+    it picked. Never the plan, never the resolver's state — see backend/drafts.py
+    for why the state stays server-side."""
+    field: str
+    choice_id: str
+
+
+def _pipeline(draft: Draft) -> dict:
+    """Run resolve -> policy -> validate over a stored draft and update it.
+
+    Called on creation and again after every clarification answer, so an
+    answered draft goes through exactly the same checks as a first-pass one —
+    there is no shortcut path that skips policy or the validator."""
+    plan = IntentPlan.model_validate(draft.intent_plan)
+    outcome = resolve(
+        plan,
+        transcript=draft.transcript,
+        user_id=draft.user_id,
+        draft_id=draft.draft_id,          # stable across the clarify loop
+        answers=draft.answers,
+    )
+
+    if isinstance(outcome, Clarify):
+        draft.status = "clarify"
+        draft.resolved_plan = None
+        draft.question = {"question": outcome.question, "field": outcome.field,
+                          "kind": outcome.kind, "choices": outcome.choices}
+        return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
+
+    resolved = outcome.plan
+    draft.question = None
+
+    # --- policy (M5). A BLOCKED draft keeps NO plan: there is nothing to sign.
+    verdicts = evaluate(resolved, load_context(draft.user_id, db_path=DB_PATH))
+    draft.policy = {
+        "decision": verdicts.decision.value,
+        "verdicts": [{"leg_id": v.leg_id, "decision": v.decision.value,
+                      "rule": v.rule, "reason": v.reason} for v in verdicts.verdicts],
+    }
+    _audit.append(AuditEntryType.POLICY, verdicts.to_audit_payload(draft.draft_id))
+    if verdicts.blocked:
+        draft.status = "blocked"
+        draft.resolved_plan = None
+        return {"status": "blocked", "draft_id": draft.draft_id,
+                "policy": draft.policy, "reasons": verdicts.reasons()}
+
+    # --- validator (M6). A frozen draft keeps its plan for display, but
+    #     /api/auth/nonce refuses a nonce, so it is unsignable.
+    report = validate(plan, resolved, draft.transcript,
+                      provider=get_provider(settings), audit=_audit)
+    draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
+                        "checks": report.checks, "soft_signals": report.soft_signals,
+                        "llm_check": report.llm_check}
+    draft.resolved_plan = resolved
+    draft.status = "frozen" if report.frozen else "ready"
+
+    return {
+        "status": draft.status,
+        "draft_id": draft.draft_id,
+        "resolved_plan": resolved.model_dump(mode="json"),
+        "payload_hash": payload_hash(resolved),
+        "policy": draft.policy,
+        "validation": draft.validation,
+        "requires_extra_confirmation":
+            verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION,
+    }
+
+
+@app.post("/api/drafts", response_model=None)
+def create_draft(req: DraftRequest):
+    """transcript -> a signable draft, a question, a policy refusal or a freeze."""
+    conn = get_conn()
+    try:
+        payees = [dict(r) for r in conn.execute(
+            "SELECT * FROM payees WHERE user_id=?", (req.user_id,)).fetchall()]
+        billers = [dict(r) for r in conn.execute("SELECT * FROM billers").fetchall()]
+        accounts = [dict(r) for r in conn.execute(
+            "SELECT * FROM accounts WHERE user_id=?", (req.user_id,)).fetchall()]
+        equities = [dict(r) for r in conn.execute("SELECT * FROM equities").fetchall()]
+    finally:
+        conn.close()
+
+    context = build_context(payees=payees, billers=billers,
+                            accounts=accounts, equities=equities)
+    for flag in context.flags:
+        logging.warning("injection tripwire: stored field flagged: %s", flag)
+
+    provider = get_provider(settings)
+    try:
+        plan = parse_transcript(req.transcript, provider=provider, context=context)
+    except ProviderUnavailable as exc:
+        raise HTTPException(status_code=502, detail={
+            "error": "LLM provider unavailable", "provider": provider.name,
+            "attempts": exc.errors})
+    except ParseFailure as exc:
+        raise HTTPException(status_code=422, detail={
+            "error": "could not produce a schema-valid plan within the retry budget",
+            "attempts": exc.errors})
+
+    draft = _drafts.put(Draft(
+        draft_id=DraftStore.new_id(), user_id=req.user_id,
+        transcript=req.transcript, intent_plan=plan.model_dump(),
+        created_at=time.time(),
+    ))
+    return _pipeline(draft)
+
+
+@app.post("/api/drafts/{draft_id}/clarify", response_model=None)
+def answer_clarification(draft_id: str, answer: ClarifyAnswer):
+    """Answer one question by candidate id. The server re-resolves against its
+    OWN stored IntentPlan, and the resolver still refuses an id the mention does
+    not justify — so an answer can narrow a choice, never widen it."""
+    draft = _drafts.get(draft_id)
+    if draft is None:
+        raise HTTPException(404, {"error": "no such draft (or it expired)",
+                                  "draft_id": draft_id})
+    draft.answers[answer.field] = answer.choice_id
+    return _pipeline(draft)
+
+
+@app.get("/api/drafts/{draft_id}", response_model=None)
+def get_draft(draft_id: str):
+    """The stored draft. The overlay renders `resolved_plan` from this and
+    recomputes payload_hash itself (frontend/canonical.js)."""
+    draft = _drafts.get(draft_id)
+    if draft is None:
+        raise HTTPException(404, {"error": "no such draft (or it expired)",
+                                  "draft_id": draft_id})
+    return {
+        "status": draft.status, "draft_id": draft.draft_id,
+        "transcript": draft.transcript,
+        "resolved_plan": (draft.resolved_plan.model_dump(mode="json")
+                          if draft.resolved_plan else None),
+        "policy": draft.policy, "validation": draft.validation,
+        "question": draft.question,
     }
 
 
