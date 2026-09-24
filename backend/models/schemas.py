@@ -18,7 +18,8 @@ Security properties baked into the shapes (say this to the judges):
      (L3). A prompt-injected model cannot pick a payee/account/equity directly;
      only the deterministic resolver can.                       (brief 4.3, layer 3)
   2. The LLM schema has NO arithmetic -> "whatever is left" is a symbolic
-     {ref, op} token the resolver computes against the ledger.     (brief 4.1)
+     {after_leg, op} token; the account is DERIVED from the referenced leg's
+     own source_account, so the ref can never contradict the leg.  (brief 4.1)
   3. The signed payload is the ResolvedPlan, never the raw LLM output. (brief 4.5/7)
   4. extra="forbid" on every model -> an LLM that invents a field is rejected.
   5. Money is int cents from DB to signed payload. The `_cents` suffix stops
@@ -84,24 +85,23 @@ class LiteralAmount(BaseModel):
 
 
 class SymbolicAmount(BaseModel):
-    """A symbolic reference the resolver computes. e.g.
-    {"ref": "acct_savings.balance_after:t1", "op": "ALL"}
-    The LLM never does arithmetic — it only emits the ref + op.
+    """A symbolic reference the resolver computes. The LLM never does
+    arithmetic — it names a leg, and deterministic code does the rest.
+    e.g. {"after_leg": "t1", "op": "ALL"} ("whatever is left after t1").
 
-    Note (L3 residual): this ref grammar still embeds an account alias
-    (<account_alias>) per the brief's Section 7 example. source_account and
-    ticker are now mentions, so this is the ONE place an account identifier
-    can appear in the LLM output. Acceptable because the resolver resolves it
-    deterministically and the user signs the RESOLVED payload (not this ref);
-    a future pass may switch the grammar to leg-relative
-    (e.g. "t1.balance_after") to remove the alias entirely."""
+    There is intentionally no account field: the account is DERIVED from the
+    referenced leg's own (already resolved) source_account, so a ref can never
+    disagree with the leg it depends on. Making the account UNREPRESENTABLE
+    (rather than detecting a mismatch) is the same enforce-the-property move
+    as extra="forbid" and the float guard. Supersedes the brief's Section 7
+    "ref" grammar, which embedded an account alias and predates L3."""
     model_config = ConfigDict(extra="forbid")
-    ref: str = Field(description="grammar: <account_alias>.balance_after:<leg_id>")
+    after_leg: str = Field(description="leg id whose post-execution balance to use, e.g. 't1'")
     op: AmountOp
 
 
 # Plain union: the two shapes share no required fields, so Pydantic resolves
-# unambiguously (a literal has `literal`, a symbolic has `ref`+`op`).
+# unambiguously (a literal has `literal_cents`, a symbolic has `after_leg`+`op`).
 Amount = Union[LiteralAmount, SymbolicAmount]
 
 
@@ -167,6 +167,29 @@ class IntentPlan(BaseModel):
         default_factory=list,
         description="fields the LLM could not determine; MUST NOT be guessed",
     )
+
+    @model_validator(mode="after")
+    def _check_symbolic_refs(self):
+        """A symbolic amount may only reference an EARLIER leg in the same
+        plan. A ref to a leg that doesn't exist, to the referencing leg itself,
+        or to a later leg (forward/circular) is rejected at construction — the
+        contradiction cannot be expressed, rather than detected downstream.
+        M4's resolver implements the computation; the schema pins the
+        well-formedness now, before any consumer exists."""
+        ids = [leg.id for leg in self.plan]
+        for i, leg in enumerate(self.plan):
+            amt = leg.amount
+            if isinstance(amt, SymbolicAmount):
+                if amt.after_leg not in ids:
+                    raise ValueError(
+                        f"leg {leg.id!r}: after_leg {amt.after_leg!r} is not a leg in this plan"
+                    )
+                if ids.index(amt.after_leg) >= i:
+                    raise ValueError(
+                        f"leg {leg.id!r}: after_leg {amt.after_leg!r} must reference "
+                        "an earlier leg"
+                    )
+        return self
 
 
 # --------------------------------------------------------------------------- RESOLVED PLAN (signed)

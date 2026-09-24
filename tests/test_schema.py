@@ -12,7 +12,8 @@ from pydantic import ValidationError
 
 from backend.audit.canonical import hash_transcript
 from backend.models.schemas import (
-    IntentPlan, ResolvedPlan, MAX_AUTH_WINDOW_S, MAX_AMOUNT_CENTS,
+    AmountOp, IntentPlan, ResolvedPlan, SymbolicAmount,
+    MAX_AUTH_WINDOW_S, MAX_AMOUNT_CENTS,
 )
 
 _TX = "stub: pay mom five hundred then buy aapl with the rest"
@@ -23,9 +24,10 @@ _TX_HASH = hash_transcript(_TX)
 # L3: source_account and ticker are MENTIONS ({mention:"..."}), not the bare
 # account-alias / ticker-string the brief's literal Section 7 shows. The LLM
 # cannot name which account to debit or which equity directly; only the
-# resolver maps the mention. (The symbolic `ref` still carries an account
-# alias per the brief grammar — the one residual identifier surface; see
-# schemas.SymbolicAmount.)
+# resolver maps the mention. Symbolic amounts name an earlier LEG (after_leg),
+# never an account — the account is derived from the referenced leg's own
+# source_account at resolution time, so no account alias is representable
+# anywhere in the LLM output. (Supersedes the brief's "ref" grammar.)
 SECTION_7_EXAMPLE = {
     "plan": [
         {
@@ -40,7 +42,7 @@ SECTION_7_EXAMPLE = {
             "type": "BUY_EQUITY",
             "source_account": {"mention": "savings"},
             "ticker": {"mention": "AAPL"},
-            "amount": {"ref": "acct_savings.balance_after:t1", "op": "ALL"},
+            "amount": {"after_leg": "t1", "op": "ALL"},
         },
     ],
     "unresolved": [],
@@ -57,7 +59,10 @@ def test_section7_example_validates():
     assert plan.plan[0].source_account.mention == "savings"
     assert plan.plan[1].ticker.mention == "AAPL"
     # the second leg's amount is symbolic, not computed — the LLM did no arithmetic
-    assert not hasattr(plan.plan[1].amount, "literal_cents")  # it's a SymbolicAmount
+    amt = plan.plan[1].amount
+    assert isinstance(amt, SymbolicAmount)
+    assert amt.after_leg == "t1"          # names a leg, never an account
+    assert amt.op is AmountOp.ALL
 
 
 # --------------------------------------------------------------------------- security: no payee_id field exists for the LLM
@@ -146,13 +151,89 @@ def test_ticker_must_be_mention_not_identifier():
                 "id": "t2", "type": "BUY_EQUITY",
                 "source_account": {"mention": "savings"},
                 "ticker": "AAPL",   # bare identifier -> rejected
-                "amount": {"ref": "acct_savings.balance_after:t1", "op": "ALL"},
+                "amount": {"after_leg": "t1", "op": "ALL"},
             }
         ],
         "unresolved": [],
     }
     with pytest.raises(ValidationError):
         IntentPlan.model_validate(bad)
+
+
+# --------------------------------------------------------------------------- L3 residual: symbolic amounts name legs, never accounts
+def _symbolic_plan(amount):
+    """A two-leg plan: t1 is a literal transfer; t2 carries the given amount."""
+    return {
+        "plan": [
+            {
+                "id": "t1", "type": "TRANSFER",
+                "source_account": {"mention": "savings"},
+                "target": {"mention": "mom"},
+                "amount": {"literal_cents": 50000},
+            },
+            {
+                "id": "t2", "type": "BUY_EQUITY",
+                "source_account": {"mention": "savings"},
+                "ticker": {"mention": "AAPL"},
+                "amount": amount,
+            },
+        ],
+        "unresolved": [],
+    }
+
+
+def test_symbolic_amount_after_leg_constructs():
+    """The grammar: a symbolic amount names an earlier leg + op. There is no
+    account field — the account is derived from the referenced leg's own
+    source_account at resolution time."""
+    plan = IntentPlan.model_validate(_symbolic_plan({"after_leg": "t1", "op": "ALL"}))
+    amt = plan.plan[1].amount
+    assert isinstance(amt, SymbolicAmount)
+    assert amt.after_leg == "t1"
+    assert amt.op is AmountOp.ALL
+
+
+def test_symbolic_amount_old_ref_form_rejected():
+    """Regression pin: the brief's old grammar embedded an account alias
+    ({"ref": "acct_savings.balance_after:t1", ...}). That shape must not
+    validate at all — extra="forbid" rejects the `ref` key, so an account
+    alias is unrepresentable in an amount, not merely discouraged."""
+    with pytest.raises(ValidationError):
+        IntentPlan.model_validate(
+            _symbolic_plan({"ref": "acct_savings.balance_after:t1", "op": "ALL"})
+        )
+
+
+def test_symbolic_amount_forward_reference_rejected():
+    """A leg may only depend on an EARLIER leg — t1 referencing t2 is a
+    forward (circular) reference, rejected at construction."""
+    bad = _symbolic_plan({"literal_cents": 100})
+    bad["plan"][0]["amount"] = {"after_leg": "t2", "op": "ALL"}
+    with pytest.raises(ValidationError, match="earlier leg"):
+        IntentPlan.model_validate(bad)
+
+
+def test_symbolic_amount_self_reference_rejected():
+    """A leg referencing itself is degenerate circularity — rejected."""
+    with pytest.raises(ValidationError, match="earlier leg"):
+        IntentPlan.model_validate({
+            "plan": [
+                {
+                    "id": "t1", "type": "TRANSFER",
+                    "source_account": {"mention": "savings"},
+                    "target": {"mention": "mom"},
+                    "amount": {"after_leg": "t1", "op": "ALL"},
+                }
+            ],
+            "unresolved": [],
+        })
+
+
+def test_symbolic_amount_unknown_leg_rejected():
+    """A ref to a leg id that does not exist in the plan is rejected at
+    construction — the resolver can never be handed a dangling reference."""
+    with pytest.raises(ValidationError, match="not a leg"):
+        IntentPlan.model_validate(_symbolic_plan({"after_leg": "t9", "op": "ALL"}))
 
 
 def test_unresolved_must_not_be_guessed():
