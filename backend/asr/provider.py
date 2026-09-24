@@ -22,6 +22,26 @@ from typing import Protocol
 
 from backend.asr.errors import ASRUnavailable
 
+# Containers SentenceRecognition documents. Enforced on OUR side before a byte
+# leaves the building, for the same reason the LLM's output is validated here
+# rather than trusted: a caller-supplied `fmt` otherwise goes straight into a
+# paid upstream request as VoiceFormat.
+#
+# webm is NOT on this list, and that matters: Chrome's MediaRecorder produces
+# audio/webm;codecs=opus, which shares a codec but not a container with the
+# documented ogg-opus. The browser asks for a documented container where it can
+# and tells us what it actually recorded; when it can only give webm we say so
+# and it drops to the Web Speech tier, which is the designed degradation rather
+# than a failed upstream call.
+SUPPORTED_VOICE_FORMATS = frozenset(
+    {"wav", "pcm", "mp3", "m4a", "aac", "ogg-opus", "speex", "silk"}
+)
+
+# Tencent's SentenceRecognition limit: <=60s and <=5MB per request. Enforced
+# before reading the upload into memory, so an oversized body is refused rather
+# than buffered.
+MAX_AUDIO_BYTES = 5 * 1024 * 1024
+
 
 class ASRProvider(Protocol):
     """One method: audio bytes in, transcript out."""

@@ -383,6 +383,45 @@ asks instead of guessing; the clarify round trip completes; and every outcome
 is HTTP 200 — a clarification is a successful request whose answer is a
 question.
 
+### Reviewed after M7 landed — three fixes
+
+- **The browser now negotiates and reports the audio container.** Chrome's
+  `MediaRecorder` produces `audio/webm;codecs=opus`, which shares a codec but
+  **not** a container with the documented `ogg-opus`. `voice.js` previously sent
+  the blob with no format hint, so the server applied its configured default
+  and would have forwarded webm audio labelled `mp3` — the exact mislabelling
+  `backend/asr/tencent.py` names as the likeliest first-live-call failure. It
+  now asks `MediaRecorder` for a documented container where the browser has one,
+  and reports verbatim what it actually recorded. An unsupported container gets
+  an honest **415** naming the fallback tier, and the demo drops to Web Speech
+  instead of paying for an upstream call that cannot succeed.
+- **`/api/transcribe` validates its inputs.** `fmt` is browser-supplied and went
+  straight upstream as `VoiceFormat`; it is now checked against
+  `SUPPORTED_VOICE_FORMATS` on our side, for the same reason the LLM's output is
+  validated here rather than trusted. Uploads over 5MB are refused with **413**
+  (upstream caps a request at ~60s/5MB, so a larger body cannot succeed).
+- **The utterance is now recorded in the audit chain.**
+  `AuditEntryType.TRANSCRIPT` existed and was reserved for M7, but nothing
+  emitted it — the chain ran `DRAFT → POLICY → VALIDATION → SIGNATURE →
+  EXECUTION` with no record of the utterance every later entry derives from, so
+  the `transcript_hash` inside the signed payload had nothing in the log to
+  correspond to. `POST /api/drafts` now appends one.
+
+  **The hash is logged, not the words.** The hash is what the signature binds,
+  so it is what non-repudiation needs; storing raw utterances would put spoken
+  account details — and whatever else a microphone caught — into append-only
+  storage that is deliberately hard to redact. A test asserts the transcript
+  text never reaches the log.
+
+> **After a tamper demo, re-seed with `--reset-audit`.**
+> `python -m backend.data.seed --reset-audit`
+>
+> `verify_chain()` reports the *first* break, so once scenario 7 has edited an
+> entry the chain stays broken for every later run, and a plain re-seed does not
+> touch the append-only log. The flag is opt-in: a normal `seed()` still
+> preserves audit history, because surviving a re-seed is usually the point.
+
+
 ## M8 — The wired pipeline + the red-team demo
 
 **`POST /api/drafts` is the endpoint that joins every milestone.** Until it

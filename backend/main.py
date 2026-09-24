@@ -35,7 +35,8 @@ from backend.auth import (
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
                            get_provider, parse_transcript)
-from backend.asr import ASRUnavailable, get_asr_provider
+from backend.asr import (MAX_AUDIO_BYTES, SUPPORTED_VOICE_FORMATS,
+                         ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
@@ -512,11 +513,40 @@ async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
     failure — it is the degradation path working as designed (brief §5).
     """
     provider = get_asr_provider(settings)
+
+    # `fmt` is what the BROWSER says it recorded, so it is caller-supplied input
+    # that would otherwise go straight upstream as VoiceFormat. Checked against
+    # the documented containers on our side, before a byte leaves the building
+    # — the same reason the LLM's output is validated here rather than trusted.
+    #
+    # 415 rather than 503: the service is up, this container is the problem.
+    # The client treats both as "drop a tier", so the user still gets Web Speech
+    # — which is the honest answer when Chrome can only hand us webm.
+    container = (fmt or settings.asr_voice_format).lower()
+    if container not in SUPPORTED_VOICE_FORMATS:
+        raise HTTPException(status_code=415, detail={
+            "error": f"unsupported audio container {container!r}; "
+                     f"Tencent SentenceRecognition accepts "
+                     f"{', '.join(sorted(SUPPORTED_VOICE_FORMATS))}",
+            "provider": provider.name,
+            "fallback": "webspeech",
+        })
+
     raw = await audio.read()
     if not raw:
         raise HTTPException(status_code=400, detail={"error": "empty audio upload"})
+    # Upstream caps a request at 60s / 5MB, so a larger body cannot succeed.
+    # Refusing it here keeps an oversized upload from being forwarded (and from
+    # sitting in memory any longer than the read that produced it).
+    if len(raw) > MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": f"audio too large: {len(raw)} bytes exceeds the "
+                     f"{MAX_AUDIO_BYTES}-byte limit (~60s)",
+            "fallback": "webspeech",
+        })
+
     try:
-        text = provider.transcribe(raw, fmt=fmt or settings.asr_voice_format)
+        text = provider.transcribe(raw, fmt=container)
     except ASRUnavailable as exc:
         raise HTTPException(status_code=503, detail={
             "error": str(exc),
@@ -651,6 +681,26 @@ def create_draft(req: DraftRequest):
         transcript=req.transcript, intent_plan=plan.model_dump(),
         created_at=time.time(),
     ))
+
+    # AuditEntryType.TRANSCRIPT exists and was reserved for M7 ("every step" —
+    # brief 4.5 / docs/ARCHITECTURE.md), but nothing emitted it: the chain went
+    # DRAFT -> POLICY -> VALIDATION -> SIGNATURE -> EXECUTION with no record of
+    # the utterance any of it came from. The signed ResolvedPlan binds
+    # transcript_hash, so without this entry the hash in the payload had nothing
+    # in the log to correspond to.
+    #
+    # The HASH is logged, not the words. The hash is what the signature binds,
+    # so it is what non-repudiation needs; storing the raw utterance would put
+    # spoken account details and whatever else a microphone caught into
+    # append-only storage that is deliberately hard to redact. `chars` keeps a
+    # truncation or an empty transcript visible without retaining the content.
+    _audit.append(AuditEntryType.TRANSCRIPT, {
+        "draft_id": draft.draft_id,
+        "transcript_hash": hash_transcript(req.transcript),
+        "chars": len(req.transcript),
+        "parser_provider": provider.name,
+        "user_id": req.user_id,
+    })
     return _pipeline(draft)
 
 

@@ -25,6 +25,45 @@ const Voice = (() => {
     return !!(window.SpeechRecognition || window.webkitSpeechRecognition);
   }
 
+  /* ---------- audio container negotiation ---------- */
+  /* Browser MIME type -> the VoiceFormat name the backend allows. Anything not
+     listed here is sent without a hint, and the server answers 415 and names
+     the tier to fall back to. Keep in step with SUPPORTED_VOICE_FORMATS in
+     backend/asr/provider.py. */
+  const MIME_TO_VOICE_FORMAT = [
+    ["audio/ogg", "ogg-opus"],
+    ["audio/mpeg", "mp3"],
+    ["audio/mp4", "m4a"],
+    ["audio/aac", "aac"],
+    ["audio/wav", "wav"],
+    ["audio/wave", "wav"],
+    ["audio/x-wav", "wav"],
+  ];
+
+  function voiceFormatOf(mimeType) {
+    const m = (mimeType || "").toLowerCase();
+    for (const [prefix, fmt] of MIME_TO_VOICE_FORMAT) {
+      if (m.startsWith(prefix)) return fmt;
+    }
+    // Unknown container (audio/webm is the common case): report the subtype
+    // VERBATIM rather than nothing. Sending no hint would let the server apply
+    // its configured default and forward webm audio labelled "mp3" — the exact
+    // mislabelling this negotiation exists to prevent. Naming it truthfully
+    // gets an honest 415 and a clean drop to the Web Speech tier.
+    const subtype = m.split(";")[0].split("/")[1];
+    return subtype || null;
+  }
+
+  function pickRecorderOptions() {
+    if (typeof MediaRecorder === "undefined" ||
+        typeof MediaRecorder.isTypeSupported !== "function") return undefined;
+    // Ordered by upstream preference, not by browser popularity.
+    for (const t of ["audio/ogg;codecs=opus", "audio/ogg", "audio/mp4", "audio/mpeg"]) {
+      if (MediaRecorder.isTypeSupported(t)) return { mimeType: t };
+    }
+    return undefined;     // browser default (usually webm) -> 415 -> tier 2
+  }
+
   /* ---------- tier 2: Web Speech API ---------- */
   function listenWebSpeech({ onText, onError, onState }) {
     const Rec = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -50,7 +89,12 @@ const Voice = (() => {
       return onError(new Error("microphone permission denied"));
     }
     chunks = [];
-    mediaRecorder = new MediaRecorder(stream);
+    // Ask for a container the upstream ASR actually documents, best first.
+    // Chrome's default is audio/webm;codecs=opus, which shares a codec but NOT
+    // a container with the documented ogg-opus and is rejected upstream. This
+    // is the single likeliest first-live-call failure, so we express a
+    // preference instead of taking whatever the browser picks.
+    mediaRecorder = new MediaRecorder(stream, pickRecorderOptions());
     mediaRecorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
     mediaRecorder.onstop = async () => {
       stream.getTracks().forEach((t) => t.stop());
@@ -58,10 +102,18 @@ const Voice = (() => {
       const blob = new Blob(chunks, { type: mediaRecorder.mimeType });
       const fd = new FormData();
       fd.append("audio", blob, "utterance");
+      // Tell the server what we ACTUALLY recorded rather than letting it assume
+      // its configured default. Previously nothing sent this, so webm audio was
+      // forwarded labelled "mp3" — the mislabelling the whole three-tier
+      // fallback exists to avoid guessing about.
+      const fmt = voiceFormatOf(mediaRecorder.mimeType);
+      const url = "/api/transcribe" + (fmt ? "?fmt=" + encodeURIComponent(fmt) : "");
       try {
-        const r = await fetch("/api/transcribe", { method: "POST", body: fd });
-        if (r.status === 503) {
-          // Designed degradation: no server-side ASR configured. Drop a tier.
+        const r = await fetch(url, { method: "POST", body: fd });
+        if (r.status === 503 || r.status === 415 || r.status === 413) {
+          // Designed degradation: no server-side ASR configured (503), a
+          // container it cannot forward (415), or too much audio (413). All
+          // three mean "this tier cannot serve this request" -> drop a tier.
           const body = await r.json().catch(() => ({}));
           return onFallback(body?.detail?.error || "server ASR unavailable");
         }
@@ -94,5 +146,6 @@ const Voice = (() => {
     }
   }
 
-  return { listenWebSpeech, recordAndUpload, stop, speak, speechRecognitionAvailable };
+  return { listenWebSpeech, recordAndUpload, stop, speak, speechRecognitionAvailable,
+           voiceFormatOf, pickRecorderOptions };
 })();

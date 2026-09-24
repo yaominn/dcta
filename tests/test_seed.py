@@ -99,3 +99,32 @@ def test_headline_arithmetic():
     assert shares == 32
     assert shares * price == 772800
     assert after - shares * price == 19250
+
+
+def test_reset_audit_repairs_a_tampered_chain(tmp_path):
+    """After a tamper demo the chain stays broken for every later run —
+    verify_chain() reports the FIRST break, and a plain re-seed does not touch
+    the append-only log. Without an opt-in reset the only cure is deleting
+    dcta.db, which is a poor thing to discover at the submission demo."""
+    from backend.audit import AuditLog
+    from backend.audit.log import AuditEntryType
+    from backend.data.seed import seed
+
+    db = tmp_path / "ledger.db"
+    seed(db)
+    log = AuditLog(db)
+    log.append(AuditEntryType.DRAFT, {"draft_id": "d1"})
+    log.append(AuditEntryType.EXECUTION, {"draft_id": "d1", "outcome": "EXECUTED"})
+    assert log.verify_chain()["ok"] is True
+
+    log._raw_update_payload(log.all_entries()[0]["id"], '{"draft_id":"tampered"}')
+    assert log.verify_chain()["ok"] is False
+
+    seed(db)                      # a normal re-seed must NOT erase history
+    assert AuditLog(db).verify_chain()["ok"] is False
+    assert len(AuditLog(db).all_entries()) == 2
+
+    seed(db, reset_audit=True)    # the opt-in reset does
+    fresh = AuditLog(db)
+    assert fresh.verify_chain()["ok"] is True
+    assert fresh.all_entries() == []
