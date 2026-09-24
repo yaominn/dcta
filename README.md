@@ -315,6 +315,66 @@ from the transcript does **not** false-positive; LLM-unavailable does not
 freeze; the audit chain still verifies; a frozen draft is unsignable) plus the
 transcript-binding short-circuit and freeze-survives-restart cases.
 
+## M7 — Voice I/O
+
+`POST /api/transcribe` plus `frontend/voice.js`. Speech-to-text has **three
+tiers, and the bottom one always works**:
+
+| tier | where | needs a key | when it runs |
+|---|---|---|---|
+| Tencent Cloud ASR | our backend | yes | credentials configured |
+| Web Speech API | the browser | no | server ASR returns 503 |
+| **text input** | the browser | no | **always available** |
+
+Tier 1 is necessarily browser → **our backend** → Tencent, because
+SecretId/SecretKey must never reach the browser. That extra hop is part of why
+tier 2 exists: it is key-free *and* lower-latency.
+
+With no credentials configured — the current state — `/api/transcribe` answers
+**503 with `{"fallback": "webspeech"}`** and the browser drops a tier. That is
+the designed degradation path, not a failure: the user sees a different engine,
+not an error. The `UnavailableASR` provider deliberately raises rather than
+returning `""` (which would look like the user said nothing) or a canned string
+(which would look like recognition working while nothing ran).
+
+Text input is always on screen. **If the room beats the microphone on stage,
+you type the same sentence and the demo continues** — the architecture is the
+pitch, not the microphone.
+
+Clarifying questions are spoken with the browser's `speechSynthesis`: free,
+offline, no keys, and it makes the clarify loop voice-first without a second
+credential.
+
+The confirmation overlay renders the resolved plan through a **fixed template**
+and shows no database internals — `Savings` not `acct_savings`, `Mom ··3310`
+with no raw `payee_id`, and the authorization window as "5 min — expires
+17:46:00" rather than Unix seconds. Those are deterministic local transforms of
+the signed payload, so nothing new is trusted and the template stays fixed
+(brief 4.2). Values are set with `textContent`, never `innerHTML`.
+
+Decisions stated up front (not hidden):
+
+- **`backend/asr/tencent.py` is UNEXERCISED.** No Tencent credentials exist, so
+  not one line has run against the real service. Two things to check on the
+  first live call are in its docstring: the **audio container** (Chrome's
+  MediaRecorder produces webm-opus; `SentenceRecognition` documents ogg-opus —
+  same codec, *different container*, so webm may be rejected) and
+  `EngSerViceType` matching the spoken language. Both are configurable
+  (`ASR_VOICE_FORMAT`, `ASR_ENGINE`) precisely because the container is the
+  likeliest first failure. If it is, the fix is a server-side rewrap, not a
+  redesign — the Web Speech tier keeps the demo working meanwhile.
+- **The client never holds the draft.** Answering a clarification sends only
+  `{field, choice_id}` for a `draft_id`; the plan stays server-side, so a
+  client cannot substitute one.
+
+Tests (`pytest tests/test_m7_voice_pipeline.py`): the tier-1 provider is only
+selected with credentials; the unavailable provider raises rather than faking a
+transcript; `/api/transcribe` reports 503 naming the fallback tier, and 400 for
+an empty upload; an utterance produces a signable draft; an ambiguous payee
+asks instead of guessing; the clarify round trip completes; and every outcome
+is HTTP 200 — a clarification is a successful request whose answer is a
+question.
+
 ## M8 — The wired pipeline + the red-team demo
 
 **`POST /api/drafts` is the endpoint that joins every milestone.** Until it
@@ -443,11 +503,11 @@ dcta/
 | 2 | WebAuthn register + sign canonical payload | done |
 | 3 | LLM parser + schema + opaque IDs | done |
 | 4 | Resolver + clarify loop | done (amended in M5 — see above) |
-| 5 | Policy engine + KYC + velocity + anomaly | **done (this commit)** |
+| 5 | Policy engine + KYC + velocity + anomaly | done |
 | 6 | Validation agent | done |
-| 7 | Voice I/O + confirmation overlay UI | **next** — the only milestone left before submission |
-| 8 | Red-team demo + polish | done (this commit) |
-| 9 | Submission package | |
+| 7 | Voice I/O + confirmation overlay UI | done |
+| 8 | Red-team demo + polish | done |
+| 9 | Submission package | **next** — the only milestone left |
 
 ## Demo script (brief Section 10)
 
@@ -465,6 +525,12 @@ dcta/
 7. **Audit** — tamper with a log entry → `verify_chain()` pinpoints it.
 
 ## Honest limitations (stated in the pitch, not hidden)
+
+- **Neither the LLM nor the ASR has run against a real service.** There are no
+  Tencent credentials yet, so the parser uses a deterministic stub and
+  `/api/transcribe` reports unavailable. Every security property is tested and
+  holds regardless of the model — that is the point of validating on our side —
+  but parse quality and the Tencent integrations themselves are unproven.
 
 - The OS biometric prompt signs a blind hash; "what you see is what you sign"
   is a *client-integrity* assumption, not a cryptographic guarantee. The
