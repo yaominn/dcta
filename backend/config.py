@@ -28,6 +28,7 @@ class Settings:
     asr_region: str = os.getenv("TENCENT_ASR_REGION", "ap-singapore")
     asr_endpoint: str = os.getenv("TENCENT_ASR_ENDPOINT", "asr.ap-singapore.tencentcloudapi.com")
     hunyuan_model: str = os.getenv("HUNYUAN_MODEL", "hunyuan-functioncall")
+    hunyuan_region: str = os.getenv("TENCENT_HUNYUAN_REGION", "ap-guangzhou")
 
     # DB
     db_path: Path = Path(__file__).resolve().parent / "data" / "dcta.db"

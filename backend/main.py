@@ -12,6 +12,7 @@ gateway -> audit) is built in Milestones 1-8.
 """
 from __future__ import annotations
 
+import logging
 import time
 
 from fastapi import FastAPI, HTTPException, Query
@@ -30,7 +31,8 @@ from backend.auth import (
     registration_options,
     verify_registration,
 )
-from backend.models.schemas import ResolvedPlan, ResolvedTransfer
+from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
+from backend.agent import ParseFailure, build_context, get_provider, parse_transcript
 
 from pathlib import Path
 
@@ -40,7 +42,7 @@ app = FastAPI(
         "GenAI is a generator of drafts, never an executor of funds. "
         "Scenario 1 — Voice-Enabled Payment and Transaction (DBS track)."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
@@ -59,7 +61,7 @@ def root():
         "project": "DCTA",
         "scenario": "Scenario 1 — Voice-Enabled Payment and Transaction, with KYC and basic risk control",
         "core_principle": "GenAI is a generator of drafts, never an executor of funds.",
-        "milestone": "2 (WebAuthn register + sign canonical payload)",
+        "milestone": "3 (LLM parser + schema + opaque IDs)",
         "credentials_configured": settings.has_credentials,
         "webauthn": {"rp_id": settings.rp_id, "expected_origin": settings.expected_origin},
         "note": "credentials empty = running on stubs; the security core needs no Tencent creds",
@@ -373,6 +375,60 @@ def webauthn_execute(req: WebAuthnExecuteRequest):
     rejects a non-biometric assertion (UV flag unset), a wrong-origin/wrong-RP
     assertion, a stale challenge, or a replayed sign count."""
     return _webauthn_gateway.submit(req.resolved_plan, req.assertion, req.nonce, req.credential_id)
+
+
+# --------------------------------------------------------------------------- M3: LLM parser + opaque IDs
+class PlanRequest(BaseModel):
+    """Text input standing in for ASR output (brief: 'text input demos the
+    architecture fine'). The transcript is user speech — untrusted but
+    authorized; it is defended by schema-constrained output, not secrecy."""
+    transcript: str
+    user_id: str = DEMO_USER_ID
+
+
+@app.post("/api/plan", response_model=None)
+def create_plan(req: PlanRequest):
+    """M3 done-when: text input -> valid symbolic plan with mentions; stored
+    untrusted fields never in prompt.
+
+    Stored rows are fetched HERE (the agent package stays DB-free) and passed
+    through the sanitizer, so build_context() is the single chokepoint between
+    third-party data and any prompt: payee legal names, last4s, biller
+    reference text, account ids and balances never leave this function.
+    Returns the validated IntentPlan (mentions + symbolic amounts only), the
+    provider that produced it, and the transcript hash that M4 will bind into
+    the ResolvedPlan. A plan with `unresolved` entries is a VALID 200 — the
+    clarify loop (M4) consumes them; guessing is what we refuse to do."""
+    conn = get_conn()
+    try:
+        payees = [dict(r) for r in conn.execute(
+            "SELECT * FROM payees WHERE user_id=?", (req.user_id,)).fetchall()]
+        billers = [dict(r) for r in conn.execute("SELECT * FROM billers").fetchall()]
+        accounts = [dict(r) for r in conn.execute(
+            "SELECT * FROM accounts WHERE user_id=?", (req.user_id,)).fetchall()]
+        equities = [dict(r) for r in conn.execute("SELECT * FROM equities").fetchall()]
+    finally:
+        conn.close()
+
+    context = build_context(payees=payees, billers=billers,
+                            accounts=accounts, equities=equities)
+    for flag in context.flags:   # layer-4 tripwire: log the attempt, weakest layer
+        logging.warning("injection tripwire: stored field flagged: %s", flag)
+
+    provider = get_provider(settings)
+    try:
+        plan = parse_transcript(req.transcript, provider=provider, context=context)
+    except ParseFailure as exc:
+        # fail closed: a model that can't produce a valid plan produces no draft
+        raise HTTPException(status_code=422, detail={
+            "error": "could not produce a schema-valid plan within the retry budget",
+            "attempts": exc.errors,
+        })
+    return {
+        "intent_plan": plan.model_dump(mode="json"),
+        "provider": provider.name,
+        "transcript_hash": hash_transcript(req.transcript),
+    }
 
 
 # Serve frontend assets (canonical.js, app.js, style.css). Mounted LAST so the
