@@ -83,7 +83,8 @@ def seed(db_path: Path = DB_PATH) -> None:
     conn = connect(db_path)
     try:
         # drop + recreate so seeding is fully idempotent
-        for t in ["transaction_history", "limits", "equities", "billers", "payees", "accounts", "users"]:
+        for t in ["webauthn_credentials", "transaction_history", "limits",
+                  "equities", "billers", "payees", "accounts", "users"]:
             conn.execute(f"DROP TABLE IF EXISTS {t}")
         init_schema(conn)
 

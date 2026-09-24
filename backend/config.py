@@ -32,6 +32,17 @@ class Settings:
     # DB
     db_path: Path = Path(__file__).resolve().parent / "data" / "dcta.db"
 
+    # --- WebAuthn (M2, transaction signing) ---
+    # RP ID must match the origin's host (no port, no scheme). "localhost" is
+    # the one host where WebAuthn works over plain HTTP -- on a deployed demo
+    # link this MUST be the HTTPS origin's domain (brief 10 WebAuthn warning:
+    # a passkey registered on localhost will not work on the deployed origin).
+    rp_id: str = os.getenv("WEBAUTHN_RP_ID", "localhost")
+    rp_name: str = os.getenv("WEBAUTHN_RP_NAME", "DCTA")
+    # The origin the browser actually speaks. localhost over HTTP for dev;
+    # https://<host> for the deployed demo. Verified against clientDataJSON.
+    expected_origin: str = os.getenv("WEBAUTHN_EXPECTED_ORIGIN", "http://localhost:8000")
+
     @property
     def has_credentials(self) -> bool:
         """True only if real Tencent creds are present. Stubs are used while False."""

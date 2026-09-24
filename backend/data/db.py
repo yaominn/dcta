@@ -78,5 +78,17 @@ def init_schema(conn: sqlite3.Connection) -> None:
             key   TEXT PRIMARY KEY,
             value INTEGER NOT NULL                    -- money limits in cents; counts/mins as-is
         );
+
+        -- M2: registered WebAuthn passkeys. One user may have several
+        -- (platform authenticators are device-bound). public_key is the COSE-
+        -- encoded key the gateway verifies against; sign_count advances each
+        -- assertion and is the library's replay-protection signal.
+        CREATE TABLE IF NOT EXISTS webauthn_credentials (
+            credential_id  TEXT PRIMARY KEY,         -- base64url
+            user_id        TEXT NOT NULL REFERENCES users(id),
+            public_key     BLOB NOT NULL,            -- COSE-encoded
+            sign_count     INTEGER NOT NULL DEFAULT 0,
+            created_at     INTEGER NOT NULL           -- Unix seconds UTC
+        );
         """
     )

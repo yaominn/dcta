@@ -18,3 +18,8 @@ webauthn>=2.0        # imports as `import webauthn`; 3.0.0 verified working
 
 # --- Tests ---
 pytest>=8.0
+# e2e WebAuthn acceptance test (M2): drives a real Chromium with a CDP virtual
+# authenticator. pytest.importorskip() skips it where playwright/browser is
+# absent, but M2 acceptance REQUIRES it installed and green.
+# One-time browser install:  python -m playwright install chromium
+playwright>=1.40

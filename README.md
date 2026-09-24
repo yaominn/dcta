@@ -59,7 +59,7 @@ Voice/Text -> ASR -> sanitizer -> LLM parser -> resolver -> policy
 
 ## Tech stack (brief Section 8)
 
-- **Backend:** Python + FastAPI, SQLite, `py_webauthn`, Pydantic v2 (frozen schemas).
+- **Backend:** Python + FastAPI, SQLite, the Duo `webauthn` library, Pydantic v2 (frozen schemas).
 - **Frontend:** plain HTML/JS (no React, no build toolchain).
 - **LLM:** behind a swappable provider interface (Tencent Hunyuan preferred).
   Output handling: generate → validate against the Pydantic schema → reject
@@ -94,10 +94,10 @@ dcta/
 
 | # | Milestone | Status |
 |---|---|---|
-| 0 | Repo, stack, seed data, external spikes | **done (this commit)** |
-| 1 | Gateway + audit log first | next |
-| 2 | WebAuthn register + sign canonical payload | |
-| 3 | LLM parser + schema + opaque IDs | |
+| 0 | Repo, stack, seed data, external spikes | done |
+| 1 | Gateway + audit log first | done |
+| 2 | WebAuthn register + sign canonical payload | **done (this commit)** |
+| 3 | LLM parser + schema + opaque IDs | next |
 | 4 | Resolver + clarify loop | |
 | 5 | Policy engine + KYC + velocity + anomaly | |
 | 6 | Validation agent | |

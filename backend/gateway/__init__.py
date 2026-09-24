@@ -12,7 +12,14 @@ must not depend on anything the LLM does.
 """
 from backend.gateway.gateway import Gateway
 from backend.gateway.nonce import NonceStore, NonceError
-from backend.gateway.signer import MockSigner
+from backend.gateway.signer import MockSigner, WebAuthnVerifier
 from backend.gateway.executor import MockExecutor
 
-__all__ = ["Gateway", "NonceStore", "NonceError", "MockSigner", "MockExecutor"]
+__all__ = [
+    "Gateway",
+    "NonceStore",
+    "NonceError",
+    "MockSigner",
+    "WebAuthnVerifier",
+    "MockExecutor",
+]

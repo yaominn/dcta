@@ -12,16 +12,27 @@ gateway -> audit) is built in Milestones 1-8.
 """
 from __future__ import annotations
 
+import time
+
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.config import settings
 from backend.data.db import DB_PATH, get_conn
 from backend.audit import AuditLog
-from backend.audit.canonical import payload_hash, challenge_hash
-from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor
-from backend.auth import MockCredentialStore
-from backend.models.schemas import ResolvedPlan
+from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
+from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor, WebAuthnVerifier
+from backend.auth import (
+    MockCredentialStore,
+    WebAuthnCredentialStore,
+    registration_options,
+    verify_registration,
+)
+from backend.models.schemas import ResolvedPlan, ResolvedTransfer
+
+from pathlib import Path
 
 app = FastAPI(
     title="DCTA — Direct Conversational Transaction Agent",
@@ -29,19 +40,29 @@ app = FastAPI(
         "GenAI is a generator of drafts, never an executor of funds. "
         "Scenario 1 — Voice-Enabled Payment and Transaction (DBS track)."
     ),
-    version="0.1.0",
+    version="0.2.0",
 )
+
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
 
 @app.get("/")
+def index():
+    """Serve the confirmation overlay (plain HTML/JS, brief 8). WebAuthn works
+    on localhost over HTTP; the deployed demo needs HTTPS (brief 10 warning)."""
+    return FileResponse(FRONTEND_DIR / "index.html")
+
+
+@app.get("/api")
 def root():
     return {
         "project": "DCTA",
         "scenario": "Scenario 1 — Voice-Enabled Payment and Transaction, with KYC and basic risk control",
         "core_principle": "GenAI is a generator of drafts, never an executor of funds.",
-        "milestone": "1 (gateway + audit + import-boundary)",
+        "milestone": "2 (WebAuthn register + sign canonical payload)",
         "credentials_configured": settings.has_credentials,
-        "note": "credentials empty = running on stubs; M1 security core needs no creds",
+        "webauthn": {"rp_id": settings.rp_id, "expected_origin": settings.expected_origin},
+        "note": "credentials empty = running on stubs; the security core needs no Tencent creds",
     }
 
 
@@ -146,6 +167,39 @@ _gateway = Gateway(
 )
 
 
+# --------------------------------------------------------------------------- M2
+# Real WebAuthn path. The gateway's submit() logic is IDENTICAL to the mock
+# path above (same expiry -> nonce -> signature -> execute -> log order); only
+# the injected strategies differ: a DB-backed credential store returning COSE
+# public keys + sign counts, and a verifier that runs
+# webauthn.verify_authentication_response. The nonce store, audit log and
+# executor are SHARED so a nonce issued once works for whichever path submits,
+# and every event lands in one hash-chained audit. (brief 4.2: the gateway is
+# the single chokepoint; here two configured instances of one class share it.)
+_webauthn_credentials = WebAuthnCredentialStore(DB_PATH)
+_webauthn_gateway = Gateway(
+    signer=WebAuthnVerifier(
+        credential_store=_webauthn_credentials,
+        rp_id=settings.rp_id,
+        expected_origin=settings.expected_origin,
+    ),
+    nonce_store=_nonce_store,     # shared
+    audit=_audit,                 # shared
+    executor=_executor,           # shared (one ledger)
+    credentials=_webauthn_credentials,
+)
+
+# In-memory registration challenges (user_id -> (challenge bytes, issued_at)).
+# Anti-replay for the registration ceremony itself; TTL 120s like the signing
+# nonce. Demo-scale; a deployment would persist + TTL-sweep this.
+_registration_challenges: dict[str, tuple[bytes, float]] = {}
+_REG_CHALLENGE_TTL = 120.0
+
+# The mock demo session (brief 8: app login is a mock session). M2 registers a
+# passkey FOR this user; signing verifies against it.
+DEMO_USER_ID = "u_alice"
+
+
 @app.get("/api/auth/nonce")
 def issue_nonce(draft_id: str = Query(...)):
     """Issue a draft-bound, single-use, 120s-TTL nonce (brief 4.5).
@@ -198,3 +252,119 @@ def audit_chain():
 def audit_verify():
     """verify_chain(): ok=True or the exact entry where tampering broke the chain."""
     return _audit.verify_chain()
+
+
+# --------------------------------------------------------------------------- M2: WebAuthn
+def _get_user(user_id: str) -> dict:
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, f"no such user {user_id}")
+        return dict(row)
+    finally:
+        conn.close()
+
+
+class RegisterBeginRequest(BaseModel):
+    user_id: str = DEMO_USER_ID
+
+
+@app.post("/api/auth/register/begin")
+def register_begin(req: RegisterBeginRequest = RegisterBeginRequest()):
+    """Begin a WebAuthn registration. UV=REQUIRED -> only a biometric-capable
+    authenticator may enroll. The server-issued challenge is verified on
+    completion (anti-replay for the registration ceremony)."""
+    from webauthn.helpers import bytes_to_base64url  # local import: keeps M1 import-light
+    user = _get_user(req.user_id)
+    options_json, challenge = registration_options(
+        rp_id=settings.rp_id,
+        rp_name=settings.rp_name,
+        user_id=user["id"],
+        username=user["nickname"],
+    )
+    _registration_challenges[req.user_id] = (challenge, time.time())
+    return {"options": options_json, "user_id": req.user_id}
+
+
+class RegisterCompleteRequest(BaseModel):
+    user_id: str = DEMO_USER_ID
+    credential: dict   # the PublicKeyCredential JSON the browser produced
+
+
+@app.post("/api/auth/register/complete")
+def register_complete(req: RegisterCompleteRequest):
+    """Verify the registration response and store the credential. A replayed or
+    stale challenge, wrong RP/origin, or a non-UV assertion is rejected."""
+    from webauthn.helpers import bytes_to_base64url
+    entry = _registration_challenges.pop(req.user_id, None)
+    if entry is None or (time.time() - entry[1]) > _REG_CHALLENGE_TTL:
+        raise HTTPException(400, "registration challenge expired or missing")
+    challenge = entry[0]
+    try:
+        cred_id_bytes, pubkey_bytes, sign_count = verify_registration(
+            credential_payload=req.credential,
+            expected_challenge=challenge,
+            rp_id=settings.rp_id,
+            expected_origin=settings.expected_origin,
+        )
+    except Exception as exc:
+        raise HTTPException(400, f"registration verification failed: {exc}")
+    cred_id_b64url = bytes_to_base64url(cred_id_bytes)
+    _webauthn_credentials.store(cred_id_b64url, req.user_id, pubkey_bytes, sign_count)
+    return {"credential_id": cred_id_b64url, "user_id": req.user_id}
+
+
+@app.get("/api/auth/credentials")
+def list_credentials(user_id: str = Query(DEMO_USER_ID)):
+    """A user's registered passkeys (for the overlay's allowCredentials list)."""
+    creds = _webauthn_credentials.list_for_user(user_id)
+    return {"user_id": user_id,
+            "credential_ids": [c.credential_id for c in creds]}
+
+
+@app.get("/api/drafts/demo")
+def demo_draft():
+    """The hard-coded demo transfer (brief M2): $500 from savings to Mom.
+    The resolver (M4) will produce this from speech; for M2 it is fixed so the
+    signing flow can be built and tested in isolation. Fresh timestamps keep the
+    authorization window valid (created_at ~ now, expires_at ~ now+300, the cap)."""
+    now = int(time.time())
+    return ResolvedPlan(
+        schema_version="1",
+        draft_id="demo",
+        plan=[
+            ResolvedTransfer(
+                id="t1", type="TRANSFER", source_account="acct_savings",
+                payee_id="payee_17", payee_display="Mom", amount_cents=50000,
+            )
+        ],
+        transcript_hash=hash_transcript("stub: transfer five hundred to mom"),
+        created_at=now,
+        expires_at=now + 300,
+    )
+
+
+class WebAuthnExecuteRequest(BaseModel):
+    """The real signing path. `assertion` is the WebAuthn AuthenticationCredential
+    JSON the browser produced over sha256(payload_hash + nonce). The gateway
+    re-derives the challenge from its OWN payload_hash + the nonce and verifies
+    the assertion against it (brief 4.5)."""
+    resolved_plan: ResolvedPlan
+    assertion: dict
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/gateway/execute-webauthn")
+def webauthn_execute(req: WebAuthnExecuteRequest):
+    """The single execution chokepoint, WebAuthn path. Same submit() logic as the
+    mock path: expiry -> nonce -> signature -> execute -> audit. The verifier
+    rejects a non-biometric assertion (UV flag unset), a wrong-origin/wrong-RP
+    assertion, a stale challenge, or a replayed sign count."""
+    return _webauthn_gateway.submit(req.resolved_plan, req.assertion, req.nonce, req.credential_id)
+
+
+# Serve frontend assets (canonical.js, app.js, style.css). Mounted LAST so the
+# API routes above match first.
+app.mount("/static", StaticFiles(directory=str(FRONTEND_DIR)), name="static")
