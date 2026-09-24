@@ -46,11 +46,13 @@ BOUNDARIES (brief §8):
 """
 from __future__ import annotations
 
+import json
+
 import re
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from backend.audit.canonical import payload_hash
+from backend.audit.canonical import payload_hash, hash_transcript
 from backend.audit.log import AuditEntryType, AuditLog
 from backend.data.db import get_conn
 from backend.models.schemas import (
@@ -78,34 +80,84 @@ class AuditingProvider(Protocol):
 
 # --------------------------------------------------------------------------- freeze set
 class FreezeSet:
-    """In-memory record of draft_ids that must never receive a nonce.
+    """The draft_ids that must never receive a nonce.
 
-    Demo-scale: a process-local set, lost on restart. A deployment would derive
-    frozen drafts from the audit chain (or persist the freeze). The SET is the
-    contract; the storage is a demo choice stated honestly. main.py consults
-    `draft_id in default_freeze_set` at /api/auth/nonce, so the freeze is a
-    property of the draft, not a flag the UI has to remember to check.
+    The hash-chained audit log is the SOURCE OF TRUTH, not this set. Every
+    validation appends a VALIDATION entry carrying `draft_id` and `frozen`, so
+    the set of frozen drafts is already recorded in tamper-evident storage —
+    this object is a read-through cache over it.
+
+    That matters because a freeze must outlive the process. A purely in-memory
+    set evaporates on restart, and a restart inside the 300s authorization
+    window would make a frozen draft signable again. `rehydrate()` rebuilds
+    from the chain, so the answer to "what if the server restarts?" is "the
+    freeze is reconstructed from the audit log", which is a stronger claim than
+    "we kept it in memory".
+
+    main.py consults `draft_id in default_freeze_set` at /api/auth/nonce, so
+    the freeze is a property of the draft rather than a flag the UI has to
+    remember to check.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, audit: "AuditLog | None" = None) -> None:
         self._ids: set[str] = set()
+        self._audit = audit
+        self._rehydrated = False
 
+    # ---- write-through -------------------------------------------------
     def freeze(self, draft_id: str) -> None:
+        """Cache a freeze. The authoritative record is the VALIDATION audit
+        entry that validate() writes in the same breath."""
         self._ids.add(draft_id)
 
+    # ---- read-through --------------------------------------------------
+    def rehydrate(self, audit: "AuditLog | None" = None) -> "FreezeSet":
+        """Rebuild the set from the audit chain. Idempotent; safe to call at
+        startup and after a restart. Unparseable entries are skipped rather
+        than raising — a malformed historical row must not stop the server
+        enforcing every freeze it CAN read."""
+        log = audit or self._audit or AuditLog()
+        for entry in log.all_entries():
+            if entry.get("entry_type") != AuditEntryType.VALIDATION.value:
+                continue
+            try:
+                payload = json.loads(entry["payload"])
+            except (ValueError, KeyError, TypeError):
+                continue
+            if payload.get("frozen") and payload.get("draft_id"):
+                self._ids.add(payload["draft_id"])
+        self._rehydrated = True
+        return self
+
     def __contains__(self, draft_id: object) -> bool:
+        # Lazily rehydrate on first read so a fresh process (a restart) answers
+        # from the chain rather than from an empty set.
+        if not self._rehydrated:
+            try:
+                self.rehydrate()
+            except Exception:
+                # A DB that is not readable yet (first boot, before migrations)
+                # must not break nonce issuance. Fail OPEN here deliberately:
+                # the authoritative freeze is re-established by the next
+                # validation, and refusing every nonce would be a self-inflicted
+                # outage. Recorded as a known limit in the review notes.
+                self._rehydrated = True
         return draft_id in self._ids
 
     def __bool__(self) -> bool:
         return bool(self._ids)
 
     def clear(self) -> None:
-        """Test/demo helper: reset between runs so suites start clean."""
+        """Test/demo helper: reset the CACHE between runs so suites start
+        clean. Does not touch the audit chain, which is append-only."""
         self._ids.clear()
+        self._rehydrated = True        # a cleared set must not silently refill
 
 
 # The module-level singleton main.py consults at nonce issuance. validate() adds
-# to it on a freeze; main.py's /api/auth/nonce reads it. One process, one set.
+# to it on a freeze; main.py's /api/auth/nonce reads it. On a fresh process it
+# rehydrates from the audit chain on first read, so a restart does not unfreeze
+# anything.
 default_freeze_set = FreezeSet()
 
 
@@ -151,6 +203,23 @@ def validate(
     checks: list[dict] = []
     soft: list[dict] = []
 
+    # --- hard, FIRST: is this plan even bound to this utterance? ---
+    # ResolvedPlan.transcript_hash exists to bind a plan to the words it came
+    # from. If it disagrees with the transcript we were handed, every check
+    # below is meaningless: we would be comparing a plan against an utterance
+    # it was not derived from, so a "pass" proves nothing and a "fail" is
+    # uninterpretable. This check is EXACT, where the content checks are
+    # deliberately lenient — so it runs first and short-circuits.
+    supplied = hash_transcript(transcript)
+    if supplied != resolved_plan.transcript_hash:
+        checks.append({
+            "check": "transcript_binding", "leg": "*", "outcome": "fail",
+            "detail": (f"plan is bound to transcript {resolved_plan.transcript_hash[:16]}… "
+                       f"but was validated against {supplied[:16]}…"),
+        })
+        return _finish(draft_id, resolved_plan, checks, soft,
+                       llm_check="skipped", audit=audit, fset=fset)
+
     conn = get_conn()
     try:
         # structural: intent and resolved legs must pair by id, in order
@@ -190,6 +259,14 @@ def validate(
     finally:
         conn.close()
 
+    return _finish(draft_id, resolved_plan, checks, soft,
+                   llm_check=llm_check, audit=audit, fset=fset)
+
+
+def _finish(draft_id, resolved_plan, checks, soft, *, llm_check, audit, fset):
+    """Verdict + freeze + audit entry. Shared by the normal path and the
+    transcript-binding short-circuit, so a freeze is recorded identically
+    however it was reached."""
     frozen = any(c["outcome"] == "fail" for c in checks)
     verdict = "freeze" if frozen else "pass"
     if frozen:

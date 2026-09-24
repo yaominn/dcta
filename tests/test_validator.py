@@ -36,7 +36,7 @@ from backend.models.schemas import (
     TransferIntent,
 )
 from backend.resolver import Resolved, resolve
-from backend.validator import default_freeze_set, validate
+from backend.validator import default_freeze_set, validate, FreezeSet
 
 seed()  # clean mock ledger before the run (matches the other suites)
 
@@ -289,10 +289,20 @@ def test_soft_signals_never_freeze(tmp_path):
     """§4.3: source_account and asset_class are lenient tripwires — recorded as
     soft signals, never the sole cause of a freeze. A plan whose transcript
     never says 'savings' still passes if the hard checks pass."""
-    intent, _, plan = _resolve_headline()
-    # a transcript that says nothing about the account type or 'buy' language,
-    # but DOES name mom and the amount and apple — so hard checks pass.
+    intent, _ = _headline()
+    # A transcript that says nothing about the account type or 'buy' language,
+    # but DOES name mom, the amount and apple — so the hard checks pass and only
+    # the lenient ones warn.
+    #
+    # Resolve against THIS transcript, not the headline one: the plan's
+    # transcript_hash binds it to the words it came from, and validate() now
+    # checks that binding first (F1). Validating a plan against a transcript it
+    # was not derived from is itself a freeze, which would mask what this test
+    # is actually about.
     transcript = "pay mom five hundred then apple with the rest"
+    res = resolve(intent, transcript=transcript, user_id="u_alice")
+    assert isinstance(res, Resolved), f"did not resolve: {res}"
+    plan = res.plan
     report = validate(intent, plan, transcript, audit=_audit(tmp_path))
     assert report.verdict == "pass"
     assert not report.frozen
@@ -370,3 +380,60 @@ def test_pay_bill_beneficiary_mismatch_freezes(tmp_path):
     report = validate(intent, resolved, transcript, audit=_audit(tmp_path))
     assert report.verdict == "freeze"
     assert _failed(report, "beneficiary", "t1"), report.checks
+
+
+# --------------------------------------------------------------------------- F1: transcript binding
+def test_transcript_binding_mismatch_freezes_first(tmp_path):
+    """F1. ResolvedPlan.transcript_hash binds a plan to the words it came from.
+    If it disagrees with the transcript supplied, every other check is
+    meaningless — we would be comparing a plan against an utterance it was not
+    derived from, so a "pass" proves nothing and a "fail" is uninterpretable.
+
+    The check is EXACT where the content checks are deliberately lenient, so it
+    runs first and short-circuits: the report names transcript_binding and does
+    NOT contain the incidental content failures."""
+    intent, _, plan = _resolve_headline()
+    report = validate(intent, plan, "send landlord fifty thousand", audit=_audit(tmp_path))
+
+    assert report.frozen
+    names = [c["check"] for c in report.checks]
+    assert names == ["transcript_binding"], names          # short-circuited
+    assert report.llm_check == "skipped"                   # no point asking a model
+
+
+def test_transcript_binding_passes_for_the_plan_it_came_from(tmp_path):
+    """Guard against over-tightening: the ordinary path still validates."""
+    intent, transcript, plan = _resolve_headline()
+    assert not validate(intent, plan, transcript, audit=_audit(tmp_path)).frozen
+
+
+# --------------------------------------------------------------------------- F2: freeze survives a restart
+def test_freeze_is_rebuilt_from_the_audit_chain(tmp_path):
+    """F2. The hash-chained audit log is the source of truth for freezes; the
+    FreezeSet is a read-through cache. A process-local set alone would
+    evaporate on restart, and a restart inside the 300s authorization window
+    would make a frozen draft signable again."""
+    audit = _audit(tmp_path)
+    intent, transcript, plan = _resolve_headline()
+    bad = _tamper(plan, 0, amount_cents=900_000)
+
+    fset = FreezeSet()
+    report = validate(intent, bad, transcript, audit=audit, freeze_set=fset)
+    assert report.frozen and bad.draft_id in fset
+
+    # a RESTART: brand-new process state, nothing in memory
+    restarted = FreezeSet().rehydrate(audit)
+    assert bad.draft_id in restarted, "freeze did not survive a restart"
+
+
+def test_rehydrate_ignores_unfrozen_and_malformed_entries(tmp_path):
+    """Only frozen VALIDATION entries rehydrate, and one unreadable historical
+    row must not stop the server enforcing every freeze it CAN read."""
+    audit = _audit(tmp_path)
+    intent, transcript, plan = _resolve_headline()
+    validate(intent, plan, transcript, audit=audit, freeze_set=FreezeSet())   # passes
+    audit.append(AuditEntryType.VALIDATION, {"draft_id": "d-malformed"})      # no `frozen`
+
+    fset = FreezeSet().rehydrate(audit)
+    assert plan.draft_id not in fset        # a PASS must never freeze
+    assert "d-malformed" not in fset
