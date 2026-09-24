@@ -38,13 +38,14 @@ caller can never inject an id the mention doesn't justify. Open questions
 """
 from __future__ import annotations
 
+import re
 import time
 import uuid
 from dataclasses import dataclass
 from typing import Any, Callable
 
 from backend.audit.canonical import hash_transcript
-from backend.data.db import get_conn
+from backend.data.db import connect, get_conn
 from backend.display import cents_to_display
 from backend.models.schemas import (
     MAX_AUTH_WINDOW_S,
@@ -60,6 +61,59 @@ from backend.models.schemas import (
     SymbolicAmount,
     TransferIntent,
 )
+
+
+# --------------------------------------------------------------------------- mention normalisation
+# ASR output and real model output carry whitespace, punctuation and filler
+# words that the stub never produced: " mom", "mom.", "Mom,", "my savings",
+# "savings account". Matching case only (the M4 shipping behaviour) rejected all
+# of those, which is indefensible in front of a user. `_normalize` is applied to
+# BOTH sides of every comparison, in ONE place, so the rule cannot drift between
+# the four mention kinds.
+#
+# Filler words are dropped token-wise. Because the SAME function normalises the
+# stored value, dropping "the" is safe even for a payee actually nicknamed "The
+# Landlord" — both sides lose it.
+_FILLER = frozenset({"my", "the", "a", "an", "account", "accounts", "please", "to"})
+
+
+def _normalize(text: str) -> str:
+    """Casefold, split on non-word characters, drop filler tokens, rejoin.
+
+    "  Mom, " -> "mom";  "my savings account" -> "savings";  "AAPL." -> "aapl".
+    Returns "" when nothing but filler is left, which is a 0-match (a question),
+    never a guess."""
+    tokens = [t for t in re.split(r"\W+", text.casefold(), flags=re.UNICODE) if t]
+    kept = [t for t in tokens if t not in _FILLER]
+    return " ".join(kept or tokens)
+
+
+# What the user says -> the seeded `accounts.type` it means. The seed types are
+# savings / joint / settlement; nobody says "settlement", so the investment
+# account was previously unreachable by ANY spoken word. Deliberately small and
+# demo-scoped, like EQUITY_NAME_TO_TICKER below.
+ACCOUNT_TYPE_SYNONYMS: dict[str, str] = {
+    "investment": "settlement",
+    "investments": "settlement",
+    "invest": "settlement",
+    "brokerage": "settlement",
+    "trading": "settlement",
+    "current": "joint",
+    "checking": "joint",
+}
+
+# backend/agent/prompts.py instructs the model: "source_account is the account
+# the user named; if they did not name one, use {"mention": "default"}". So
+# "default" is a hint that THE USER WAS SILENT — not the name of an account.
+# Matching it literally against accounts.type found nothing, so every transcript
+# that did not name an account dead-ended in a clarification, including the
+# README's own demo sentence. The rule below is the fix, and it is deliberately
+# explicit rather than silent: the resolved source_account is a concrete id that
+# the overlay renders, so the user still SEES which account is being debited
+# before signing. A default you can see is consent; a default you cannot is the
+# failure this project exists to prevent.
+_DEFAULT_ACCOUNT_MENTIONS = frozenset({"default", "", "mine", "usual"})
+_DEFAULT_ACCOUNT_TYPE = "savings"
 
 
 # Curated name -> ticker table. The DB stores tickers + prices only (no company
@@ -79,9 +133,10 @@ class Clarify:
     """A single clarifying question + enough state to resume once answered.
 
     `field` is the dotted key (e.g. "t1.target") a caller uses in `answers`.
-    `choices` carries the candidate rows for a 2+ disambiguation (DB-sourced
-    display only); it is empty for open questions (0-match / empty / insufficient)
-    that re-pipeline rather than resume via `answers`.
+    `choices` carries the candidate rows (DB-sourced display only) for every
+    mention question — both a 2+ disambiguation and a 0-match, so either can be
+    answered in one round-trip. It is empty only for `empty` / `zero` /
+    `insufficient`, where no candidate row exists to choose from.
     """
     question: str
     field: str
@@ -113,6 +168,7 @@ def resolve(
     now: int | None = None,
     draft_id: str | None = None,
     answers: dict[str, str] | None = None,
+    db_path=None,
 ) -> Resolved | Clarify:
     """Turn a symbolic IntentPlan into a concrete ResolvedPlan, or a clarifying
     question. Deterministic; touches no LLM.
@@ -121,6 +177,10 @@ def resolve(
     `field` key the Clarify reported. The id is validated against a fresh
     deterministic match — a caller cannot inject an id the mention doesn't
     justify (same enforce-the-property move as extra="forbid").
+
+    `db_path` targets an isolated ledger (tests); omit it for the default mock
+    ledger. Without it a test cannot resolve against a tmp_path DB the way
+    tests/test_gateway.py does.
     """
     now = int(time.time()) if now is None else int(now)
     draft_id = draft_id or uuid.uuid4().hex
@@ -149,7 +209,7 @@ def resolve(
             resume_state=resume,
         )
 
-    conn = get_conn()
+    conn = connect(db_path) if db_path is not None else get_conn()
     try:
         # SIMULATED ledger: a copy. The real DB is never mutated here — execution
         # is the gateway's job, after a signature. We only read balances to
@@ -351,6 +411,11 @@ def _resolve_leg(
 
 
 # --------------------------------------------------------------------------- mention matchers
+def _article(kind: str) -> str:
+    """'an account', 'a payee' — the question is read aloud in the demo."""
+    return "an" if kind[:1] in "aeiou" else "a"
+
+
 def _pick(
     rows: list,
     mention: str,
@@ -360,35 +425,60 @@ def _pick(
     answers: dict[str, str],
     display: Callable[[Any], str],
     value: Callable[[Any], Any],
+    ident: Callable[[Any], str],
+    fallback: list | None = None,
+    zero_question: str | None = None,
 ) -> Any:
     """0 / 1 / 2+ logic shared by every mention kind.
 
     Returns `value(row)` on a unique match (or a validated answer), else a
-    Clarify. On 2+, if `answers[field]` is one of the candidate ids, that id is
-    used — but only after a fresh deterministic match confirms it is among the
-    rows the mention actually justifies. A caller cannot smuggle in an id the
-    mention doesn't map to."""
-    if len(rows) == 0:
-        return Clarify(
-            question=f"I don't have a {kind} called {mention!r} — who did you mean?",
-            field=field, kind=kind, choices=[], resume_state=resume,
-        )
+    Clarify carrying answerable `choices`.
+
+    Both the 2+ and the 0-match paths are answerable via `answers[field]`, and
+    in both cases the id is validated against a freshly computed candidate list
+    — for 2+, the rows the mention matched; for 0-match, the user's own list
+    (`fallback`). A caller can never smuggle in an id that neither justifies.
+    Previously the 0-match path returned before it read `answers` and carried no
+    choices at all, so "I don't have a payee called X" could not be answered:
+    re-parsing the same transcript reproduced the same 0-match, which is an
+    infinite loop in a voice flow.
+    """
+    candidates = rows if rows else list(fallback or [])
+
     if len(rows) == 1:
         return value(rows[0])
-    # 2+ -> disambiguate with distinguishing detail (DB-sourced, never LLM-derived)
+
     chosen = answers.get(field)
     if chosen:
-        for r in rows:
-            if str(r["id"]) == str(chosen):
+        for r in candidates:
+            if str(ident(r)) == str(chosen):
                 return value(r)
-        # an answer that isn't among the candidates is ignored -> re-clarify
-    opts = " or ".join(display(r) for r in rows[:4])
+        # an id that is not among the candidates is ignored -> re-clarify
+
+    choices = [{"id": ident(r), "display": display(r)} for r in candidates]
+    if not rows:
+        opts = " or ".join(c["display"] for c in choices[:4])
+        question = zero_question or (
+            f"I don't have {_article(kind)} {kind} called {mention!r}"
+            + (f" — did you mean {opts}?" if opts else " — who did you mean?")
+        )
+    else:
+        question = "Did you mean " + " or ".join(c["display"] for c in choices[:4]) + "?"
     return Clarify(
-        question=f"Did you mean {opts}?",
-        field=field, kind=kind,
-        choices=[{"id": r["id"], "display": display(r)} for r in rows],
-        resume_state=resume,
+        question=question, field=field, kind=kind,
+        choices=choices, resume_state=resume,
     )
+
+
+def _match(rows: list, mention: str, key: str, synonyms: dict[str, str] | None = None) -> list:
+    """Rows whose `key` normalises equal to the normalised mention. Both sides go
+    through _normalize, so whitespace, punctuation, case and filler words cannot
+    cause a false 0-match. Matching happens in Python rather than SQL `lower()`
+    precisely so the two sides share one normaliser."""
+    norm = _normalize(mention)
+    if synonyms:
+        norm = synonyms.get(norm, norm)
+    return [r for r in rows if _normalize(str(r[key])) == norm]
 
 
 def _resolve_account(conn, mention, user_id, answers, field, resume):
@@ -396,22 +486,34 @@ def _resolve_account(conn, mention, user_id, answers, field, resume):
     # seed sets equal to the id and is useless for matching what a human says.
     # This is also the only field the M3 sanitizer exposes to the LLM.
     rows = conn.execute(
-        "SELECT id, type, balance FROM accounts "
-        "WHERE user_id=? AND lower(type)=lower(?)",
-        (user_id, mention),
+        "SELECT id, type, balance FROM accounts WHERE user_id=?", (user_id,)
     ).fetchall()
+
+    zero_question = None
+    if _normalize(mention) in _DEFAULT_ACCOUNT_MENTIONS:
+        # The user named no account: use the documented default (their savings
+        # account), or the only account they have. Anything else -> ask, with
+        # every account offered as an answerable choice.
+        matched = [r for r in rows if _normalize(r["type"]) == _DEFAULT_ACCOUNT_TYPE]
+        if len(matched) != 1:
+            matched = rows if len(rows) == 1 else []
+        zero_question = "Which account should I use?"
+    else:
+        matched = _match(rows, mention, "type", ACCOUNT_TYPE_SYNONYMS)
+
     return _pick(
-        rows, mention, "account", field, resume, answers,
+        matched, mention, "account", field, resume, answers,
         display=lambda r: f"{r['type']} ({cents_to_display(r['balance'])})",
         value=lambda r: r["id"],
+        ident=lambda r: r["id"],
+        fallback=rows,
+        zero_question=zero_question,
     )
 
 
 def _resolve_payee(conn, mention, user_id, answers, field, resume):
     rows = conn.execute(
-        "SELECT id, nickname, last4 FROM payees "
-        "WHERE user_id=? AND lower(nickname)=lower(?)",
-        (user_id, mention),
+        "SELECT id, nickname, last4 FROM payees WHERE user_id=?", (user_id,)
     ).fetchall()
     # payee_display is built from OUR DB only: nickname + last4. Never from the
     # LLM, never from legal_name or biller reference_text (attacker-controllable;
@@ -419,9 +521,11 @@ def _resolve_payee(conn, mention, user_id, answers, field, resume):
     # disambiguation question and the signed payee_display, for a single
     # provenance-safe surface.
     return _pick(
-        rows, mention, "payee", field, resume, answers,
+        _match(rows, mention, "nickname"), mention, "payee", field, resume, answers,
         display=lambda r: f"{r['nickname']} ··{r['last4']}",
         value=lambda r: (r["id"], f"{r['nickname']} ··{r['last4']}"),
+        ident=lambda r: r["id"],
+        fallback=rows,
     )
 
 
@@ -429,36 +533,30 @@ def _resolve_biller(conn, mention, answers, field, resume):
     # Billers are not user-scoped in the schema (no user_id column) -> match
     # globally on name. biller_display is the name only — there is no last4,
     # and reference_text is the injection carrier, so it is never used.
-    rows = conn.execute(
-        "SELECT id, name FROM billers WHERE lower(name)=lower(?)",
-        (mention,),
-    ).fetchall()
+    rows = conn.execute("SELECT id, name FROM billers").fetchall()
     return _pick(
-        rows, mention, "biller", field, resume, answers,
+        _match(rows, mention, "name"), mention, "biller", field, resume, answers,
         display=lambda r: r["name"],
         value=lambda r: (r["id"], r["name"]),
+        ident=lambda r: r["id"],
+        fallback=rows,
     )
 
 
 def _resolve_equity(conn, mention, answers, field, resume):
-    # The mention may be a ticker ("AAPL") or a company name ("Apple"). Try the
-    # ticker first (exact, case-insensitive), then the curated name->ticker
-    # table. An unknown symbol is a clarify case, never a guess.
-    rows = conn.execute(
-        "SELECT ticker, price FROM equities WHERE lower(ticker)=lower(?)",
-        (mention,),
-    ).fetchall()
-    if not rows:
-        tk = EQUITY_NAME_TO_TICKER.get(mention.lower())
+    # The mention may be a ticker ("AAPL", "aapl.") or a company name ("Apple",
+    # "my apple"). Try the ticker first, then the curated name->ticker table. An
+    # unknown symbol is a clarify case offering the known tickers, never a guess.
+    rows = conn.execute("SELECT ticker, price FROM equities").fetchall()
+    matched = _match(rows, mention, "ticker")
+    if not matched:
+        tk = EQUITY_NAME_TO_TICKER.get(_normalize(mention))
         if tk:
-            r = conn.execute(
-                "SELECT ticker, price FROM equities WHERE lower(ticker)=lower(?)",
-                (tk.lower(),),
-            ).fetchone()
-            if r:
-                rows = [r]
+            matched = [r for r in rows if r["ticker"] == tk]
     return _pick(
-        rows, mention, "equity", field, resume, answers,
+        matched, mention, "equity", field, resume, answers,
         display=lambda r: r["ticker"],
         value=lambda r: (r["ticker"], r["price"]),
+        ident=lambda r: r["ticker"],
+        fallback=rows,
     )
