@@ -42,7 +42,7 @@ from backend.policy import contact_change_step_up
 from backend.resolver.contacts import resolve_contact_edit
 from backend.validator.contacts import validate_contact_change
 from backend.asr import (MAX_AUDIO_BYTES,
-                         ASRUnavailable, get_asr_provider)
+                         ASRNoSpeech, ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
@@ -583,7 +583,24 @@ async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
 
     try:
         text = provider.transcribe(raw, fmt=container)
+    except ASRNoSpeech as exc:
+        # The provider is fine; the clip held nothing it could recognise. 422,
+        # NOT 503: the browser must ask the user to try again on THIS tier, not
+        # conclude server ASR is down and abandon it for the session.
+        logging.info("ASR heard no speech: provider=%s fmt=%s bytes=%d",
+                     provider.name, container, len(raw))
+        raise HTTPException(status_code=422, detail={
+            "error": str(exc),
+            "provider": provider.name,
+            "no_speech": True,
+        })
     except ASRUnavailable as exc:
+        # The browser gets this detail, but it then drops a tier and moves on,
+        # so without a server-side line the REASON is lost: a rejected
+        # container, a silent clip and a quota error all look like "503".
+        # Metadata and the upstream error only — never the audio or the words.
+        logging.warning("ASR unavailable: provider=%s fmt=%s bytes=%d: %s",
+                        provider.name, container, len(raw), exc)
         raise HTTPException(status_code=503, detail={
             "error": str(exc),
             "provider": provider.name,

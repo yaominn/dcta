@@ -11,3 +11,15 @@ class ASRUnavailable(RuntimeError):
     endpoint reports 503 with a machine-readable `fallback` so the client knows
     which tier to drop to, rather than surfacing a failure to the user.
     """
+
+
+class ASRNoSpeech(ASRUnavailable):
+    """The provider ran and recognised nothing — silence, noise, a clip cut off.
+
+    A subclass so every existing `except ASRUnavailable` still holds, but the
+    endpoint catches it FIRST and answers 422, not 503. The difference is the
+    whole point: 503 tells the browser "this tier is down, drop to the next",
+    and the page then stops trying server ASR. A quiet clip is not an outage —
+    treating it as one turned a single mis-tap into a mic that stayed on the
+    browser tier (dead in Safari without Dictation) for the rest of the session.
+    """

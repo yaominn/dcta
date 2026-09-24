@@ -621,7 +621,8 @@ async function onSign() {
 /* Readable messages for the Web Speech API's error codes. */
 const SPEECH_ERRORS = {
   "not-allowed": "Microphone access is blocked. Allow it in the address bar, or type instead.",
-  "service-not-allowed": "This browser won't run speech recognition here. Type it instead.",
+  "service-not-allowed": "This browser won't run speech recognition here (in Safari, turn on "
+    + "Dictation in System Settings → Keyboard). Type it instead.",
   "no-speech": "I didn't hear anything. Tap the mic and try again.",
   "audio-capture": "No microphone was found. Type it instead.",
   "network": "The browser's speech service couldn't be reached. Type it instead.",
@@ -633,10 +634,16 @@ function wireVoice() {
   const textForm = document.getElementById("say-form");
   const textIn = document.getElementById("say");
 
-  // Once server-side ASR has said "not available" (503/415/413), skip it for
-  // the rest of the session: otherwise every press records, uploads, gets
-  // refused, and asks the user to say it all a second time.
+  // Once server-side ASR CANNOT serve this browser — no provider configured,
+  // or a container it will keep refusing — skip it for the rest of the
+  // session: otherwise every press records, uploads, gets refused, and asks
+  // the user to say it all a second time. A transient failure is different:
+  // it drops a tier for that one utterance only, and only two in a row give
+  // up on tier 1. Previously ANY refusal was permanent, so one quiet clip left
+  // the mic on the browser tier — dead in Safari without Dictation — until
+  // the page was reloaded.
   let serverAsrDown = false;
+  let serverAsrFailures = 0;       // consecutive transient tier-1 failures
   let active = null;               // { stop() } for whichever tier is listening
 
   const onText = (t, provider) => {
@@ -679,11 +686,12 @@ function wireVoice() {
     if (serverAsrDown) { startWebSpeech(); return; }
     // Tier 1 first (server-side ASR: OpenAI or Tencent, the backend decides).
     const rec = await Voice.recordAndUpload({
-      onText, onError, onState,
-      onFallback: () => {
+      onText: (t, provider) => { serverAsrFailures = 0; onText(t, provider); },
+      onError, onState,
+      onFallback: (_reason, { sticky } = {}) => {
         // The recording can't be reused by the browser tier, so say so rather
         // than silently listening again.
-        serverAsrDown = true;
+        if (sticky || ++serverAsrFailures >= 2) serverAsrDown = true;
         active = null;
         botSay("Server speech recognition isn't available right now, so I'll "
           + "use your browser's instead. Please say it again.");

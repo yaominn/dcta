@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import base64
 
-from backend.asr.errors import ASRUnavailable
+from backend.asr.errors import ASRNoSpeech, ASRUnavailable
 from backend.asr.provider import SUPPORTED_VOICE_FORMATS
 
 
@@ -73,5 +73,5 @@ class TencentASRProvider:
             # Distinguish "recognised nothing" from "call failed": an empty
             # result is a real outcome (silence, noise) and must not be mistaken
             # for a transcript.
-            raise ASRUnavailable("Tencent ASR returned no text (silence or unrecognised audio)")
+            raise ASRNoSpeech("Tencent ASR returned no text (silence or unrecognised audio)")
         return text

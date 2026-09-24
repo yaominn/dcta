@@ -223,3 +223,53 @@ def test_silence_is_not_mistaken_for_a_transcript(upload):
     upload({"text": "   "})
     with pytest.raises(ASRUnavailable):
         OpenAIASRProvider(_Settings(openai_key="sk-o")).transcribe(b"x", fmt="wav")
+
+
+# --------------------------------------------------------------------------- silence is not an outage
+def test_no_speech_is_a_distinct_subclass():
+    """Every existing `except ASRUnavailable` still catches it."""
+    from backend.asr import ASRNoSpeech
+    assert issubclass(ASRNoSpeech, ASRUnavailable)
+
+
+def test_silence_raises_no_speech_specifically(upload):
+    from backend.asr import ASRNoSpeech
+    upload({"text": ""})
+    with pytest.raises(ASRNoSpeech):
+        OpenAIASRProvider(_Settings(openai_key="sk-o")).transcribe(b"x", fmt="wav")
+
+
+class _Raises:
+    name = "openai"
+    formats = OpenAIASRProvider.formats
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def transcribe(self, audio, *, fmt):
+        raise self._exc
+
+
+def test_endpoint_answers_422_for_silence_not_503(monkeypatch):
+    """503 tells the browser the tier is down; silence must not say that."""
+    from backend.asr import ASRNoSpeech
+    monkeypatch.setattr(main, "get_asr_provider",
+                        lambda settings: _Raises(ASRNoSpeech("returned no text")))
+    r = TestClient(main.app).post("/api/transcribe?fmt=webm",
+                                  files={"audio": ("u", b"quiet", "audio/webm")})
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["no_speech"] is True
+    assert "fallback" not in detail
+
+
+def test_endpoint_still_answers_503_for_an_upstream_failure(monkeypatch):
+    monkeypatch.setattr(main, "get_asr_provider",
+                        lambda settings: _Raises(ASRUnavailable("HTTP 429 insufficient_quota")))
+    r = TestClient(main.app).post("/api/transcribe?fmt=webm",
+                                  files={"audio": ("u", b"audio", "audio/webm")})
+    assert r.status_code == 503
+    detail = r.json()["detail"]
+    assert detail["fallback"] == "webspeech"
+    # A configured provider, so the client treats this as transient, not sticky.
+    assert detail["provider"] == "openai"

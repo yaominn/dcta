@@ -27,7 +27,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from backend.asr.errors import ASRUnavailable
+from backend.asr.errors import ASRNoSpeech, ASRUnavailable
 
 # Our VoiceFormat name -> (filename extension OpenAI keys on, MIME type).
 # OpenAI documents flac, mp3, mp4, mpeg, mpga, m4a, ogg, wav and webm. Not
@@ -104,7 +104,7 @@ class OpenAIASRProvider:
         if not text:
             # Distinguish "recognised nothing" from "call failed": silence is a
             # real outcome and must not be mistaken for an empty transcript.
-            raise ASRUnavailable("OpenAI ASR returned no text (silence or unrecognised audio)")
+            raise ASRNoSpeech("OpenAI ASR returned no text (silence or unrecognised audio)")
         return text
 
 

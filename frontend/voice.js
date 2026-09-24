@@ -112,12 +112,22 @@ const Voice = (() => {
       const url = "/api/transcribe" + (fmt ? "?fmt=" + encodeURIComponent(fmt) : "");
       try {
         const r = await fetch(url, { method: "POST", body: fd });
-        if (r.status === 503 || r.status === 415 || r.status === 413) {
-          // Designed degradation: no server-side ASR configured (503), a
-          // container it cannot forward (415), or too much audio (413). All
-          // three mean "this tier cannot serve this request" -> drop a tier.
-          const body = await r.json().catch(() => ({}));
-          return onFallback(body?.detail?.error || "server ASR unavailable");
+        if (r.status === 422 || r.status === 503 || r.status === 415 || r.status === 413) {
+          const detail = (await r.json().catch(() => ({})))?.detail || {};
+          // The provider ran and heard nothing (silence, a clip cut short).
+          // NOT an outage: stay on this tier and let the user try again.
+          // Checked by flag, not status alone — 422 is also FastAPI's
+          // malformed-request answer, which is a bug, not a quiet room.
+          if (r.status === 422 && detail.no_speech) return onText("", "server");
+          if (r.status === 422) return onError(new Error("transcription failed: 422"));
+          // Designed degradation: no server-side ASR configured or upstream
+          // failing (503), a container it cannot forward (415), or too much
+          // audio (413) -> drop a tier for this utterance. `sticky` says
+          // whether retrying tier 1 next press can possibly help: not when no
+          // provider is configured, nor for a container this browser will
+          // keep producing. An upstream blip or an over-long clip, yes.
+          const sticky = r.status === 415 || detail.provider === "unavailable";
+          return onFallback(detail.error || "server ASR unavailable", { sticky });
         }
         if (!r.ok) return onError(new Error("transcription failed: " + r.status));
         const { transcript, provider } = await r.json();
