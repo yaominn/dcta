@@ -190,11 +190,6 @@
       const h = el("h3"); h.append(who("you"), document.createTextNode(`Signed (${e.path}) → `), who("code"), document.createTextNode("Gateway"));
       const out = [h, el("p", null, e.accepted ? "Accepted: " + ((e.execution && e.execution.status) || "EXECUTED")
                                                : `Rejected (${e.rejection}): ${e.reason || ""}`)];
-      if (e.ownership) {
-        const o = e.ownership;
-        out.push(el("p", null, `Ownership verified: the passkey belongs to ${o.signer_name} (${o.signer}), `
-          + `who owns ${[...(o.accounts || []).map((a) => a.id), ...(o.payees || []).map((p) => p.id)].join(", ")}.`));
-      }
       if (e.execution) out.push(block("What it did", json(e.execution), false));
       return out;
     },

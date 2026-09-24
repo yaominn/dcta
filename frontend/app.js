@@ -460,29 +460,12 @@ function showResult(res) {
       ul.append(li);
     }
     card.append(ul);
-    const proof = ownershipLine(res.json.ownership);
-    if (proof) card.append(el("p", "ownership", proof));
   } else {
     card.append(el("p", "lead", res.json.reason || "The gateway refused this payment."));
     const pre = el("pre");
     pre.textContent = JSON.stringify(res.json, null, 2);
     card.append(pre);
   }
-}
-
-// The gateway's ownership evidence, as one sentence: whose passkey signed,
-// and that this person owns every account and payee the payment touched. Shown
-// on success because a check that only ever speaks when it refuses is
-// invisible in a demo. Text only (el() sets textContent): labels come from
-// stored rows, and this card is the trusted surface.
-function ownershipLine(own) {
-  if (!own || !own.verified) return "";
-  const things = [...(own.accounts || []).map((a) => "the " + a.label + " account"),
-                  ...(own.payees || []).map((p) => "the payee " + p.label)];
-  const list = things.length < 2 ? things.join("")
-    : things.slice(0, -1).join(", ") + " and " + things[things.length - 1];
-  return "✓ Ownership verified: this passkey belongs to " + own.signer_name
-    + (list ? ", who owns " + list : "") + ".";
 }
 
 function showRefusal(title, detail, explanation) {

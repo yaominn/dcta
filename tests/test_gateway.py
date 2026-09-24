@@ -42,7 +42,7 @@ def _build(tmp_path, ttl=120):
     seed(db_path)
     signer = MockSigner()
     creds = MockCredentialStore()
-    creds.register("cred_alice", signer.public_key, user_id="u_alice")
+    creds.register("cred_alice", signer.public_key)
     nonce_store = NonceStore(ttl_seconds=ttl)
     audit = AuditLog(db_path)
     executor = MockExecutor(db_path)

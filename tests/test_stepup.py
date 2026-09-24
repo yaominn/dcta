@@ -41,7 +41,7 @@ def _gateway(tmp_path, step_up):
     seed(db)
     signer = MockSigner()
     creds = MockCredentialStore()
-    creds.register("cred_alice", signer.public_key, user_id="u_alice")
+    creds.register("cred_alice", signer.public_key)
     gw = Gateway(signer=signer, nonce_store=NonceStore(), audit=AuditLog(db),
                  executor=MockExecutor(db), credentials=creds,
                  policy_db_path=db, step_up=step_up)

@@ -38,7 +38,6 @@ from backend.gateway.signer import MockSigner
 from backend.gateway.stepup import StepUpStore
 from backend.gateway.executor import MockExecutor
 from backend.auth.credentials import MockCredentialStore
-from backend.gateway import ownership
 from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
 from backend.policy import (Decision, contact_change_step_up, evaluate,
@@ -108,16 +107,6 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
 
-        # 3b. ownership — the signer must own every debited account and every
-        #     transfer's payee. AFTER the signature, so it cannot be used to
-        #     probe who owns what. Read from the executor's ledger, which every
-        #     gateway has: unlike the policy re-check below, this one cannot be
-        #     configured away.
-        signer = self.credentials.user_of(credential_id)
-        owned = ownership.check_plan(resolved_plan, signer, db_path=self.executor.db_path)
-        if not owned.ok:
-            return self._reject(draft_id, p_hash, "OWNERSHIP", owned.reason)
-
         # 4. policy — re-evaluated at the chokepoint (M5). The owner is derived
         #    from the ACCOUNT ROWS being debited, never from a field in the
         #    request, so a caller cannot nominate whose limits apply to them.
@@ -155,12 +144,10 @@ class Gateway:
                 "payload_hash": p_hash,
                 "outcome": result["status"],
                 "legs": result["legs"],
-                "signer": signer,
             },
         )
         return {"accepted": True, "draft_id": draft_id,
-                "payload_hash": p_hash, "execution": result,
-                "ownership": owned.evidence}
+                "payload_hash": p_hash, "execution": result}
 
     def submit_contact_change(
         self,
@@ -193,13 +180,6 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
 
-        # Ownership, as for payments: only the payee's owner may rename it or
-        # change where it points.
-        signer = self.credentials.user_of(credential_id)
-        owned = ownership.check_contact_change(change, signer, db_path=self.executor.db_path)
-        if not owned.ok:
-            return self._reject(draft_id, p_hash, "OWNERSHIP", owned.reason)
-
         # Re-derived HERE from the payload, not taken from the draft store: a
         # hand-assembled phone change needs the out-of-band code too.
         reasons = contact_change_step_up(change)
@@ -217,11 +197,9 @@ class Gateway:
             # payee ids and fields only: the audit chain is append-only and hard
             # to redact, so the phone numbers themselves are not copied into it.
             "edits": [{"payee_id": e.payee_id, "field": e.field} for e in change.edits],
-            "signer": signer,
         })
         return {"accepted": result["status"] == "UPDATED", "draft_id": draft_id,
                 "payload_hash": p_hash, "execution": result,
-                "ownership": owned.evidence,
                 **({} if result["status"] == "UPDATED"
                    else {"rejection": "FAILED", "reason": result["error"]})}
 

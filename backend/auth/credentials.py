@@ -28,24 +28,16 @@ from backend.data.db import connect
 
 
 class MockCredentialStore:
-    """# MOCK: in-memory credential_id -> (public key, owning user)."""
+    """# MOCK: in-memory credential_id -> public key."""
 
     def __init__(self):
         self._creds: Dict[str, str] = {}
-        self._users: Dict[str, str] = {}
 
-    def register(self, credential_id: str, public_key: str, *, user_id: str) -> None:
-        # user_id is required: a credential with no owner could never pass the
-        # gateway's ownership check, and a silent default would hide that.
+    def register(self, credential_id: str, public_key: str) -> None:
         self._creds[credential_id] = public_key
-        self._users[credential_id] = user_id
 
     def get(self, credential_id: str) -> str | None:
         return self._creds.get(credential_id)
-
-    def user_of(self, credential_id: str) -> str | None:
-        """The user this credential signs for — the gateway's ownership check."""
-        return self._users.get(credential_id)
 
 
 @dataclass
@@ -112,11 +104,6 @@ class WebAuthnCredentialStore:
             conn.commit()
         finally:
             conn.close()
-
-    def user_of(self, credential_id: str) -> str | None:
-        """The user this passkey was registered to — the gateway's ownership check."""
-        cred = self.get(credential_id)
-        return cred.user_id if cred else None
 
     def list_for_user(self, user_id: str) -> list[WebAuthnCredential]:
         """All of a user's registered passkeys -> allowCredentials for signing."""

@@ -132,35 +132,6 @@ off, so the real path is proven without the shortcut.
 `tests/test_mock_signing_disabled.py` pins all of this, including the
 three-call attack failing end to end with the balance unchanged.
 
-## Ownership — the signer must own what they sign for
-
-A valid signature proves a registered passkey approved **exactly this
-payload**. It does not say whose passkey that is relative to the money. So
-after the signature and before policy, the gateway checks, against the ledger
-rows and never a request field:
-
-- every debited account belongs to the signer's user,
-- every transfer's payee belongs to the signer's user,
-- every payee in a contact edit belongs to the signer's user.
-
-Anything else is rejected as `OWNERSHIP` and logged in the audit chain. Billers
-and tickers are shared by every customer, so they carry no owner. The check
-fails **closed** (an unknown signer, account or payee is a rejection), runs
-only **after** a valid signature so it cannot be used to probe who owns what,
-and a rejection names only the id the request supplied, never the true owner.
-
-It is also **visible on success**. The result card reads *"✓ Ownership
-verified: this passkey belongs to Alice, who owns the savings account and the
-payee Mom"*, the `/data` trace shows the same, and the `EXECUTION` audit entry
-records the signer. `tests/test_ownership.py` gives Bob his own account, payee
-and credential and signs across the line in every direction; against the
-previous gateway, Bob's passkey moved Alice's money.
-
-> **Limit, stated plainly:** this binds the signer to the accounts. It does
-> not decide who may *become* a signer. Registration currently stores a
-> passkey for whatever `user_id` the request names (the mock session), so
-> enrollment needs its own gate before this is a complete identity story.
-
 ## M3 — LLM parser + schema + opaque IDs
 
 `POST /api/plan` turns a text transcript into a schema-valid `IntentPlan`

@@ -266,7 +266,6 @@ details.sec[open] summary::before { transform: rotate(90deg); }
 .result h3 { margin: 0 0 4px; font-size: 12px; letter-spacing: .8px; display: flex; align-items: center; gap: 6px; }
 .result.ok h3 { color: var(--ok); }
 .result.bad h3 { color: var(--bad); }
-.result .ownership { margin: 10px 0 0; padding: 8px 10px; border-radius: 8px; background: var(--ok-soft); color: var(--ok); font-size: 13px; }
 .result .lead { margin: 0 0 6px; font-weight: 600; }
 .result ul { margin: 6px 0 0; padding: 0; list-style: none; font-size: 13px; }
 .result li { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-top: 1px solid var(--line); }
