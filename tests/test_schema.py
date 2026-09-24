@@ -20,20 +20,26 @@ _TX_HASH = hash_transcript(_TX)
 
 
 # --------------------------------------------------------------------------- the Section 7 example
+# L3: source_account and ticker are MENTIONS ({mention:"..."}), not the bare
+# account-alias / ticker-string the brief's literal Section 7 shows. The LLM
+# cannot name which account to debit or which equity directly; only the
+# resolver maps the mention. (The symbolic `ref` still carries an account
+# alias per the brief grammar — the one residual identifier surface; see
+# schemas.SymbolicAmount.)
 SECTION_7_EXAMPLE = {
     "plan": [
         {
             "id": "t1",
             "type": "TRANSFER",
-            "source_account": "acct_savings",
+            "source_account": {"mention": "savings"},
             "target": {"mention": "mom"},
             "amount": {"literal_cents": 50000},   # $500.00 in cents
         },
         {
             "id": "t2",
             "type": "BUY_EQUITY",
-            "source_account": "acct_savings",
-            "ticker": "AAPL",
+            "source_account": {"mention": "savings"},
+            "ticker": {"mention": "AAPL"},
             "amount": {"ref": "acct_savings.balance_after:t1", "op": "ALL"},
         },
     ],
@@ -47,6 +53,9 @@ def test_section7_example_validates():
     assert len(plan.plan) == 2
     assert plan.plan[0].type == "TRANSFER"      # Literal discriminator -> plain str
     assert plan.plan[1].type == "BUY_EQUITY"
+    # L3: source_account + ticker are mentions, not bare identifiers.
+    assert plan.plan[0].source_account.mention == "savings"
+    assert plan.plan[1].ticker.mention == "AAPL"
     # the second leg's amount is symbolic, not computed — the LLM did no arithmetic
     assert not hasattr(plan.plan[1].amount, "literal_cents")  # it's a SymbolicAmount
 
@@ -58,7 +67,8 @@ def test_llm_cannot_emit_payee_id():
     bad = {
         "plan": [
             {
-                "id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+                "id": "t1", "type": "TRANSFER",
+                "source_account": {"mention": "savings"},
                 "target": {"mention": "mom"},
                 "amount": {"literal_cents": 50000},
                 "payee_id": "payee_17",  # <-- invented, must be rejected
@@ -75,7 +85,8 @@ def test_llm_cannot_attach_account_number():
     bad = {
         "plan": [
             {
-                "id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+                "id": "t1", "type": "TRANSFER",
+                "source_account": {"mention": "savings"},
                 "target": {"mention": "mom", "account_number": "123-456"},  # invented
                 "amount": {"literal_cents": 50000},
             }
@@ -92,10 +103,50 @@ def test_wrong_variant_field_rejected():
     bad = {
         "plan": [
             {
-                "id": "t1", "type": "TRANSFER", "source_account": "acct_savings",
+                "id": "t1", "type": "TRANSFER",
+                "source_account": {"mention": "savings"},
                 "target": {"mention": "mom"},
                 "amount": {"literal_cents": 50000},
-                "ticker": "AAPL",  # ticker doesn't belong on a TRANSFER
+                "ticker": {"mention": "AAPL"},  # ticker doesn't belong on a TRANSFER
+            }
+        ],
+        "unresolved": [],
+    }
+    with pytest.raises(ValidationError):
+        IntentPlan.model_validate(bad)
+
+
+# --------------------------------------------------------------------------- L3: source_account + ticker are mentions, not identifiers
+def test_source_account_must_be_mention_not_identifier():
+    """L3: the LLM emits a MENTION for the source account ({mention:'savings'}),
+    not the account alias/id. A bare alias string like 'acct_savings' is
+    rejected — the LLM cannot name which account to debit directly; only the
+    resolver maps the mention. Mirrors 'no payee_id'."""
+    bad = {
+        "plan": [
+            {
+                "id": "t1", "type": "TRANSFER",
+                "source_account": "acct_savings",   # bare identifier -> rejected
+                "target": {"mention": "mom"},
+                "amount": {"literal_cents": 50000},
+            }
+        ],
+        "unresolved": [],
+    }
+    with pytest.raises(ValidationError):
+        IntentPlan.model_validate(bad)
+
+
+def test_ticker_must_be_mention_not_identifier():
+    """L3: the LLM emits a MENTION for the equity ({mention:'AAPL'}), not a
+    bare ticker string. The resolver validates it maps to a known equity."""
+    bad = {
+        "plan": [
+            {
+                "id": "t2", "type": "BUY_EQUITY",
+                "source_account": {"mention": "savings"},
+                "ticker": "AAPL",   # bare identifier -> rejected
+                "amount": {"ref": "acct_savings.balance_after:t1", "op": "ALL"},
             }
         ],
         "unresolved": [],

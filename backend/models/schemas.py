@@ -7,13 +7,16 @@ affects all three workstreams (agent, resolver, gateway/audit).
 Two schemas, and the gap between them IS the security model:
 
   - IntentPlan   : what the LLM emits. Mentions + symbolic amounts only.
-                   No payee_id, no account numbers, no computed money.
+                   No payee_id, no account ids, no tickers, no computed money —
+                   every cross-reference is a mention the resolver maps (L3).
   - ResolvedPlan : what the resolver produces; canonicalized -> hashed -> signed.
                    Concrete payee_id, concrete amounts, whole share counts.
 
 Security properties baked into the shapes (say this to the judges):
-  1. The LLM schema has NO payee_id field -> a prompt-injected model cannot
-     pick a payee; only the deterministic resolver can.            (brief 4.3, layer 3)
+  1. The LLM schema has NO identifier fields: no payee_id, no account id, no
+     bare ticker — source_account and ticker are MENTIONS the resolver maps
+     (L3). A prompt-injected model cannot pick a payee/account/equity directly;
+     only the deterministic resolver can.                       (brief 4.3, layer 3)
   2. The LLM schema has NO arithmetic -> "whatever is left" is a symbolic
      {ref, op} token the resolver computes against the ledger.     (brief 4.1)
   3. The signed payload is the ResolvedPlan, never the raw LLM output. (brief 4.5/7)
@@ -83,7 +86,15 @@ class LiteralAmount(BaseModel):
 class SymbolicAmount(BaseModel):
     """A symbolic reference the resolver computes. e.g.
     {"ref": "acct_savings.balance_after:t1", "op": "ALL"}
-    The LLM never does arithmetic — it only emits the ref + op."""
+    The LLM never does arithmetic — it only emits the ref + op.
+
+    Note (L3 residual): this ref grammar still embeds an account alias
+    (<account_alias>) per the brief's Section 7 example. source_account and
+    ticker are now mentions, so this is the ONE place an account identifier
+    can appear in the LLM output. Acceptable because the resolver resolves it
+    deterministically and the user signs the RESOLVED payload (not this ref);
+    a future pass may switch the grammar to leg-relative
+    (e.g. "t1.balance_after") to remove the alias entirely."""
     model_config = ConfigDict(extra="forbid")
     ref: str = Field(description="grammar: <account_alias>.balance_after:<leg_id>")
     op: AmountOp
@@ -106,7 +117,14 @@ class _BaseIntent(BaseModel):
     """Shared fields across all intent variants."""
     model_config = ConfigDict(extra="forbid")
     id: str = Field(description="leg id, e.g. 't1' — referenced by symbolic amounts")
-    source_account: str = Field(description="account alias, e.g. 'acct_savings'")
+    # L3: the source account is a MENTION (e.g. {"mention":"savings"}), not an
+    # account alias/id. The resolver maps the mention to the concrete account
+    # (acct_savings). The LLM cannot name which account to debit directly —
+    # mirrors "no payee_id". A bare alias string is rejected at validation.
+    source_account: MentionTarget = Field(
+        description="account the user mentioned, e.g. {mention:'savings'}; "
+                    "resolver maps to the concrete account id",
+    )
 
 
 class TransferIntent(_BaseIntent):
@@ -123,7 +141,13 @@ class PayBillIntent(_BaseIntent):
 
 class BuyEquityIntent(_BaseIntent):
     type: Literal["BUY_EQUITY"] = "BUY_EQUITY"
-    ticker: str = Field(description="e.g. 'AAPL'")
+    # L3: the equity is a MENTION (e.g. {"mention":"AAPL"} or {"mention":"Apple"}),
+    # not a bare ticker string. The resolver validates it maps to a known
+    # equity in the DB and fetches its price. A bare ticker string is rejected.
+    ticker: MentionTarget = Field(
+        description="equity the user mentioned, e.g. {mention:'AAPL'}; "
+                    "resolver validates it maps to a known equity",
+    )
     amount: Amount
 
 
