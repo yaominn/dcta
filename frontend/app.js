@@ -248,53 +248,88 @@ function showResult(res) {
 }
 
 /* ---------- M7: transcript -> draft, with the clarify loop ---------- */
-let CURRENT = { plan: null, credentialIds: [], answers: {}, transcript: "" };
+/* The draft lives SERVER-SIDE (backend/drafts.py). We send a transcript and get
+   a draft_id back; answering a question sends only {field, choice_id} for that
+   id. The client never holds or returns the plan — so it cannot substitute one,
+   and a clarify round-trip re-RESOLVES against the stored IntentPlan rather
+   than re-parsing the transcript, which with a real model could otherwise
+   produce a different plan on every turn. */
+let CURRENT = { draftId: null, plan: null, credentialIds: [], transcript: "" };
 
 function setStatus(msg) {
   const el = document.getElementById("status");
   if (el) { el.textContent = msg; el.hidden = !msg; }
 }
 
-async function submitTranscript(transcript, answers) {
-  // One utterance in, one of three outcomes out. `clarify` and `frozen` are
-  // both HTTP 200: needing to ask is a normal conversational outcome, and a
-  // freeze is a successful request whose answer is "no". Only a genuine
-  // failure to respond is a non-200.
-  setStatus("Working…");
-  const res = await jpost(API + "/api/draft", {
-    transcript, user_id: DEMO_USER, answers: answers || {},
-  });
+function handleDraft(res) {
   if (res.status !== 200) {
     const d = res.json.detail || {};
-    showErr(d.error ? `${d.error}` : `request failed (${res.status})`);
+    showErr(d.error || `request failed (${res.status})`);
     setStatus("");
     return;
   }
   const body = res.json;
+  CURRENT.draftId = body.draft_id;
+  setStatus("");
 
+  // Four outcomes, and the user must be able to tell them apart. All are HTTP
+  // 200: needing to ask is a normal conversational result, and a refusal is a
+  // successful request whose answer is "no".
   if (body.status === "clarify") {
-    // Voice-first: ONE short question at a time, spoken as well as shown.
-    CURRENT.transcript = transcript;
-    setStatus("");
     renderClarify(body);
     Voice.speak(body.question);
     return;
   }
-
-  if (body.status === "frozen") {
-    setStatus("");
-    showFrozen(body);
+  if (body.status === "blocked") {                 // M5 policy refusal
+    showRefusal("BLOCKED BY POLICY", body.reasons || [],
+      "A policy rule refused this before it could be drafted.");
+    return;
+  }
+  if (body.status === "frozen") {                  // M6 validator freeze
+    showRefusal("FROZEN BY VALIDATOR",
+      (body.validation && body.validation.checks) || body.validation || [],
+      "The independent validator found a mismatch between what you said and "
+      + "what was drafted. This draft cannot be signed.");
     return;
   }
 
-  CURRENT.plan = body.plan;
-  CURRENT.answers = {};
-  setStatus("");
-  renderPlan(body.plan);
+  CURRENT.plan = body.resolved_plan;
+  renderPlan(body.resolved_plan);
   document.getElementById("plan").hidden = false;
+  if (body.requires_extra_confirmation) {
+    setStatus("This amount needs an extra out-of-band confirmation.");
+  }
   const btn = document.getElementById("sign");
   btn.disabled = false;
   btn.onclick = onSign;
+}
+
+async function submitTranscript(transcript) {
+  setStatus("Working…");
+  CURRENT.transcript = transcript;
+  handleDraft(await jpost(API + "/api/drafts", {
+    transcript, user_id: DEMO_USER,
+  }));
+}
+
+async function answerClarification(field, choiceId) {
+  setStatus("Working…");
+  handleDraft(await jpost(
+    API + "/api/drafts/" + encodeURIComponent(CURRENT.draftId) + "/clarify",
+    { field, choice_id: choiceId },
+  ));
+}
+
+function showRefusal(title, detail, explanation) {
+  const box = document.getElementById("result");
+  box.replaceChildren();
+  const h = el("h3"); h.textContent = title;
+  const p = el("p"); p.textContent = explanation;
+  const pre = el("pre");
+  pre.textContent = JSON.stringify(detail, null, 2);   // textContent, never innerHTML (H1)
+  box.append(h, p, pre);
+  box.className = "result bad";
+  box.hidden = false;
 }
 
 function renderClarify(body) {
@@ -313,7 +348,7 @@ function renderClarify(body) {
       b.textContent = c.display;                 // textContent: DB-sourced, still never innerHTML
       b.onclick = () => {
         box.hidden = true;
-        submitTranscript(CURRENT.transcript, { ...CURRENT.answers, [body.field]: c.id });
+        answerClarification(body.field, c.id);
       };
       row.append(b);
     }

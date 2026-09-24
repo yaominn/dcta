@@ -28,7 +28,16 @@ from backend.models.schemas import (
 )
 from backend.resolver import Clarify, Resolved, resolve
 
-seed()  # clean mock ledger before the run (matches the other suites)
+
+@pytest.fixture(scope="module", autouse=True)
+def _clean_ledger():
+    """Clean mock ledger for this module.
+
+    This was a module-level `seed()` call, which ran at COLLECTION time — so it
+    wiped the developer's ledger merely for importing the file, even on an
+    unrelated `-k` run. A fixture runs when the tests do, like conftest.py."""
+    seed()
+    yield
 
 
 # --------------------------------------------------------------------------- builders
@@ -124,8 +133,16 @@ def test_3_unknown_payee_clarifies():
     res = resolve(plan, transcript="send fifty to dave", user_id="u_alice")
     assert isinstance(res, Clarify)
     assert "Dave" in res.question
-    assert res.choices == []                          # open question -> re-pipeline, not resume
     assert res.kind == "payee"
+    # A 0-match question is ANSWERABLE: it offers the user's own payees, so the
+    # voice loop can resolve it in one round-trip. It previously returned no
+    # choices and ignored `answers`, so re-parsing the same transcript
+    # reproduced the same 0-match forever.
+    assert {c["id"] for c in res.choices} == {"payee_17", "payee_21", "payee_22", "payee_30"}
+    resumed = resolve(plan, transcript="send fifty to dave", user_id="u_alice",
+                      answers={res.field: "payee_17"})
+    assert isinstance(resumed, Resolved)
+    assert resumed.plan.plan[0].payee_id == "payee_17"
 
 
 # --------------------------------------------------------------------------- 4. company name
@@ -344,3 +361,89 @@ def test_pay_bill_resolves_biller_without_reference_text():
     assert leg.biller_display == "CityGas"           # name only; reference_text absent
     for forbidden in ("ignore previous instructions", "123-456", "Acct 88231"):
         assert forbidden not in leg.biller_display
+
+
+# --------------------------------------------------------------------------- M5 additions
+def test_mentions_normalise_whitespace_punctuation_and_case():
+    """ASR output carries whitespace and punctuation; a real model will too. All
+    of these must reach payee_17 — matching on case alone rejected every one."""
+    for raw in ["mom", "  mom", "mom ", "Mom", "mom.", "Mom,", "\tmom\n", "my mom", "the mom"]:
+        plan = IntentPlan(plan=[TransferIntent(
+            id="t1", type="TRANSFER", source_account=_mention("savings"),
+            target=_mention(raw), amount=_lit(5000))])
+        res = resolve(plan, transcript="pay mom fifty", user_id="u_alice")
+        assert isinstance(res, Resolved), f"{raw!r} did not resolve"
+        assert res.plan.plan[0].payee_id == "payee_17", raw
+
+
+def test_account_phrasing_and_synonyms():
+    """'my savings account' is the natural phrasing; 'investment' is the only word
+    a human would use for the settlement-type account, which was unreachable."""
+    funded = {"savings": "acct_savings", "my savings": "acct_savings",
+              "savings account": "acct_savings", "  Savings. ": "acct_savings",
+              "joint": "acct_joint"}
+    for raw, expected in funded.items():
+        plan = IntentPlan(plan=[TransferIntent(
+            id="t1", type="TRANSFER", source_account=_mention(raw),
+            target=_mention("mom"), amount=_lit(100))])
+        res = resolve(plan, transcript="pay mom", user_id="u_alice")
+        assert isinstance(res, Resolved), f"{raw!r} did not resolve"
+        assert res.plan.plan[0].source_account == expected, raw
+
+    # acct_invest is seeded at 0c, so a debit against it stops at the funds check
+    # — which is itself the proof that the MENTION matched: an unmatched word
+    # would clarify with kind "account", never reach the balance check at all.
+    for raw in ["investment", "invest", "brokerage"]:
+        plan = IntentPlan(plan=[TransferIntent(
+            id="t1", type="TRANSFER", source_account=_mention(raw),
+            target=_mention("mom"), amount=_lit(100))])
+        res = resolve(plan, transcript="pay mom", user_id="u_alice")
+        assert isinstance(res, Clarify) and res.kind == "insufficient", raw
+
+
+def test_default_account_mention_resolves_to_savings():
+    """backend/agent/prompts.py tells the model to emit {"mention":"default"} when
+    the user names no account. That must resolve to the documented default, not
+    dead-end: it is the single most common shape the parser emits."""
+    plan = IntentPlan(plan=[TransferIntent(
+        id="t1", type="TRANSFER", source_account=_mention("default"),
+        target=_mention("mom"), amount=_lit(50000))])
+    res = resolve(plan, transcript="pay mom five hundred", user_id="u_alice")
+    assert isinstance(res, Resolved)
+    # concrete + visible: the overlay renders this, so the default is seen, not silent
+    assert res.plan.plan[0].source_account == "acct_savings"
+
+
+def test_zero_match_answer_still_cannot_inject_an_unjustified_id():
+    """The 0-match path is answerable, but only with an id from the user's OWN
+    list. A payee belonging to nobody must still be refused."""
+    plan = IntentPlan(plan=[TransferIntent(
+        id="t1", type="TRANSFER", source_account=_mention("savings"),
+        target=_mention("Dave"), amount=_lit(5000))])
+    res = resolve(plan, transcript="send fifty to dave", user_id="u_alice",
+                  answers={"t1.target": "payee_99"})
+    assert isinstance(res, Clarify)
+
+
+def test_resolve_accepts_an_isolated_db(tmp_path):
+    """db_path targets a tmp ledger, as tests/test_gateway.py does. Without it a
+    resolver test can only run against the developer's real DB."""
+    db = tmp_path / "ledger.db"
+    seed(db)
+    plan = IntentPlan(plan=[TransferIntent(
+        id="t1", type="TRANSFER", source_account=_mention("savings"),
+        target=_mention("mom"), amount=_lit(50000))])
+    res = resolve(plan, transcript="pay mom five hundred", user_id="u_alice", db_path=db)
+    assert isinstance(res, Resolved)
+    assert res.plan.plan[0].payee_id == "payee_17"
+
+
+def test_clarify_question_reads_correctly_aloud():
+    """N1: 'I don't have a account called ...' is spoken in the demo."""
+    plan = IntentPlan(plan=[TransferIntent(
+        id="t1", type="TRANSFER", source_account=_mention("zzz"),
+        target=_mention("mom"), amount=_lit(5000))])
+    res = resolve(plan, transcript="x", user_id="u_alice")
+    assert isinstance(res, Clarify)
+    assert "a account" not in res.question
+    assert "an account" in res.question

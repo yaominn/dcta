@@ -12,6 +12,8 @@ Walks the module import graph and enforces every trust boundary:
     or backend/auth/ is a violation (M6) — the validator is read-only by
     construction: it can freeze a draft, never execute one. CI checks that rather
     than the docstring asserting it.
+  - any module under backend/policy/ that transitively imports backend/agent/
+    is a violation (M5) — a risk decision must have no path to the LLM.
 
 Pure static AST analysis (no modules imported/executed, so no side effects).
 Runs in CI.
@@ -23,7 +25,8 @@ Real tests, not a trivially-green stub:
      flagged                                                              follows edges)
   4. a planted resolver->agent forbidden import is flagged (M4)         (proves the new
                                                                          boundary catches)
-  5. clean agent->resolver and resolver->data imports stay green        (proves it doesn't
+  5. a planted policy->agent forbidden import is flagged (M5)           (same, for policy)
+  6. clean agent->resolver and resolver->data imports stay green        (proves it doesn't
                                                                          false-fire)
   6. a planted validator->gateway forbidden import is flagged (M6)      (proves the new
                                                                          boundary catches)
@@ -46,12 +49,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #     code path to execution or signing keys)
 #   - resolver must not reach agent/             (M4: the resolver is LLM-free by
 #     construction; "deterministic" is enforced, not asserted)
+#   - policy  must not reach agent/              (M5: a risk decision must have
+#     no path to the LLM — deterministic means deterministic)
 #   - validator must not reach gateway/ or auth/  (M6: the validator is read-only
 #     by construction — it can freeze a draft, never execute one. Enforced, not
 #     asserted in a docstring.)
 BOUNDARIES = [
     ("backend.agent", ("backend.gateway", "backend.auth")),
     ("backend.resolver", ("backend.agent",)),
+    ("backend.policy", ("backend.agent",)),
     ("backend.validator", ("backend.gateway", "backend.auth")),
 ]
 
@@ -261,6 +267,24 @@ def test_planted_validator_gateway_violation_is_flagged(tmp_path):
     ), v
 
 
+def test_planted_policy_agent_violation_is_flagged(tmp_path):
+    """M5: the policy engine must not reach the agent. A risk decision that could
+    consult the LLM is not a deterministic risk decision. Proves the boundary
+    catches, so "no LLM in policy/" is CI-checked rather than asserted."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/agent/__init__.py": "",
+        "backend/policy/__init__.py": "",
+        "backend/policy/evil.py": "from backend.agent import parse_transcript\n",
+    })
+    v = find_violations(root)
+    assert any(
+        x["root"].startswith("backend.policy")
+        and x["reaches"].startswith("backend.agent")
+        for x in v
+    ), v
+
+
 def test_planted_validator_auth_violation_is_flagged(tmp_path):
     """The validator must not reach auth/ either — no code path to signing keys."""
     root = _make_repo(tmp_path, {
@@ -287,5 +311,20 @@ def test_clean_validator_passes(tmp_path):
         "backend/validator/clean.py": "import backend.data\nimport backend.audit\n",  # allowed
         "backend/data/__init__.py": "",
         "backend/audit/__init__.py": "",
+    })
+    assert find_violations(root) == []
+
+
+def test_clean_policy_passes(tmp_path):
+    """policy -> data / models / display are all allowed; only agent is forbidden."""
+    root = _make_repo(tmp_path, {
+        "backend/__init__.py": "",
+        "backend/policy/__init__.py": "",
+        "backend/policy/engine.py": "import backend.models.schemas\n",
+        "backend/policy/context.py": "import backend.data.db\n",
+        "backend/models/__init__.py": "",
+        "backend/models/schemas.py": "",
+        "backend/data/__init__.py": "",
+        "backend/data/db.py": "",
     })
     assert find_violations(root) == []

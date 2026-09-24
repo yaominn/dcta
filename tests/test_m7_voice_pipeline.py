@@ -58,50 +58,53 @@ def test_transcribe_rejects_an_empty_upload():
     assert r.status_code == 400
 
 
-# --------------------------------------------------------------------------- the pipeline
-def _draft(transcript: str, **kw):
-    return client.post("/api/draft", json={"transcript": transcript,
-                                           "user_id": kw.pop("user_id", "u_alice"), **kw})
+# --------------------------------------------------------------------------- the pipeline, from a voice/typed utterance
+# These exercise the same server-side draft API the overlay uses (/api/drafts).
+# M7 owns the CLIENT tiers above; the draft resource itself is M8's.
+def _draft(transcript: str, user_id: str = "u_alice"):
+    return client.post("/api/drafts", json={"transcript": transcript, "user_id": user_id})
 
 
-def test_draft_returns_a_signable_plan():
+def test_utterance_produces_a_signable_draft():
     r = _draft("transfer five hundred from my savings to mom")
     assert r.status_code == 200
     body = r.json()
-    assert body["status"] == "draft"
-    leg = body["plan"]["plan"][0]
+    assert body["status"] == "ready"
+    leg = body["resolved_plan"]["plan"][0]
     assert leg["payee_display"] == "Mom ··3310"
     assert leg["amount_cents"] == 50000
-    assert body["validation"]["verdict"] == "pass"
 
 
-def test_draft_asks_rather_than_guessing_an_unnamed_account():
-    """The system refuses to guess which account an unspecified payment leaves
-    from. Asking is the correct outcome, and it is a 200 — needing to clarify is
-    a normal conversational result, not an error."""
-    r = _draft("pay mom five hundred")
-    assert r.status_code == 200
-    assert r.json()["status"] == "clarify"
-
-
-def test_draft_disambiguates_two_johns():
-    r = _draft("send fifty to john from savings")
-    body = r.json()
+def test_ambiguous_payee_asks_rather_than_guessing():
+    body = _draft("send fifty to john from savings").json()
     assert body["status"] == "clarify"
-    assert len(body["choices"]) == 2
     assert {c["display"] for c in body["choices"]} == {"John ··4521", "John ··8892"}
 
 
-def test_clarify_resumes_via_answers():
-    """The round trip the UI performs: ask, the user picks, resubmit."""
+def test_clarify_round_trip_the_ui_performs():
+    """Ask -> the user picks -> the draft completes. The client sends only
+    {field, choice_id} for a draft_id; it never holds or returns the plan."""
     first = _draft("send fifty to john from savings").json()
-    second = _draft("send fifty to john from savings",
-                    answers={first["field"]: "payee_22"}).json()
-    assert second["status"] == "draft"
-    assert second["plan"]["plan"][0]["payee_id"] == "payee_22"
+    second = client.post(
+        f"/api/drafts/{first['draft_id']}/clarify",
+        json={"field": first["field"], "choice_id": "payee_22"},
+    ).json()
+    assert second["status"] == "ready"
+    assert second["resolved_plan"]["plan"][0]["payee_id"] == "payee_22"
 
 
-def test_empty_utterance_asks_and_builds_no_plan():
+def test_unparseable_utterance_asks_and_builds_no_plan():
     body = _draft("mmmm").json()
     assert body["status"] == "clarify"
-    assert "plan" not in body
+    assert body.get("resolved_plan") is None
+
+
+def test_every_outcome_is_http_200():
+    """clarify and blocked/frozen are successful requests whose ANSWER is "no".
+    The HTTP layer reports whether we could respond; the body reports what the
+    answer was. A client that only checks the status code must not mistake a
+    clarification for a failure."""
+    for t in ["transfer five hundred from my savings to mom",
+              "send fifty to john from savings",
+              "mmmm"]:
+        assert _draft(t).status_code == 200

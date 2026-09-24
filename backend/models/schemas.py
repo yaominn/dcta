@@ -234,7 +234,13 @@ class ResolvedBuyEquity(BaseModel):
     type: Literal["BUY_EQUITY"] = "BUY_EQUITY"
     source_account: str
     ticker: str
-    amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)            # dollars allocated, in cents
+    # The SPEND (estimated_shares * estimated_fill_price_cents), NOT the dollars
+    # allocated. The user signs what actually moves: allocating 792050c buys 32
+    # whole shares for 772800c and leaves 19250c in the source account, so the
+    # signed, executed and displayed amount must be 772800. The executor debits
+    # this field directly. (Comment corrected in M5 to match the M4 resolver;
+    # flagged as a frozen-contract clarification, not a shape change.)
+    amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)
     estimated_shares: int      # WHOLE shares only (floor) -> the demo's 32 shares
     estimated_fill_price_cents: int             # per-share price, in cents
 
