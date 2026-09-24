@@ -257,6 +257,14 @@ while the policy engine **blocks** at the gateway. Both boundaries are now
 CI-checked in `tests/test_import_boundary.py` — `policy` cannot reach `agent`,
 `validator` cannot reach `gateway` or `auth`. Full suite: 209 passed.
 
+**Every executed leg counts toward the limits, not just transfers.**
+`transaction_history.payee_id` is nullable and a `leg_type` column says what
+moved. While payee_id was `NOT NULL` the executor could record transfers only,
+so a $19,000 equity purchase left no trace and "daily limit" silently meant
+"daily TRANSFER limit" — a user could exceed it by mixing leg types across
+drafts. The anomaly rule still matches on `payee_id`, so payee-less rows cannot
+pollute a per-payee baseline.
+
 ## M6 — Independent validation agent
 
 `backend/validator/validate()` is a second, **read-only** audit of a resolved
@@ -523,6 +531,27 @@ dcta/
 5. **Injection via voice** — spoken attack → at most a draft, flagged, declined.
 6. **Rogue agent** — direct gateway call without a signature → rejected.
 7. **Audit** — tamper with a log entry → `verify_chain()` pinpoints it.
+
+Two more that the brief did not ask for, and that are the strongest things we
+can show — both attack **our own code**, not the model:
+
+8. **Skipping the UI** — an attacker assembles a $20,000.01 payload, signs it
+   validly, and posts it straight to the gateway, never touching the overlay
+   that shows policy. The gateway re-runs policy before executing, so a limit
+   checked only on the way to the UI is not a limit.
+9. **A compromised resolver** — not the LLM: the *resolver* is subverted and
+   swaps the beneficiary after parsing. The independent validator recomputes
+   from the transcript, freezes the draft, and a frozen draft receives no nonce
+   — so it is unsignable, not merely labelled frozen.
+
+All nine are executable, not slideware:
+
+```bash
+python -m backend.redteam        # runs every scenario against the real pipeline
+```
+
+It exits non-zero if any property fails, and `tests/test_redteam.py` asserts
+each one, so a regression breaks CI rather than surfacing on stage.
 
 ## Honest limitations (stated in the pitch, not hidden)
 

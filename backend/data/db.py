@@ -69,7 +69,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS transaction_history (
             id        INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id   TEXT NOT NULL REFERENCES users(id),
-            payee_id  TEXT NOT NULL REFERENCES payees(id),
+            -- NULLABLE on purpose. Only a TRANSFER has a payee; a bill payment
+            -- or an equity purchase does not. While this was NOT NULL the
+            -- executor could only record transfers, so a $19,000 share purchase
+            -- was invisible to the daily limit and "daily limit" silently meant
+            -- "daily TRANSFER limit". Every leg that moves money is recorded now.
+            payee_id  TEXT REFERENCES payees(id),
+            leg_type  TEXT NOT NULL DEFAULT 'TRANSFER',   -- TRANSFER | PAY_BILL | BUY_EQUITY
             amount    INTEGER NOT NULL,               -- cents (int minor units; never float)
             ts        TEXT NOT NULL                   -- ISO-8601
         );

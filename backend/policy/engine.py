@@ -197,11 +197,13 @@ def check_velocity(leg: Any, ctx: PolicyContext, recent_count: int) -> Verdict |
 def check_anomaly(leg: Any, ctx: PolicyContext) -> Verdict | None:
     """Flag an amount far above what this user normally sends this payee.
 
-    ESCALATES, never blocks: the user confirms. Applies to TRANSFER only —
-    ResolvedPayBill and ResolvedBuyEquity carry no payee_id, and
-    transaction_history cannot represent them (its payee_id is NOT NULL and
-    foreign-keys to payees), so there is no per-counterparty baseline to compare
-    against. Stated rather than silently skipped."""
+    ESCALATES, never blocks: the user confirms. Applies to TRANSFER only, and
+    for a reason that survives the widened history: a bill payment or an equity
+    purchase has no payee, so there is no per-counterparty baseline to compare
+    an amount against. Non-transfer legs ARE recorded now (they count toward the
+    daily and velocity rules) — they simply carry payee_id NULL, and the filter
+    below matches on payee_id, so they cannot pollute a per-payee median.
+    Stated rather than silently skipped."""
     if not _is_transfer(leg):
         return None
     amounts = [int(h["amount"]) for h in ctx.history

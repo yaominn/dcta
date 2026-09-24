@@ -16,7 +16,7 @@ from backend.policy.engine import PolicyContext
 
 
 def load_context(user_id: str, *, db_path=None, now: int | None = None) -> PolicyContext:
-    """Fetch the user row, the limits table and this user's transfer history.
+    """Fetch the user row, the limits table and this user's money-movement history.
 
     History is the WHOLE of transaction_history for the user, not just today's:
     the daily rule needs today's rows and the anomaly rule needs the long-run
@@ -26,7 +26,7 @@ def load_context(user_id: str, *, db_path=None, now: int | None = None) -> Polic
         user_row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
         limits = {r["key"]: r["value"] for r in conn.execute("SELECT * FROM limits")}
         history = [dict(r) for r in conn.execute(
-            "SELECT payee_id, amount, ts FROM transaction_history WHERE user_id=?",
+            "SELECT payee_id, leg_type, amount, ts FROM transaction_history WHERE user_id=?",
             (user_id,))]
     finally:
         conn.close()

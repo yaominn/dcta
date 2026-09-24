@@ -41,7 +41,6 @@ class MockExecutor:
                 try:
                     if leg.type == "TRANSFER":
                         self._debit(conn, leg.source_account, leg.amount_cents)
-                        self._record_transfer(conn, leg)
                         # MOCK: external payee credit not modeled in the seed ledger.
                     elif leg.type == "PAY_BILL":
                         self._debit(conn, leg.source_account, leg.amount_cents)
@@ -50,6 +49,9 @@ class MockExecutor:
                         # MOCK: whole shares would settle into acct_invest (M4 resolves the count).
                     else:  # pragma: no cover - schema-constrained, unreachable
                         raise RuntimeError(f"unknown intent type {leg.type}")
+                    # Recorded here, after the switch, so every executed leg
+                    # lands in history exactly once — not only transfers.
+                    self._record_leg(conn, leg)
                     results.append({"id": leg.id, "type": leg.type,
                                     "status": "EXECUTED", "amount_cents": leg.amount_cents})
                 except Exception as exc:
@@ -62,19 +64,27 @@ class MockExecutor:
         return {"draft_id": plan.draft_id, "legs": results,
                 "status": "FAILED" if aborted else "EXECUTED"}
 
-    def _record_transfer(self, conn, leg) -> None:
-        """Append the executed transfer to transaction_history, so the M5 daily
-        and velocity rules see payments that actually happened. The user is read
-        from the debited account rather than taken on trust."""
+    def _record_leg(self, conn, leg) -> None:
+        """Append EVERY executed leg to transaction_history, so the M5 daily and
+        velocity rules see all the money that actually moved.
+
+        This used to record transfers only, because payee_id was NOT NULL. The
+        effect was that a $19,000 equity purchase left no trace and "daily
+        limit" silently meant "daily TRANSFER limit" — a user could exceed it by
+        mixing leg types across drafts. payee_id is nullable now and leg_type
+        says what moved; the anomaly rule still matches on payee_id, so rows
+        without one cannot pollute a per-payee baseline.
+
+        The user is read from the debited account rather than taken on trust."""
         row = conn.execute("SELECT user_id FROM accounts WHERE id=?",
                            (leg.source_account,)).fetchone()
         if row is None:  # pragma: no cover - _debit already raised
             return
         conn.execute(
-            "INSERT INTO transaction_history (user_id, payee_id, amount, ts) "
-            "VALUES (?,?,?,?)",
-            (row["user_id"], leg.payee_id, leg.amount_cents,
-             datetime.now(timezone.utc).isoformat()),
+            "INSERT INTO transaction_history (user_id, payee_id, leg_type, amount, ts) "
+            "VALUES (?,?,?,?,?)",
+            (row["user_id"], getattr(leg, "payee_id", None), leg.type,
+             leg.amount_cents, datetime.now(timezone.utc).isoformat()),
         )
 
     def _debit(self, conn, account_id: str, amount_cents: int) -> None:

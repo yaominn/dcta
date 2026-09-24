@@ -95,8 +95,10 @@ def seed(db_path: Path = DB_PATH) -> None:
         conn.executemany("INSERT INTO equities VALUES (?,?)", EQUITIES)
         conn.executemany("INSERT INTO limits VALUES (?,?)",
                          [(k, v) for k, v in LIMITS.items()])
-        conn.executemany("INSERT INTO transaction_history (user_id, payee_id, amount, ts) VALUES (?,?,?,?)",
-                         _history_rows())
+        conn.executemany(
+            "INSERT INTO transaction_history (user_id, payee_id, leg_type, amount, ts) "
+            "VALUES (?,?,'TRANSFER',?,?)",
+            _history_rows())
         conn.commit()
     finally:
         conn.close()

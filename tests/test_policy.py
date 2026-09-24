@@ -29,6 +29,7 @@ from backend.models.schemas import (
     ResolvedBuyEquity, ResolvedPayBill, ResolvedPlan, ResolvedTransfer,
 )
 from backend.policy import (
+    check_anomaly,
     Decision, PolicyContext, evaluate, load_context, owner_of,
 )
 
@@ -313,3 +314,67 @@ def test_executed_transfer_is_recorded_in_history(tmp_path):
     _submit(gw, signer, _plan(_transfer(50000), draft_id="ok"))
     after = load_context("u_alice", db_path=db)
     assert len(after.history) == len(before.history) + 1
+
+
+# --------------------------------------------------------------------------- F1: every executed leg counts
+def test_non_transfer_legs_count_toward_the_daily_limit(tmp_path):
+    """F1 regression. transaction_history.payee_id was NOT NULL, so the executor
+    could only record transfers: a $19,000 equity purchase left no trace and
+    "daily limit" silently meant "daily TRANSFER limit". A user could exceed the
+    daily limit by mixing leg types across drafts.
+
+    Every executed leg is recorded now — payee_id nullable, leg_type saying what
+    moved — so the daily total reflects all the money that actually left."""
+    from datetime import datetime, timezone
+
+    from backend.data.db import connect
+    from backend.data.seed import seed
+    from backend.gateway.executor import MockExecutor
+    from backend.models.schemas import ResolvedBuyEquity, ResolvedPayBill
+
+    db = tmp_path / "dcta.db"
+    seed(db)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def todays_total() -> int:
+        ctx = load_context(user_id="u_alice", db_path=db, now=_NOW)
+        return sum(int(h["amount"]) for h in ctx.history if h["ts"][:10] == today)
+
+    before = todays_total()
+    result = MockExecutor(db).execute(_plan(
+        ResolvedBuyEquity(id="t1", source_account="acct_savings", ticker="AAPL",
+                          amount_cents=241_500, estimated_shares=10,
+                          estimated_fill_price_cents=24_150),
+        ResolvedPayBill(id="t2", source_account="acct_savings", biller_id="biller_03",
+                        biller_display="SP Group", amount_cents=12_345),
+    ))
+    assert result["status"] == "EXECUTED"
+
+    rows = [dict(r) for r in connect(db).execute(
+        "SELECT leg_type, payee_id, amount FROM transaction_history "
+        "ORDER BY id DESC LIMIT 2")]
+    assert {r["leg_type"] for r in rows} == {"BUY_EQUITY", "PAY_BILL"}
+    assert all(r["payee_id"] is None for r in rows), "no payee on a non-transfer leg"
+
+    assert todays_total() == before + 241_500 + 12_345
+
+
+def test_payee_less_rows_cannot_pollute_the_anomaly_baseline(tmp_path):
+    """The other half of F1. The anomaly rule compares against this user's
+    history WITH THIS PAYEE. Rows carrying payee_id NULL must not enter that
+    median, or a big equity purchase would make a large transfer look normal."""
+    from backend.data.seed import seed
+    from backend.gateway.executor import MockExecutor
+    from backend.models.schemas import ResolvedBuyEquity
+
+    db = tmp_path / "dcta.db"
+    seed(db)
+    MockExecutor(db).execute(_plan(
+        ResolvedBuyEquity(id="t1", source_account="acct_savings", ticker="AAPL",
+                          amount_cents=241_500, estimated_shares=10,
+                          estimated_fill_price_cents=24_150)))
+
+    ctx = load_context(user_id="u_alice", db_path=db, now=_NOW)
+    # $5,000 to a payee whose history is all $50 must still escalate.
+    verdict = check_anomaly(_transfer(500_000, payee="payee_21", display="John ··4521"), ctx)
+    assert verdict is not None and verdict.rule == "anomaly"
