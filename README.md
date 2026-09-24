@@ -16,10 +16,34 @@ fully compromised, the worst outcome is a wrong draft the user sees and
 declines. The security property does not depend on model behaviour and does
 not degrade when the model does.
 
+## Prerequisites
+
+Three things, two of which `pip` cannot install for you. **All three team
+members need all three**, or parts of the test suite will error rather than
+skip.
+
+| | Why | Install |
+|---|---|---|
+| Python 3.11+ | everything | already have it |
+| **Node.js** | `tests/test_js_canonicalizer.py` runs `frontend/canonical.js` and proves it is byte-identical to Python's canonicalizer | `brew install node` |
+| **Playwright Chromium** | `tests/test_e2e_webauthn.py` drives a virtual authenticator through the real WebAuthn ceremony | `playwright install chromium` (after `pip install`) |
+
+Without Node, three cross-language canonicalization tests fail with
+`FileNotFoundError: 'node'`. Without the Chromium download, the end-to-end
+WebAuthn test fails with `Executable doesn't exist`. Neither is optional: they
+cover the two properties the security model rests on — that what the browser
+displays is what it hashes, and that a real biometric assertion is what
+authorizes execution.
+
 ## Quick start
 
 ```bash
+# one-time setup
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+playwright install chromium          # browser binaries for the e2e test
+brew install node                    # for the cross-language canonicalizer test
 
 # seed the mock ledger (brief Section 13)
 python -m backend.data.seed
@@ -33,6 +57,11 @@ uvicorn backend.main:app --reload
 # run the tests
 pytest -q
 ```
+
+> **Use `localhost`, never `127.0.0.1`.** WebAuthn binds credentials to the RP
+> ID, which defaults to `localhost` (`WEBAUTHN_RP_ID`). Reaching the app at
+> `127.0.0.1:8000` lets registration succeed and then makes signing fail with
+> an unhelpful error.
 
 ## Credentials (for when we go live — NOT needed for M0)
 
