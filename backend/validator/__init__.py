@@ -370,6 +370,20 @@ def _check_beneficiary(rleg, transcript: str, conn) -> dict:
 
 
 # --------------------------------------------------------------------------- source account (soft, §4.3)
+# Words a user says for each account type. Kept HERE rather than imported from
+# the resolver, like the validator's number words: its checks are its own code.
+# Deliberately NARROWER than the resolver's synonyms: this is a tripwire for a
+# model inventing the source account, so a word that also appears in ordinary
+# requests ("invest $100 in apple", "trading", "current", "everyday") would
+# satisfy it without the user naming any account. The demo shows the joint
+# account as "Spending".
+_ACCOUNT_WORDS = {
+    "savings": ("savings", "saving"),
+    "joint": ("joint", "spending"),
+    "settlement": ("settlement", "investment", "investments", "brokerage"),
+}
+
+
 def _check_source_account(rleg, transcript: str, conn) -> dict:
     """The resolved source_account's TYPE must be mentioned. Lenient tripwire
     for gross divergence (the model inventing a leg), not a grammar test."""
@@ -381,9 +395,11 @@ def _check_source_account(rleg, transcript: str, conn) -> dict:
         return {"check": name, "leg": rleg.id,
                 "outcome": "warn", "detail": "unknown source account"}
     acct_type = row["type"]
-    if _word_in(acct_type, transcript):
+    said = next((w for w in _ACCOUNT_WORDS.get(acct_type, (acct_type,))
+                 if _word_in(w, transcript)), None)
+    if said:
         return {"check": name, "leg": rleg.id, "outcome": "pass",
-                "detail": f"{acct_type!r} mentioned"}
+                "detail": f"{acct_type!r} mentioned (as {said!r})"}
     return {"check": name, "leg": rleg.id, "outcome": "warn",
             "detail": f"{acct_type!r} not mentioned (soft)"}
 

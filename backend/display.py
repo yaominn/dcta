@@ -18,10 +18,17 @@ def cents_to_display(cents: int) -> str:
     return f"{sign}{dollars:,}.{remaining:02d}"
 
 
+# What each account is CALLED to the user. The demo presents the joint account
+# as the everyday "Spending" account. Mirrors ACCOUNT_LABELS in frontend/app.js:
+# the card, the balance panel, the phone's confirmation message and the
+# resolver's questions must never call one account two different things.
+ACCOUNT_NAMES = {"savings": "Savings", "joint": "Spending", "invest": "Investments"}
+
+
 def account_label(account_id: str) -> str:
-    """'acct_savings' -> 'Savings'. Mirrors acctLabel() in frontend/app.js."""
+    """'acct_savings' -> 'Savings', 'acct_joint' -> 'Spending'."""
     name = account_id[5:] if account_id.startswith("acct_") else account_id
-    return name[:1].upper() + name[1:]
+    return ACCOUNT_NAMES.get(name) or name[:1].upper() + name[1:]
 
 
 def plan_summary(plan) -> str:

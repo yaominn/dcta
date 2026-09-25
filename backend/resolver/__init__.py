@@ -46,7 +46,7 @@ from typing import Any, Callable
 
 from backend.audit.canonical import hash_transcript
 from backend.data.db import connect, get_conn
-from backend.display import cents_to_display
+from backend.display import account_label, cents_to_display
 from backend.models.schemas import (
     MAX_AUTH_WINDOW_S,
     AmountOp,
@@ -100,6 +100,11 @@ ACCOUNT_TYPE_SYNONYMS: dict[str, str] = {
     "trading": "settlement",
     "current": "joint",
     "checking": "joint",
+    # The demo presents the joint account as the everyday "Spending" account
+    # (frontend ACCOUNT_LABELS), so the words on screen must resolve to it.
+    "spending": "joint",
+    "everyday": "joint",
+    "saving": "savings",
 }
 
 # backend/agent/prompts.py instructs the model: "source_account is the account
@@ -478,6 +483,15 @@ def _match(rows: list, mention: str, key: str, synonyms: dict[str, str] | None =
     norm = _normalize(mention)
     if synonyms:
         norm = synonyms.get(norm, norm)
+        keys = {_normalize(str(r[key])) for r in rows}
+        if norm not in keys:
+            # Several words, all naming the SAME account ("everyday spending"):
+            # use it. Words naming different accounts ("joint savings") match
+            # nothing, so the caller asks — never a guess between two accounts.
+            named = {synonyms.get(t, t) for t in norm.split()
+                     if t in synonyms or t in keys}
+            if len(named) == 1:
+                norm = named.pop()
     return [r for r in rows if _normalize(str(r[key])) == norm]
 
 
@@ -503,7 +517,8 @@ def _resolve_account(conn, mention, user_id, answers, field, resume):
 
     return _pick(
         matched, mention, "account", field, resume, answers,
-        display=lambda r: f"{r['type']} ({cents_to_display(r['balance'])})",
+        # Named as the page names it (backend/display.py), not by raw type.
+        display=lambda r: f"{account_label(r['id'])} ({cents_to_display(r['balance'])})",
         value=lambda r: r["id"],
         ident=lambda r: r["id"],
         fallback=rows,

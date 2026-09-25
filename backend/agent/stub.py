@@ -22,6 +22,7 @@ import json
 import re
 
 from backend.agent import prompts
+from backend.resolver import ACCOUNT_TYPE_SYNONYMS
 
 
 class StubProvider:
@@ -179,6 +180,15 @@ def _find_source_account(clause: str, account_types: list[str]) -> str:
         for t in account_types:
             if re.search(r"\b" + re.escape(t) + r"\b", words, re.I):
                 return t
+        # The user NAMED an account by a word the context has no type for ("my
+        # spending account", "from invest"): pass their words through, as the
+        # real model does (prompt rule 5: "the account the user named"), and
+        # let the resolver map it. The words come FROM the resolver's own map,
+        # so the two cannot drift. A bare "my account" names nothing and still
+        # means the default.
+        if any(re.search(r"\b" + re.escape(w) + r"\b", words, re.I)
+               for w in ACCOUNT_TYPE_SYNONYMS):
+            return words
     for t in account_types:  # "savings account", "my joint"
         if re.search(r"\b" + re.escape(t) + r"\b", clause, re.I):
             return t

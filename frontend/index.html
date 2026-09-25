@@ -47,6 +47,18 @@
           </div>
         </header>
 
+        <!-- Live balances, read from the ledger — so the demo can say "from my
+             savings" and the audience sees the money leave. Refreshed on load,
+             after every executed payment, and when the tab regains focus. -->
+        <section id="balances" class="balances" aria-label="Account balances">
+          <div class="bal"><span class="bal-name">Savings</span><span id="bal-savings" class="bal-amt">—</span></div>
+          <div class="bal"><span class="bal-name">Spending</span><span id="bal-joint" class="bal-amt">—</span></div>
+        </section>
+
+        <!-- The drop-down notification after a payment goes through. Built with
+             textContent only; announced to screen readers via role=status. -->
+        <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
         <!-- The conversation. Every value from the server is set with
              textContent (never innerHTML), and a payment is rendered as a
              FIXED-TEMPLATE card from the ResolvedPlan JSON — never from

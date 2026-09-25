@@ -74,6 +74,12 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             #    used deliberately — it is the one that must ALWAYS work, and
             #    it exercises parse -> resolve -> validate -> overlay without
             #    depending on a microphone in CI.
+            # 1b. the balance panel shows the ledger's balances before anything moves.
+            page.wait_for_function(
+                "document.getElementById('bal-savings').textContent === '$8,420.50'",
+                timeout=10000)
+            assert page.inner_text("#bal-joint") == "$1,200.00"
+
             page.fill("#say", "transfer five hundred from my savings to mom")
             page.click("#say-form button[type=submit]")
             page.wait_for_selector(
@@ -103,6 +109,33 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             assert savings["balance"] == 792050, (
                 f"savings should be 792050 after $500 debit, got {savings['balance']}"
             )
+
+            # 5b. what the demo SHOWS: the drop-down notification says who got
+            #     how much from which account, and the balance panel follows
+            #     the ledger — read from it, not computed by the page.
+            page.wait_for_selector("#toast.show", timeout=5000)
+            toast = page.inner_text("#toast")
+            assert "Transfer successful" in toast, toast
+            assert "$500.00 to Mom" in toast and "from Savings" in toast, toast
+            page.wait_for_function(
+                "document.getElementById('bal-savings').textContent === '$7,920.50'",
+                timeout=10000)
+
+            # 5c. the demo sentence: "from my spending account" debits the
+            #     joint account, shown as Spending on the card, the
+            #     notification and the panel.
+            page.fill("#say", "send mom twenty dollars from my spending account")
+            page.click("#say-form button[type=submit]")
+            page.wait_for_selector("#sign:not([disabled])", state="visible", timeout=30000)
+            assert "from Spending" in page.inner_text("#legs"), page.inner_text("#legs")
+            page.click("#sign")
+            page.wait_for_function(
+                "document.getElementById('toast').textContent.includes('from Spending')",
+                timeout=20000)
+            assert "$20.00 to Mom" in page.inner_text("#toast")
+            page.wait_for_function(
+                "document.getElementById('bal-joint').textContent === '$1,180.00'",
+                timeout=10000)
 
             # 6. the hash-chained audit log verifies end to end.
             verify = requests.get(server_url + "/api/audit/verify", timeout=5).json()

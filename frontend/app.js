@@ -230,12 +230,17 @@ function retireLiveCard() {
 /* The payment card is the one surface we tell the user to trust, so it must
    not show database internals. These are pure, deterministic transforms of
    the SIGNED payload — no extra inputs, no new trust surface (brief 4.2). */
+// Display names for the account id suffixes. The joint account is presented
+// as the everyday "Spending" account. Mirrors ACCOUNT_NAMES in
+// backend/display.py (the phone message and the resolver's questions); the
+// resolver understands "spending" as it (ACCOUNT_TYPE_SYNONYMS).
+const ACCOUNT_LABELS = { savings: "Savings", joint: "Spending", invest: "Investments" };
 function acctLabel(id) {
   // "acct_savings" -> "Savings". Deterministic and local; falls back to the
   // raw id rather than inventing a name it cannot derive.
   const m = /^acct_(.+)$/.exec(id || "");
   if (!m) return id || "";
-  return m[1].charAt(0).toUpperCase() + m[1].slice(1);
+  return ACCOUNT_LABELS[m[1]] || m[1].charAt(0).toUpperCase() + m[1].slice(1);
 }
 function windowLabel(created, expires) {
   // Unix seconds are correct in the payload and meaningless on screen.
@@ -450,6 +455,7 @@ function newResultCard(ok) {
 // A repeat of a draft that already ran. Not a failure: the one real execution
 // is shown, stated as such, so a retry after a lost response ends in the truth.
 function showAlreadySent(res) {
+  refreshBalances();          // money did move — possibly just now, in a race
   const exec = res.json.execution || {};
   const card = newResultCard(exec.status !== "FAILED");
   card.append(el("h3", null, "ALREADY SENT"));
@@ -473,9 +479,115 @@ function showAlreadySent(res) {
   card.append(ul);
 }
 
+/* ---------- balances + the drop-down notification ---------- */
+// Read from the ledger, never computed here: the panel shows what the bank
+// holds, so a payment that failed can't make it look like money moved.
+// Several refreshes can be in flight (focus fires as the biometric sheet
+// closes, just before the post-payment refresh): only the NEWEST request may
+// write, or a pre-payment read landing last would show the old balance.
+let balanceSeq = 0;
+async function refreshBalances() {
+  const mine = ++balanceSeq;
+  let rows;
+  try {
+    rows = (await jget(API + "/api/seed/accounts?user_id=" + DEMO_USER)).accounts || [];
+  } catch (_) {
+    return;                           // a missing panel value is not worth an error
+  }
+  if (mine !== balanceSeq) return;    // a newer refresh was started; it wins
+  for (const a of rows) {
+    const n = document.getElementById("bal-" + String(a.id).replace(/^acct_/, ""));
+    if (!n) continue;
+    const text = centsToDisplay(a.balance);
+    if (n.textContent !== text && n.textContent !== "—") {
+      n.classList.add("changed");
+      setTimeout(() => n.classList.remove("changed"), 1500);
+    }
+    n.textContent = text;
+  }
+}
+
+// One line per leg that actually ran, from the executor's result joined to the
+// signed plan by leg id — the same trusted surface as the payment card.
+function executedLines(exec, plan) {
+  const byId = Object.fromEntries(((plan && plan.plan) || []).map((l) => [l.id, l]));
+  const lines = [];
+  for (const leg of exec.legs || []) {
+    if (leg.status !== "EXECUTED") continue;
+    const p = byId[leg.id] || {};
+    const amount = centsToDisplay(leg.amount_cents);
+    const from = p.source_account ? " · from " + acctLabel(p.source_account) : "";
+    if (leg.type === "TRANSFER") lines.push(amount + " to " + (p.payee_display || "payee") + from);
+    else if (leg.type === "PAY_BILL") lines.push(amount + " to " + (p.biller_display || "biller") + from);
+    else if (leg.type === "BUY_EQUITY") lines.push(amount + " of " + (p.ticker || "shares") + from);
+  }
+  return lines;
+}
+
+let toastTimer = null;     // auto-hide after 5s
+let toastHideTimer = null; // display:none once the slide-up has finished
+function showToast(title, lines) {
+  const t = document.getElementById("toast");
+  if (!t || !lines.length) return;
+  // A new notification cancels BOTH pending timers — otherwise the previous
+  // one's delayed hidden=true could blank this one moments after it appears.
+  clearTimeout(toastTimer);
+  clearTimeout(toastHideTimer);
+  t.replaceChildren();
+  const body = el("div");
+  body.append(el("p", "toast-title", title));
+  for (const line of lines) body.append(el("p", "toast-line", line));
+  t.append(el("span", "toast-icon", "✓"), body);
+  t.classList.remove("show");
+  t.hidden = false;
+  void t.offsetHeight;       // commit the hidden-state styles, so the slide plays
+  t.classList.add("show");
+  const hide = () => {
+    clearTimeout(toastTimer);
+    t.classList.remove("show");
+    toastHideTimer = setTimeout(() => { t.hidden = true; }, 350);
+  };
+  toastTimer = setTimeout(hide, 5000);
+  t.onclick = hide;
+}
+
+// The notification for an execution result, as data: { title, lines }. Pure,
+// so tests run exactly what the page shows. Announces whatever ACTUALLY ran —
+// including when a later leg failed (status FAILED, earlier legs EXECUTED):
+// money moved, so say so, and say it was partial. A leg that did not run is
+// never listed; nothing ran means no notification.
+function successToast(exec, plan) {
+  if (exec.legs) {
+    const lines = executedLines(exec, plan);
+    if (!lines.length) return { title: "", lines: [] };   // nothing moved: say nothing
+    const total = exec.legs.length;
+    const only = total === 1 ? exec.legs[0].type : null;
+    const title = lines.length < total ? lines.length + " of " + total + " payments sent"
+      : lines.length > 1 ? lines.length + " payments sent"
+      : only === "PAY_BILL" ? "Bill paid"
+      : only === "BUY_EQUITY" ? "Order placed"
+      : "Transfer successful";
+    return { title, lines };
+  }
+  if (exec.status === "UPDATED") {
+    return { title: "Contact updated", lines: (exec.changes || []).map((c) =>
+      c.payee_display + " · " + (c.field === "phone" ? "phone" : "name") + " → " + c.new_value) };
+  }
+  return { title: "", lines: [] };
+}
+
+function announceSuccess(res) {
+  const { title, lines } = successToast(res.json.execution || {}, CURRENT.plan);
+  showToast(title, lines);             // no-op when nothing ran
+}
+
 function showResult(res) {
   if (res.json.rejection === "DUPLICATE") return showAlreadySent(res);
   const ok = !!res.json.accepted;
+  if (ok) {
+    announceSuccess(res);
+    refreshBalances();
+  }
   const exec = res.json.execution || {};
   const status = ok ? (exec.status || "EXECUTED") : res.json.rejection || "REJECTED";
   const card = newResultCard(ok);
@@ -822,6 +934,10 @@ function tickClock() {
 async function init() {
   tickClock();
   setInterval(tickClock, 15000);
+  refreshBalances();
+  // A payment made elsewhere (another tab, the red-team runner) shows up when
+  // the demo window is focused again.
+  window.addEventListener("focus", refreshBalances);
   const [creds, cfg] = await Promise.all([
     jget(API + "/api/auth/credentials?user_id=" + DEMO_USER),
     jget(API + "/api/auth/config").catch(() => ({})),

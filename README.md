@@ -777,6 +777,25 @@ dcta/
 | 8 | Red-team demo + polish | done |
 | 9 | Submission package | **next** — the only milestone left |
 
+## Balances and the payment notification (demo)
+
+The top of the phone screen shows **Savings** and **Spending** balances, read
+from the ledger (`/api/seed/accounts`) — never computed by the page, so a
+payment that failed cannot make money appear to move. They refresh on load,
+after every executed payment, and when the window regains focus.
+
+**Spending is the joint account**, presented as the everyday account. "From my
+spending account" (or "everyday", "current", "joint") debits it: the resolver
+maps the word, the offline stub passes a named account through instead of
+silently choosing savings, and the validator's source-account check accepts it.
+
+After a payment goes through, a notification drops down from the top — *"Transfer
+successful · $50.00 to John ••4521 · from Savings"* — listing only the legs
+that actually executed (a failed leg never appears as sent). Tap to dismiss;
+it hides after five seconds. Contact edits get *"Contact updated"*.
+`tests/test_e2e_webauthn.py` proves the panel, the notification and the
+spending sentence in a real browser.
+
 ## Demo script (brief Section 10)
 
 1. **Happy path** — multi-intent voice command → one overlay → one fingerprint → both legs executed.
