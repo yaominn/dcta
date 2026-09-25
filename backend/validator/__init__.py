@@ -233,11 +233,11 @@ def validate(
             })
         else:
             recomputed = amounts.recompute_symbolic(intent_plan, resolved_plan, conn)
-            clauses = _clauses(transcript)
+            leg_clauses = _match_clauses(intent_plan.plan, transcript)
             resolved_by_id = {leg.id: leg for leg in resolved_plan.plan}
             for i, ileg in enumerate(intent_plan.plan):
                 rleg = resolved_by_id[ileg.id]
-                clause = _clause_for(clauses, i, transcript)
+                clause = leg_clauses[i]
 
                 # --- hard: amount (§4.1) ---
                 checks.append(_check_amount(ileg, rleg, clause, recomputed, conn))
@@ -478,9 +478,49 @@ def _clauses(transcript: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
-def _clause_for(clauses: list[str], i: int, transcript: str) -> str:
-    """The clause for leg i, falling back to the whole transcript if there are
-    fewer clauses than legs (e.g. '...to mom and invest the rest' is one clause
-    for two legs). Lenient: better to check against the whole transcript than to
-    false-freeze a correct plan whose clauses weren't 'then'-separated."""
-    return clauses[i] if i < len(clauses) else transcript
+def _leg_mention(ileg) -> str:
+    """The user's own words for this leg's recipient/ticker ("mom", "apple")."""
+    target = getattr(ileg, "target", None) or getattr(ileg, "ticker", None)
+    return (getattr(target, "mention", "") or "").strip()
+
+
+def _mentions(clause: str, mention: str) -> bool:
+    return bool(mention) and re.search(r"\b" + re.escape(mention) + r"\b",
+                                       clause, re.I) is not None
+
+
+def _match_clauses(legs, transcript: str) -> list[str]:
+    """One clause per leg, for the clause-localized literal check.
+
+    Clauses used to pair with legs by POSITION, so "okay then 2 bucks to
+    jonny" paired its one leg with the clause "okay" and froze a correct plan.
+    Now:
+      1. Filler is dropped: a clause with no amount and no leg's recipient in
+         it ("okay", "alright so") cannot be any leg's clause.
+      2. A leg takes the clause that names ITS recipient, when exactly one
+         does. Pairing by the RECIPIENT, never by the amount, is what keeps
+         the cross-clause swap check: "pay mom 50 then pay john 500" swapped
+         to mom=500/john=50 still pairs mom with "pay mom 50", where 500 is
+         not — pairing by amount would have matched mom to "pay john 500".
+      3. Legs left over (the same recipient twice, a paraphrased mention)
+         take the remaining clauses in order — the user's stated order, which
+         the parser preserves (prompt rule 7) — and then the whole transcript
+         (one clause holding two legs: "...to mom and invest the rest")."""
+    clauses = _clauses(transcript)
+    mentions = [_leg_mention(leg) for leg in legs]
+    clauses = [c for c in clauses
+               if amounts.extract_literal_cents(c) or any(_mentions(c, m) for m in mentions)]
+
+    chosen: list[str | None] = [None] * len(legs)
+    taken: set[int] = set()
+    for i, mention in enumerate(mentions):
+        hits = [k for k, c in enumerate(clauses) if _mentions(c, mention)]
+        if len(hits) == 1 and hits[0] not in taken:
+            chosen[i] = clauses[hits[0]]
+            taken.add(hits[0])
+
+    remaining = iter([c for k, c in enumerate(clauses) if k not in taken])
+    for i in range(len(legs)):
+        if chosen[i] is None:
+            chosen[i] = next(remaining, transcript)
+    return chosen

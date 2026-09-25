@@ -422,6 +422,28 @@ from the transcript does **not** false-positive; LLM-unavailable does not
 freeze; the audit chain still verifies; a frozen draft is unsignable) plus the
 transcript-binding short-circuit and freeze-survives-restart cases.
 
+### Reading looser language — with rules, not a model
+
+The validator stays deliberately **not** an LLM: if the checker were a model,
+the same injected text could talk the drafter and the checker into agreeing,
+and "security does not depend on model behaviour" would stop being true. So
+flexibility comes from better rules:
+
+- **Pairing by recipient.** Clauses are split on "then", but no longer paired
+  with legs by position — that froze *"okay then 2 bucks to jonny"* by pairing
+  its one leg with the clause "okay". Filler clauses (no amount, no recipient)
+  are dropped, and each leg takes the clause naming **its** recipient. Pairing
+  by recipient, never by amount, keeps the cross-clause swap check — and
+  tightens it: a leg's recipient and amount must now appear in the same
+  clause. The old positional pairing let a plan with its legs **reordered and
+  their amounts swapped** pass; it now freezes.
+- **Shorthand amounts.** `5k`, `$1.5k`, `two grand`, `a grand`, `5 thousand`,
+  `a hundred and fifty`, `fifty k`, `SGD 50` / `S$50`. No float touches money,
+  and a multiplier consumes its number, so "5 grand" is $5,000 and never also
+  $5 (an extra reading would let a tampered $5 pass).
+
+`tests/test_validator_flexible.py` pins both, including the swap cases.
+
 ## M7 — Voice I/O
 
 `POST /api/transcribe` plus `frontend/voice.js`. Speech-to-text has **three

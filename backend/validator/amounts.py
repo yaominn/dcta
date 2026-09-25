@@ -65,6 +65,10 @@ _NUMBER_VOCAB = set(_ONES) | set(_TENS) | {"hundred", "thousand"}
 # Units that follow a number run and fix its scale (cents vs dollars).
 _DOLLAR_UNITS = {"dollar", "dollars", "bucks", "buck"}
 _CENT_UNITS = {"cent", "cents"}
+# Units that MULTIPLY the number before them: "5k", "two grand", "1.5k",
+# "5 thousand". Spoken shorthand the parser (an LLM) reads without effort; the
+# validator must read it too, or it freezes a correct plan.
+_MULTIPLIERS = {"k": 1000, "grand": 1000, "thousand": 1000, "hundred": 100}
 
 
 def _words_to_int(words: list[str]) -> int | None:
@@ -91,6 +95,26 @@ def _words_to_int(words: list[str]) -> int | None:
 # --------------------------------------------------------------------------- literal extraction
 # Digit amounts: "$500", "500", "1,200", "50.25", "500 dollars", "50 cents".
 # String composition only — NO float ever touches money (same rule as canonical.py).
+# Digits followed by a multiplier: "5k", "$1.5k", "2 grand", "5 thousand".
+# Matched FIRST, and its span is consumed, so "5 grand" is $5,000 and NOT also
+# $5 — an extra reading would let a tampered $5 pass the amount check.
+_DIGIT_MULTIPLIED = re.compile(r"\$?\s*(\d+)(?:\.(\d+))?\s*(k|grand|thousand|hundred)\b", re.I)
+
+
+def _multiplied_to_cents(whole_str: str, frac: str | None, unit: str) -> int | None:
+    """"1.5k" -> 150000c by integer arithmetic (no float touches money). None
+    if it does not come out to a whole number of cents."""
+    scale = _MULTIPLIERS[unit.lower()] * 100          # cents per unit
+    cents = int(whole_str) * scale
+    if frac:
+        num = int(frac) * scale
+        den = 10 ** len(frac)
+        if num % den:
+            return None
+        cents += num // den
+    return cents
+
+
 _DIGIT_AMOUNT = re.compile(
     r"\$?\s*(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?\s*(dollars?|bucks?|cents?)?\b",
     re.I,
@@ -116,34 +140,53 @@ def extract_literal_cents(clause: str) -> set[int]:
     """
     out: set[int] = set()
 
+    # digits with a multiplier first; their spans are consumed (see above)
+    consumed: list[tuple[int, int]] = []
+    for m in _DIGIT_MULTIPLIED.finditer(clause):
+        cents = _multiplied_to_cents(m.group(1), m.group(2), m.group(3))
+        if cents is not None:
+            out.add(cents)
+        consumed.append(m.span())
+
+    def _free(pos: int) -> bool:
+        return not any(a <= pos < b for a, b in consumed)
+
     # digit amounts — every match, not just the first
     for m in _DIGIT_AMOUNT.finditer(clause):
-        out.add(_digit_run_to_cents(m.group(1), m.group(2), m.group(3)))
+        if _free(m.start(1)):
+            out.add(_digit_run_to_cents(m.group(1), m.group(2), m.group(3)))
 
     # number-word runs — scan tokens; a run is a maximal sequence of number
     # words (optionally led by "a"/"an"), possibly followed by a dollar/cent unit.
-    tokens = list(re.finditer(r"[A-Za-z]+", clause))
+    tokens = [t for t in re.finditer(r"[A-Za-z]+", clause) if _free(t.start())]
+    word = lambda k: tokens[k].group(0).lower() if k < len(tokens) else ""
     i = 0
     while i < len(tokens):
-        tok = tokens[i].group(0).lower()
+        tok = word(i)
         is_run_start = tok in _NUMBER_VOCAB or (
-            tok in ("a", "an") and i + 1 < len(tokens)
-            and tokens[i + 1].group(0).lower() in ("hundred", "thousand")
+            tok in ("a", "an") and word(i + 1) in ("hundred", "thousand", "grand")
         )
         if is_run_start:
             j = i
             run: list[str] = []
             while j < len(tokens):
-                w = tokens[j].group(0).lower()
+                w = word(j)
                 if w in _NUMBER_VOCAB or (w in ("a", "an") and j == i):
                     run.append(w)
                     j += 1
+                elif (w == "and" and run and run[-1] in ("hundred", "thousand")
+                      and (word(j + 1) in _ONES or word(j + 1) in _TENS)):
+                    j += 1              # "a hundred AND fifty" -> 150
                 else:
                     break
             value = _words_to_int(run)
             if value:
-                unit = tokens[j].group(0).lower() if j < len(tokens) else ""
-                cents = value if unit in _CENT_UNITS else value * 100
+                unit = word(j)
+                if unit in ("k", "grand"):            # "two grand", "fifty k"
+                    cents = value * _MULTIPLIERS[unit] * 100
+                    j += 1
+                else:
+                    cents = value if unit in _CENT_UNITS else value * 100
                 out.add(cents)
             i = max(j, i + 1)
         else:
