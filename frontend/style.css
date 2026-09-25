@@ -224,6 +224,8 @@ details.sec[open] summary::before { transform: rotate(90deg); }
 .btn.primary { background: var(--accent); color: var(--accent-fg); }
 .btn.primary:disabled { opacity: .4; cursor: not-allowed; }
 .btn.primary:not(:disabled):active { transform: scale(.99); }
+.btn.secondary { margin-top: 8px; background: transparent; color: var(--fg); border: 1px solid var(--line); font-weight: 600; }
+.btn.secondary:disabled { opacity: .4; cursor: not-allowed; }
 .hint { margin: 8px 2px 0 !important; font-size: 11px; color: var(--muted); }
 
 /* contact changes + list */

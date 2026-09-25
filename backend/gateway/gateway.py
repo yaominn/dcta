@@ -37,6 +37,9 @@ from backend.gateway.nonce import NonceStore, NonceError
 from backend.gateway.signer import MockSigner
 from backend.gateway.stepup import StepUpStore
 from backend.gateway.executor import AlreadyExecuted, MockExecutor
+
+# Outcomes recorded for a draft that ended WITHOUT running.
+CLOSED_OUTCOMES = frozenset({"DECLINED", "CANCELLED"})
 from backend.auth.credentials import MockCredentialStore
 from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
@@ -53,6 +56,7 @@ class Gateway:
         audit: AuditLog,
         executor: MockExecutor,
         credentials: MockCredentialStore,
+        drafts,
         policy_db_path=None,
         step_up: StepUpStore | None = None,
     ):
@@ -61,6 +65,11 @@ class Gateway:
         self.audit = audit
         self.executor = executor
         self.credentials = credentials
+        # What this app actually drafted. Required — no default: a gateway that
+        # could be built without it would execute any signed payload again.
+        # Anything with executable(draft_id, kind=, submitted_hash=) will do;
+        # main.py wires the real DraftStore.
+        self.drafts = drafts
         # The ledger policy is evaluated against. None disables the re-check —
         # used only by the M1 gateway unit tests, which predate M5 and exercise
         # the signature matrix in isolation. main.py always wires it.
@@ -113,7 +122,14 @@ class Gateway:
         #     after a lost response learns what happened instead of paying twice.
         prior = self.executor.prior_execution(draft_id)
         if prior is not None:
-            return self._duplicate(draft_id, p_hash, prior)
+            return self._already_final(draft_id, p_hash, prior)
+
+        # 3c. the draft itself: it must exist, be `ready`, and this must be
+        #     EXACTLY its payload — not an older version, not one the validator
+        #     never saw, not one for a draft this app never made.
+        refused = self.drafts.executable(draft_id, kind="payment", submitted_hash=p_hash)
+        if refused is not None:
+            return self._reject(draft_id, p_hash, *refused)
 
         # 4. policy — re-evaluated at the chokepoint (M5). The owner is derived
         #    from the ACCOUNT ROWS being debited, never from a field in the
@@ -145,7 +161,7 @@ class Gateway:
         try:
             result = self.executor.execute(resolved_plan, payload_hash=p_hash)
         except AlreadyExecuted as exc:     # lost a race to a concurrent submit
-            return self._duplicate(draft_id, p_hash, exc.prior)
+            return self._already_final(draft_id, p_hash, exc.prior)
         if self.step_up is not None:
             self.step_up.consume(draft_id)
         self.audit.append(
@@ -197,7 +213,11 @@ class Gateway:
         #     after a lost response learns what happened instead of paying twice.
         prior = self.executor.prior_execution(draft_id)
         if prior is not None:
-            return self._duplicate(draft_id, p_hash, prior)
+            return self._already_final(draft_id, p_hash, prior)
+
+        refused = self.drafts.executable(draft_id, kind="contact_edit", submitted_hash=p_hash)
+        if refused is not None:
+            return self._reject(draft_id, p_hash, *refused)
 
         # Re-derived HERE from the payload, not taken from the draft store: a
         # hand-assembled phone change needs the out-of-band code too.
@@ -211,7 +231,7 @@ class Gateway:
         try:
             result = self.executor.apply_contact_change(change, payload_hash=p_hash)
         except AlreadyExecuted as exc:
-            return self._duplicate(draft_id, p_hash, exc.prior)
+            return self._already_final(draft_id, p_hash, exc.prior)
         if self.step_up is not None and reasons:
             self.step_up.consume(draft_id)
         self.audit.append(AuditEntryType.CONTACT_UPDATE, {
@@ -224,6 +244,14 @@ class Gateway:
                 "payload_hash": p_hash, "execution": result,
                 **({} if result["status"] == "UPDATED"
                    else {"rejection": "FAILED", "reason": result["error"]})}
+
+    def _already_final(self, draft_id: str, p_hash: str, prior: dict) -> dict:
+        """The draft already has its one outcome. Declined/cancelled is a STATE
+        refusal; anything else ran, so this is a DUPLICATE."""
+        if prior["outcome"] in CLOSED_OUTCOMES:
+            return self._reject(draft_id, p_hash, "STATE",
+                                f"this draft was {prior['outcome'].lower()} — nothing was sent")
+        return self._duplicate(draft_id, p_hash, prior)
 
     def _duplicate(self, draft_id: str, p_hash: str, prior: dict) -> dict:
         """Refuse a repeat, audited like any rejection, carrying what the one

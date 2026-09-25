@@ -33,6 +33,16 @@ from backend.policy import (
     Decision, PolicyContext, evaluate, load_context, owner_of,
 )
 
+
+class _EveryPayloadIsTheDraft:
+    """Stand-in for the draft store in gateway unit tests: every submitted
+    payload counts as its own ready draft, so these tests exercise the nonce /
+    signature / expiry / policy rules in isolation. The real binding — only a
+    ready draft's exact payload executes — is tested in test_draft_states.py."""
+
+    def executable(self, draft_id, *, kind, submitted_hash):
+        return None
+
 _TX = "stub: policy tests"
 _NOW = int(time.time())
 
@@ -264,7 +274,7 @@ def _gateway(tmp_path, ttl=120):
     signer = MockSigner()
     creds = MockCredentialStore()
     creds.register("cred_alice", signer.public_key)
-    gw = Gateway(signer=signer, nonce_store=NonceStore(ttl_seconds=ttl),
+    gw = Gateway(drafts=_EveryPayloadIsTheDraft(), signer=signer, nonce_store=NonceStore(ttl_seconds=ttl),
                  audit=AuditLog(db), executor=MockExecutor(db), credentials=creds,
                  policy_db_path=db)
     return gw, signer, db

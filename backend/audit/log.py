@@ -38,6 +38,8 @@ class AuditEntryType(str, Enum):
     CONTACT_UPDATE = "CONTACT_UPDATE"   # a signed payee rename / phone change
     SIGNATURE = "SIGNATURE"
     EXECUTION = "EXECUTION"
+    DRAFT_DECLINED = "DRAFT_DECLINED"     # the user said no before signing
+    DRAFT_CANCELLED = "DRAFT_CANCELLED"   # the user withdrew a pending draft
 
 
 GENESIS_HASH = "0" * 64   # prev_hash of the very first entry

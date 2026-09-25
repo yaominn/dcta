@@ -134,6 +134,13 @@ async function signAndExecute(plan, credentialIds, rpId,
     return { status: 409, json: { accepted: false, rejection: "DUPLICATE",
                                   execution: done.execution, executed_at: done.executed_at } };
   }
+  // Any other refusal (cancelled, expired, not ready): the server will not
+  // count a signature, so don't ask for one — say why instead.
+  if (!nonceResp.nonce) {
+    return { status: 409, json: { accepted: false, rejection: "STATE",
+                                  reason: "This can't be approved: " + ((done && done.error) || "no signing challenge")
+                                          + ". Nothing was sent." } };
+  }
   const nonce = nonceResp.nonce;
 
   // 3. build the challenge OURSELF: sha256(payload_hash + nonce). The server
@@ -205,7 +212,7 @@ function typing(on) {
    the live controls are unambiguous. A newer card retires the older one:
    its ids are dropped and its controls disabled — an old draft can't be
    signed from further up the conversation. */
-const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign",
+const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign", "decline",
                   "stepup", "stepup-reason", "stepup-form", "stepup-code"];
 function retireLiveCard() {
   for (const id of LIVE_IDS) {
@@ -296,7 +303,7 @@ function buildPlanCard(plan, confirmation) {
   // whatever this page does (gateway/stepup.py).
   btn.disabled = !!confirmation;
   btn.onclick = onSign;
-  card.append(btn);
+  card.append(btn, declineButton());
   card.append(el("p", "hint",
     "Your device signs a hash of exactly this payment, recomputed in your browser."));
   return card;
@@ -344,7 +351,7 @@ function buildChangeCard(change, confirmation) {
   btn.id = "sign";
   btn.disabled = !!confirmation;
   btn.onclick = onSign;
-  card.append(btn);
+  card.append(btn, declineButton());
   card.append(el("p", "hint",
     "Nothing changes until you confirm. Your device signs exactly this change."));
   return card;
@@ -629,6 +636,45 @@ function renderClarify(body) {
     // user re-states the request and it re-enters the pipeline from the top.
     m.append(el("p", "meta-note", "Say or type it again with more detail."));
   }
+}
+
+// Cancel, before confirming. The server records the decline durably and the
+// draft can never be signed afterwards — not a button that merely hides a card.
+function declineButton() {
+  const b = el("button", "btn secondary", "Cancel");
+  b.id = "decline";
+  b.onclick = onDecline;
+  return b;
+}
+
+async function onDecline() {
+  const btn = document.getElementById("decline");
+  if (!btn) return;
+  const sign = document.getElementById("sign");
+  btn.disabled = true;
+  if (sign) sign.disabled = true;
+  const res = await jpost(API + "/api/drafts/" + encodeURIComponent(CURRENT.draftId) + "/decline", {});
+  const d = res.json.detail || {};
+  if (res.status === 200) {
+    showCancelled();
+  } else if (d.already_executed) {
+    // It was signed first: tell the truth rather than "cancelled".
+    showAlreadySent({ json: { rejection: "DUPLICATE", execution: d.execution,
+                              executed_at: d.executed_at } });
+  } else {
+    showErr("Couldn't cancel: " + (d.error || res.status) + ". Nothing has been sent.");
+    btn.disabled = false;
+    if (sign) sign.disabled = false;
+    return;
+  }
+  retireLiveCard();
+}
+
+function showCancelled() {
+  const card = newResultCard(true);
+  card.append(el("h3", null, "CANCELLED"));
+  card.append(el("p", "lead", "Nothing was sent. This can't be approved now — "
+    + "say it again if you still want to send it."));
 }
 
 async function onSign() {

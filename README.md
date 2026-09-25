@@ -156,6 +156,44 @@ Existing databases get the table at startup (`migrate()`), without a re-seed.
 `tests/test_execute_once.py` pins all of it, including four threads racing to
 pay the same draft.
 
+## Only a ready draft's exact payment executes — and the user can say no
+
+The gateway used to execute whatever payload it was sent. The validator passed
+"$50 to Mom" and the gateway ran **$800 signed under the same draft id**, and
+ran a payment for a draft this app **never created**. A frozen draft was
+stopped only because no nonce was issued for it. And a card the user did not
+want stayed signable for its whole window: there was no way to say no.
+
+After verifying the signature, the gateway now asks the draft store. It
+executes only if the draft **exists**, is **`ready`**, and the payload is
+**byte-for-byte the one the pipeline drafted, policy cleared and the
+validator passed** (by payload hash). Otherwise:
+
+| Rejection | When |
+|---|---|
+| `STATE` | no such draft (never created, or expired); or it is `frozen`, `declined`, `cancelled` |
+| `OUTDATED` | the payload is not the draft's current one — a swap, an older version |
+| `DUPLICATE` | it already ran (see above) |
+
+This also closes the gap behind the client-integrity caveat below: a
+compromised page can still *show* $50 and ask the authenticator to sign $800,
+but the server will not execute it.
+
+**Saying no.** The payment card has **Cancel** beside *Confirm*. It calls
+`POST /api/drafts/{id}/decline`; `POST /api/drafts/{id}/cancel` withdraws a
+pending draft (for the scam-demo hold). Both are **final** and audited
+(`DRAFT_DECLINED` / `DRAFT_CANCELLED`), refuse the nonce and the gateway, and
+cannot be revived by answering a question. They are recorded in the same
+durable table as executions, so they survive a restart, and a decline racing
+a signature is settled by whichever reaches the ledger first — the user is
+never told "nothing was sent" about money that was.
+
+`/api/auth/nonce` now issues a nonce only for an existing `ready` draft, so the
+page never asks for a fingerprint that cannot count. Drafts live in memory: a
+draft left unsigned across a server restart can no longer be paid (fails
+safe — ask again). `tests/test_draft_states.py` pins all of it, including a
+decline and a signature released together, ten times over.
+
 ## M3 — LLM parser + schema + opaque IDs
 
 `POST /api/plan` turns a text transcript into a schema-valid `IntentPlan`
@@ -544,7 +582,7 @@ in a slide.
 | 5 | Injection in the user's own speech | No leg pays the injected account — the LLM schema has no `payee_id` to name one |
 | 6 | Unsigned call straight to the gateway | Rejected and recorded in the hash chain |
 | 7 | One byte edited in the audit log | `verify_chain()` names the exact entry |
-| 8 | Correctly signed payload, UI skipped | The gateway re-runs policy: $20,000.01 is refused (M5) |
+| 8 | Correctly signed payload, UI skipped | A hand-assembled $20,000.01 gets no nonce (no such draft); swapped into a real draft it is refused `OUTDATED` — only the drafted, policy-cleared payment executes |
 | 9 | Compromised **resolver** swaps the payee | The validator freezes it; a frozen draft gets no nonce, so it is unsignable (M6) |
 
 Scenarios 8 and 9 are not in the brief's list. They are what an attacker tries

@@ -332,10 +332,14 @@ def scenario_8_policy_bypass(client: TestClient) -> Result:
     r = Result(8, "Skipping the UI (M5)",
                "An attacker assembles an over-limit payload and signs it "
                "correctly, never touching the overlay that shows policy.",
-               "The gateway re-runs policy before executing, so a limit "
-               "checked only on the way to the UI is not a limit.")
+               "The gateway executes only the exact payment the pipeline "
+               "drafted and policy cleared, so a payload assembled by hand has "
+               "nothing to be — and policy re-runs at the gateway regardless.")
     from backend.models.schemas import ResolvedPlan, ResolvedTransfer
     import time as _t
+    before = _balance("acct_savings")
+
+    # 1. A payload assembled from nothing, under a draft id this app never made.
     now = int(_t.time())
     plan = ResolvedPlan(
         draft_id="bypass", plan=[ResolvedTransfer(
@@ -344,17 +348,28 @@ def scenario_8_policy_bypass(client: TestClient) -> Result:
             amount_cents=2000001)],                      # $1 over the cap
         transcript_hash=hash_transcript("assembled by hand"),
         created_at=now, expires_at=now + 300).model_dump(mode="json")
-    nonce = client.get("/api/auth/nonce", params={"draft_id": "bypass"}).json()["nonce"]
-    signed = client.post("/api/auth/mock-sign",
-                         json={"resolved_plan": plan, "nonce": nonce}).json()
-    out = client.post("/api/gateway/execute", json={
-        "resolved_plan": plan, "signature": signed["signature"],
-        "nonce": nonce, "credential_id": signed["credential_id"]}).json()
+    no_nonce = client.get("/api/auth/nonce", params={"draft_id": "bypass"})
     r.line("payload: $20,000.01 — one cent over the per-transaction limit, "
-           "validly signed, submitted straight to the gateway")
+           "under a draft id the app never created")
+    r.line(f"signing challenge for it: HTTP {no_nonce.status_code} "
+           "(no draft -> no nonce -> nothing to sign)")
+
+    # 2. The same amount swapped into a REAL draft, validly signed.
+    draft = _draft(client, "pay mom five hundred")
+    swapped = dict(draft["resolved_plan"])
+    swapped["plan"] = [dict(swapped["plan"][0], amount_cents=2000001)]
+    nonce = client.get("/api/auth/nonce", params={"draft_id": draft["draft_id"]}).json()["nonce"]
+    signed = client.post("/api/auth/mock-sign",
+                         json={"resolved_plan": swapped, "nonce": nonce}).json()
+    out = client.post("/api/gateway/execute", json={
+        "resolved_plan": swapped, "signature": signed["signature"],
+        "nonce": nonce, "credential_id": signed["credential_id"]}).json()
+    r.line("then swapped into a real $500 draft and validly signed:")
     r.line(f"gateway: accepted={out['accepted']} rejection={out['rejection']}")
     r.line(f"reason: {out['reason']}")
-    r.passed = out["accepted"] is False and out["rejection"] == "POLICY"
+    r.line(f"acct_savings: {before}c -> {_balance('acct_savings')}c (unchanged)")
+    r.passed = (no_nonce.status_code == 404 and out["accepted"] is False
+                and out["rejection"] == "OUTDATED" and _balance("acct_savings") == before)
     return r
 
 

@@ -78,6 +78,25 @@ class MockExecutor:
             prior = self.prior_execution(draft_id)
             raise AlreadyExecuted(prior) from None
 
+    def close(self, draft_id: str, kind: str, payload_hash: str, outcome: str) -> dict:
+        """Record that this draft ended WITHOUT running (DECLINED / CANCELLED).
+
+        Same table, same PRIMARY KEY as an execution — deliberately. A decline
+        racing a signature is settled by whichever claims the draft first: if
+        the payment claimed it, this raises AlreadyExecuted and the user is
+        told it was already sent; if this did, the payment's claim fails and
+        nothing moves. The user is never told "nothing was sent" about money
+        that was."""
+        conn = connect(self.db_path)
+        try:
+            self._claim(conn, draft_id, kind, payload_hash)
+            result = {"draft_id": draft_id, "status": outcome}
+            self._record(conn, draft_id, result)
+            conn.commit()
+        finally:
+            conn.close()
+        return self.prior_execution(draft_id)
+
     @staticmethod
     def _record(conn, draft_id: str, result: dict) -> None:
         conn.execute("UPDATE executions SET outcome=?, result=? WHERE draft_id=?",

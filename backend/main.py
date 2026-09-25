@@ -25,6 +25,8 @@ from backend.data.db import DB_PATH, get_conn, migrate
 from backend.audit import AuditLog
 from backend.audit.log import AuditEntryType
 from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
+from backend.gateway.gateway import CLOSED_OUTCOMES
+from backend.gateway.executor import AlreadyExecuted
 from backend.gateway import (Gateway, NonceStore, MockSigner, MockExecutor, WebAuthnVerifier,
                              SimulatedPhone, StepUpError, StepUpStore)
 from backend.auth import (
@@ -218,6 +220,9 @@ _step_up = StepUpStore()
 _phone = SimulatedPhone()    # MOCK: the "phone" the code is delivered to
 _audit = AuditLog(DB_PATH)
 _executor = MockExecutor(DB_PATH)
+# What the pipeline drafted. Built before the gateways because they consult it:
+# only a `ready` draft's exact payload may execute.
+_drafts = DraftStore()
 _gateway = Gateway(
     signer=_signer,
     nonce_store=_nonce_store,
@@ -226,6 +231,7 @@ _gateway = Gateway(
     credentials=_credentials,
     policy_db_path=DB_PATH,      # M5: policy is enforced at the chokepoint
     step_up=_step_up,
+    drafts=_drafts,
 )
 
 
@@ -251,6 +257,7 @@ _webauthn_gateway = Gateway(
     credentials=_webauthn_credentials,
     policy_db_path=DB_PATH,       # shared — the same limits on both paths
     step_up=_step_up,             # shared — one confirmation, either path
+    drafts=_drafts,               # shared — the same drafts on both paths
 )
 
 # In-memory registration challenges (user_id -> (challenge bytes, issued_at)).
@@ -285,12 +292,31 @@ def issue_nonce(draft_id: str = Query(...)):
     # this is what makes a double tap harmless AND quiet.) 409 carries the
     # original outcome so the page can show what happened.
     prior = _executor.prior_execution(draft_id)
+    if prior is not None and prior["outcome"] in CLOSED_OUTCOMES:
+        _traces.event(draft_id, "nonce", issued=False, reason=prior["outcome"].lower())
+        raise HTTPException(status_code=409, detail={
+            "error": f"draft {prior['outcome'].lower()}", "draft_id": draft_id,
+            "closed": True, "status": prior["outcome"].lower()})
     if prior is not None:
         _traces.event(draft_id, "nonce", issued=False, reason="already executed")
         raise HTTPException(status_code=409, detail={
             "error": "draft already executed", "draft_id": draft_id,
             "already_executed": True, "outcome": prior["outcome"],
             "execution": prior["result"], "executed_at": prior["executed_at"]})
+    # A nonce only for a draft this app made that can still execute. It used to
+    # be issued for ANY draft_id — which is how a payment for a draft that never
+    # existed got signed. The gateway refuses those regardless; refusing here
+    # keeps the page from asking for a fingerprint that cannot count.
+    draft = _drafts.get(draft_id)
+    if draft is None:
+        _traces.event(draft_id, "nonce", issued=False, reason="no such draft")
+        raise HTTPException(status_code=404, detail={
+            "error": "no such draft (it expired or was never created)", "draft_id": draft_id})
+    if draft.status != "ready":
+        _traces.event(draft_id, "nonce", issued=False, reason=f"draft is {draft.status}")
+        raise HTTPException(status_code=409, detail={
+            "error": f"draft is {draft.status}", "draft_id": draft_id,
+            "status": draft.status})
     _traces.event(draft_id, "nonce", issued=True, ttl_seconds=_nonce_store.ttl)
     return {"nonce": _nonce_store.issue(draft_id),
             "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
@@ -667,7 +693,6 @@ async def transcribe(audio: UploadFile = File(...), fmt: str | None = None):
 #
 # Each stage can stop the pipeline, and a stage that stops it produces NO
 # signable draft — the fail-closed direction, every time.
-_drafts = DraftStore()
 _traces = TraceStore()      # MOCK/demo: what each request was told and did (/data)
 
 
@@ -935,9 +960,66 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
     if draft is None:
         raise HTTPException(404, {"error": "no such draft (or it expired)",
                                   "draft_id": draft_id})
+    # A final draft stays final: answering a question would otherwise re-run
+    # the pipeline and flip a declined or executed draft back to `ready`.
+    if draft.status in FINAL_STATUSES:
+        raise HTTPException(409, {"error": f"draft is {draft.status}", "draft_id": draft_id,
+                                  "status": draft.status})
     draft.answers[answer.field] = answer.choice_id
     _traces.event(draft_id, "answer", field=answer.field, choice_id=answer.choice_id)
     return _run(draft)
+
+
+# --------------------------------------------------------------------------- decline / cancel
+# Saying no, on the server. Before this the only way to refuse a draft was to
+# leave it alone, and it stayed signable for its whole window. Both are FINAL,
+# audited, and recorded in the same durable table as executions — so a decline
+# racing a signature is settled by whichever reaches the ledger first, and the
+# user is never told "nothing was sent" about money that was.
+#   decline — the user says no to the card before confirming (the page's Cancel)
+#   cancel  — the user withdraws a draft that has not run (the hold window)
+FINAL_STATUSES = frozenset({"executed", "declined", "cancelled"})
+
+
+def _close_draft(draft_id: str, outcome: str, entry: AuditEntryType) -> dict:
+    prior = _executor.prior_execution(draft_id)
+    if prior is not None and prior["outcome"] in CLOSED_OUTCOMES:
+        # Already closed (a double tap): say so, change nothing.
+        return {"draft_id": draft_id, "status": prior["outcome"].lower(), "sent": False}
+    if prior is not None:
+        raise HTTPException(409, {
+            "error": "already sent — it can no longer be cancelled", "draft_id": draft_id,
+            "already_executed": True, "execution": prior["result"],
+            "executed_at": prior["executed_at"]})
+    draft = _drafts.get(draft_id)
+    if draft is None:
+        raise HTTPException(404, {"error": "no such draft (it expired or was never created)",
+                                  "draft_id": draft_id})
+    p_hash = payload_hash(draft.payload) if draft.payload is not None else ""
+    try:
+        _executor.close(draft_id, draft.kind, p_hash, outcome)
+    except AlreadyExecuted as exc:          # a signature reached the ledger first
+        raise HTTPException(409, {
+            "error": "already sent — it can no longer be cancelled", "draft_id": draft_id,
+            "already_executed": True, "execution": exc.prior["result"],
+            "executed_at": exc.prior["executed_at"]})
+    was = draft.status
+    draft.status = outcome.lower()
+    _audit.append(entry, {"draft_id": draft_id, "payload_hash": p_hash, "prior_status": was})
+    _traces.event(draft_id, outcome.lower(), prior_status=was)
+    return {"draft_id": draft_id, "status": outcome.lower(), "sent": False}
+
+
+@app.post("/api/drafts/{draft_id}/decline", response_model=None)
+def decline_draft(draft_id: str):
+    """The user says no to this draft before confirming. Nothing is sent, ever."""
+    return _close_draft(draft_id, "DECLINED", AuditEntryType.DRAFT_DECLINED)
+
+
+@app.post("/api/drafts/{draft_id}/cancel", response_model=None)
+def cancel_draft(draft_id: str):
+    """The user withdraws a draft that has not run. Nothing is sent, ever."""
+    return _close_draft(draft_id, "CANCELLED", AuditEntryType.DRAFT_CANCELLED)
 
 
 class ConfirmRequest(BaseModel):

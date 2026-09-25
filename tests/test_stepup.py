@@ -22,6 +22,16 @@ from backend.gateway import (Gateway, MockExecutor, MockSigner, NonceStore,
                              StepUpError, StepUpStore)
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer
 
+
+class _EveryPayloadIsTheDraft:
+    """Stand-in for the draft store in gateway unit tests: every submitted
+    payload counts as its own ready draft, so these tests exercise the nonce /
+    signature / expiry / policy rules in isolation. The real binding — only a
+    ready draft's exact payload executes — is tested in test_draft_states.py."""
+
+    def executable(self, draft_id, *, kind, submitted_hash):
+        return None
+
 _NOW = int(time.time())
 
 
@@ -42,7 +52,7 @@ def _gateway(tmp_path, step_up):
     signer = MockSigner()
     creds = MockCredentialStore()
     creds.register("cred_alice", signer.public_key)
-    gw = Gateway(signer=signer, nonce_store=NonceStore(), audit=AuditLog(db),
+    gw = Gateway(drafts=_EveryPayloadIsTheDraft(), signer=signer, nonce_store=NonceStore(), audit=AuditLog(db),
                  executor=MockExecutor(db), credentials=creds,
                  policy_db_path=db, step_up=step_up)
     return gw, signer

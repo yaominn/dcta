@@ -32,6 +32,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
+from backend.audit.canonical import payload_hash
 from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import MAX_AUTH_WINDOW_S, ResolvedPlan
 
@@ -48,6 +49,13 @@ class Draft:
       ready    — resolved, policy-cleared, validator-passed; signable
       executed — reached the executor once; never again (the `executions`
                  table enforces that — this field follows it for display)
+      declined — the user said no before signing; final
+      cancelled — the user withdrew it before it ran; final
+
+    Only `ready` can execute, and only with EXACTLY its payload: the gateway
+    asks DraftStore.executable() after verifying the signature. declined,
+    cancelled and executed are ALSO recorded in the `executions` table, which
+    survives a restart and settles a decline racing a signature.
     """
     draft_id: str
     user_id: str
@@ -90,6 +98,29 @@ class DraftStore:
     def get(self, draft_id: str) -> Draft | None:
         self._sweep()
         return self._drafts.get(draft_id)
+
+    def executable(self, draft_id: str, *, kind: str, submitted_hash: str):
+        """None if THIS payload may execute now; else (rejection, reason).
+
+        The gateway used to execute whatever payload it was sent: a plan the
+        validator never saw under a real draft id ran, and so did one for a
+        draft this app never created. Now the payload must be the draft's
+        current one, byte for byte — so what executes is what the pipeline
+        drafted, policy cleared and the validator passed, whatever the page
+        showed or asked the authenticator to sign."""
+        draft = self.get(draft_id)                    # expired drafts are swept
+        if draft is None:
+            return ("STATE", "no such draft: it expired or was never created by "
+                             "this app — nothing was sent")
+        if draft.kind != kind:
+            return ("STATE", f"draft {draft_id} is a {draft.kind}, not a {kind}")
+        if draft.status != "ready":
+            return ("STATE", f"this draft is {draft.status}; only a ready draft can "
+                             "be executed — nothing was sent")
+        if draft.payload is None or payload_hash(draft.payload) != submitted_hash:
+            return ("OUTDATED", "this is not the payment that was drafted and "
+                                "checked — nothing was sent")
+        return None
 
     def _sweep(self) -> None:
         now = time.time()

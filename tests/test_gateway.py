@@ -18,6 +18,16 @@ from backend.data.seed import seed
 from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer, ResolvedBuyEquity
 
+
+class _EveryPayloadIsTheDraft:
+    """Stand-in for the draft store in gateway unit tests: every submitted
+    payload counts as its own ready draft, so these tests exercise the nonce /
+    signature / expiry / policy rules in isolation. The real binding — only a
+    ready draft's exact payload executes — is tested in test_draft_states.py."""
+
+    def executable(self, draft_id, *, kind, submitted_hash):
+        return None
+
 # Stub transcript (ASR lands in M7); its sha256 is the required transcript_hash.
 _STUB_TX = "stub: transfer five hundred dollars to mom then buy aapl with the rest"
 _STUB_TX_HASH = hash_transcript(_STUB_TX)
@@ -46,7 +56,7 @@ def _build(tmp_path, ttl=120):
     nonce_store = NonceStore(ttl_seconds=ttl)
     audit = AuditLog(db_path)
     executor = MockExecutor(db_path)
-    gw = Gateway(
+    gw = Gateway(drafts=_EveryPayloadIsTheDraft(), 
         signer=signer, nonce_store=nonce_store,
         audit=audit, executor=executor, credentials=creds,
     )
