@@ -796,6 +796,17 @@ it hides after five seconds. Contact edits get *"Contact updated"*.
 `tests/test_e2e_webauthn.py` proves the panel, the notification and the
 spending sentence in a real browser.
 
+**Before a demo, reset the money — not your passkey:**
+
+```bash
+python -m backend.data.reset_demo
+```
+
+It restores the seeded balances (Savings $8,420.50, Spending $1,200.00) and
+the payment history the anomaly and limit rules read, and **keeps** your
+registered passkey, contact edits, the audit log and the record of executed
+drafts. (`python -m backend.data.seed` resets everything, passkeys included.)
+
 ## Demo script (brief Section 10)
 
 1. **Happy path** — multi-intent voice command → one overlay → one fingerprint → both legs executed.
