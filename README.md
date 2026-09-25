@@ -132,6 +132,30 @@ off, so the real path is proven without the shortcut.
 `tests/test_mock_signing_disabled.py` pins all of this, including the
 three-call attack failing end to end with the balance unchanged.
 
+## Every draft executes at most once
+
+A nonce is single-use, but a new one can be issued for the same draft on every
+request, and a new signature is one more Touch ID away. Nothing said "this
+draft was already paid", so a user who approved, lost the response to a
+timeout, and tapped again paid twice. Now:
+
+- **The ledger decides.** Before debiting, the executor claims the draft in an
+  `executions` table (`draft_id` is the primary key) **in the same
+  transaction** as the debit. A second claim cannot be written; two requests
+  racing cannot both pay, and the loser's debit rolls back. The table is in
+  the database, so the rule survives a restart.
+- **A repeat is refused as `DUPLICATE`, with the original result**, and
+  audited. A retry after a lost response shows *"Already sent at 14:32 —
+  nothing was sent twice"*, not an error.
+- **No second fingerprint.** `/api/auth/nonce` answers 409 for a draft that
+  already ran, so the page reports what happened instead of prompting again.
+- **One attempt per draft, whatever the outcome** — a failed execution is
+  recorded too. Contact edits get the same guarantee.
+
+Existing databases get the table at startup (`migrate()`), without a re-seed.
+`tests/test_execute_once.py` pins all of it, including four threads racing to
+pay the same draft.
+
 ## M3 — LLM parser + schema + opaque IDs
 
 `POST /api/plan` turns a text transcript into a schema-valid `IntentPlan`

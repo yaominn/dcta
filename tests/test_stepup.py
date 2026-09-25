@@ -74,9 +74,13 @@ def test_gateway_executes_a_confirmed_escalated_plan_exactly_once(tmp_path):
     plan = _anomalous_plan()
     store.confirm(plan.draft_id, store.issue(plan.draft_id, payload_hash(plan)))
     assert _submit(gw, signer, plan)["accepted"] is True
-    # One confirmation authorizes one execution: a second signed submission of
-    # the same draft needs a fresh confirmation.
-    assert _submit(gw, signer, plan)["rejection"] == "CONFIRMATION"
+    # A second signed submission of the same draft is refused as a DUPLICATE —
+    # before the step-up check, and even with a FRESH confirmation. (This test
+    # used to expect CONFIRMATION, i.e. that a new code would let the same draft
+    # pay again. That was the duplicate-execution hole: now a draft runs once.)
+    assert _submit(gw, signer, plan)["rejection"] == "DUPLICATE"
+    store.confirm(plan.draft_id, store.issue(plan.draft_id, payload_hash(plan)))
+    assert _submit(gw, signer, plan)["rejection"] == "DUPLICATE"
 
 
 def test_a_confirmation_cannot_be_moved_onto_a_different_payload(tmp_path):

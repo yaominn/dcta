@@ -28,6 +28,24 @@ def get_conn() -> sqlite3.Connection:
     return connect()
 
 
+# One row per draft that has ever reached the executor — the at-most-once
+# guarantee. draft_id is the PRIMARY KEY, so a second execution of the same
+# draft cannot be written, even by two requests racing: the row is claimed in
+# the SAME transaction as the debit, and whichever loses the race rolls its
+# debit back. In the DB (not memory) so it survives a restart. `result` is the
+# executor's JSON, replayed to a retry so a lost response can be recovered.
+EXECUTIONS_DDL = """
+CREATE TABLE IF NOT EXISTS executions (
+    draft_id     TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,       -- payment | contact_edit
+    payload_hash TEXT NOT NULL,
+    outcome      TEXT NOT NULL,       -- EXECUTED | FAILED | UPDATED
+    result       TEXT NOT NULL,       -- the execution result, as JSON
+    executed_at  INTEGER NOT NULL
+);
+"""
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing ledger up to the current schema without re-seeding
     (a re-seed would drop the user's own edits and registered passkeys).
@@ -36,6 +54,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     if cols and "phone" not in cols:
         conn.execute("ALTER TABLE payees ADD COLUMN phone TEXT")
         conn.commit()
+    conn.executescript(EXECUTIONS_DDL)
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -110,3 +129,4 @@ def init_schema(conn: sqlite3.Connection) -> None:
         );
         """
     )
+    conn.executescript(EXECUTIONS_DDL)

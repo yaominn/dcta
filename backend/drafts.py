@@ -46,6 +46,8 @@ class Draft:
       frozen   — the validator froze it; the plan is retained for display, but
                  /api/auth/nonce refuses a nonce so it cannot be signed
       ready    — resolved, policy-cleared, validator-passed; signable
+      executed — reached the executor once; never again (the `executions`
+                 table enforces that — this field follows it for display)
     """
     draft_id: str
     user_id: str

@@ -280,6 +280,17 @@ def issue_nonce(draft_id: str = Query(...)):
             status_code=403,
             detail={"error": "draft frozen by validator", "draft_id": draft_id},
         )
+    # At most once: a draft that already ran gets no nonce, so the page never
+    # asks for a second fingerprint. (The gateway refuses a repeat regardless;
+    # this is what makes a double tap harmless AND quiet.) 409 carries the
+    # original outcome so the page can show what happened.
+    prior = _executor.prior_execution(draft_id)
+    if prior is not None:
+        _traces.event(draft_id, "nonce", issued=False, reason="already executed")
+        raise HTTPException(status_code=409, detail={
+            "error": "draft already executed", "draft_id": draft_id,
+            "already_executed": True, "outcome": prior["outcome"],
+            "execution": prior["result"], "executed_at": prior["executed_at"]})
     _traces.event(draft_id, "nonce", issued=True, ttl_seconds=_nonce_store.ttl)
     return {"nonce": _nonce_store.issue(draft_id),
             "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
@@ -333,6 +344,13 @@ def gateway_execute(req: ExecuteRequest):
 
 
 def _traced_gateway(draft_id: str, path: str, out: dict) -> dict:
+    # The draft's state follows the ledger: once executed (or refused as a
+    # repeat of one that was), it is no longer "ready". The executions table,
+    # not this field, is what enforces it.
+    if out.get("accepted") or out.get("rejection") == "DUPLICATE":
+        draft = _drafts.get(draft_id)
+        if draft is not None:
+            draft.status = "executed"
     _traces.event(draft_id, "gateway", path=path, accepted=out.get("accepted"),
                   rejection=out.get("rejection"), reason=out.get("reason"),
                   execution=out.get("execution"), payload_hash=out.get("payload_hash"))

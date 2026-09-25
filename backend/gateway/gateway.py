@@ -36,7 +36,7 @@ from backend.audit.log import AuditLog, AuditEntryType
 from backend.gateway.nonce import NonceStore, NonceError
 from backend.gateway.signer import MockSigner
 from backend.gateway.stepup import StepUpStore
-from backend.gateway.executor import MockExecutor
+from backend.gateway.executor import AlreadyExecuted, MockExecutor
 from backend.auth.credentials import MockCredentialStore
 from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
@@ -107,6 +107,14 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
 
+        # 3b. at most once. A fresh nonce and a fresh signature exist for this
+        #     draft on every request — neither says "not again" — so ask the
+        #     ledger. A repeat is refused WITH the original result: a retry
+        #     after a lost response learns what happened instead of paying twice.
+        prior = self.executor.prior_execution(draft_id)
+        if prior is not None:
+            return self._duplicate(draft_id, p_hash, prior)
+
         # 4. policy — re-evaluated at the chokepoint (M5). The owner is derived
         #    from the ACCOUNT ROWS being debited, never from a field in the
         #    request, so a caller cannot nominate whose limits apply to them.
@@ -134,7 +142,10 @@ class Gateway:
                                     + "; ".join(verdicts.reasons()))
 
         # 5. execute on the mock ledger.
-        result = self.executor.execute(resolved_plan)
+        try:
+            result = self.executor.execute(resolved_plan, payload_hash=p_hash)
+        except AlreadyExecuted as exc:     # lost a race to a concurrent submit
+            return self._duplicate(draft_id, p_hash, exc.prior)
         if self.step_up is not None:
             self.step_up.consume(draft_id)
         self.audit.append(
@@ -180,6 +191,14 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
 
+        # 3b. at most once. A fresh nonce and a fresh signature exist for this
+        #     draft on every request — neither says "not again" — so ask the
+        #     ledger. A repeat is refused WITH the original result: a retry
+        #     after a lost response learns what happened instead of paying twice.
+        prior = self.executor.prior_execution(draft_id)
+        if prior is not None:
+            return self._duplicate(draft_id, p_hash, prior)
+
         # Re-derived HERE from the payload, not taken from the draft store: a
         # hand-assembled phone change needs the out-of-band code too.
         reasons = contact_change_step_up(change)
@@ -189,7 +208,10 @@ class Gateway:
                                 "this change needs an out-of-band confirmation "
                                 "first: " + " ".join(reasons))
 
-        result = self.executor.apply_contact_change(change)
+        try:
+            result = self.executor.apply_contact_change(change, payload_hash=p_hash)
+        except AlreadyExecuted as exc:
+            return self._duplicate(draft_id, p_hash, exc.prior)
         if self.step_up is not None and reasons:
             self.step_up.consume(draft_id)
         self.audit.append(AuditEntryType.CONTACT_UPDATE, {
@@ -202,6 +224,14 @@ class Gateway:
                 "payload_hash": p_hash, "execution": result,
                 **({} if result["status"] == "UPDATED"
                    else {"rejection": "FAILED", "reason": result["error"]})}
+
+    def _duplicate(self, draft_id: str, p_hash: str, prior: dict) -> dict:
+        """Refuse a repeat, audited like any rejection, carrying what the one
+        real execution did and when."""
+        out = self._reject(draft_id, p_hash, "DUPLICATE",
+                           f"this draft was already executed at {prior['executed_at']} "
+                           f"({prior['outcome']}); nothing was sent twice")
+        return {**out, "execution": prior["result"], "executed_at": prior["executed_at"]}
 
     def _reject(self, draft_id: str, p_hash: str, kind: str, reason: str) -> dict:
         self.audit.append(

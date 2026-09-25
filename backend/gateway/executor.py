@@ -19,6 +19,9 @@ skipped.
 """
 from __future__ import annotations
 
+import json
+import sqlite3
+import time
 from datetime import datetime, timezone
 
 from backend.data.db import DB_PATH, connect
@@ -30,15 +33,64 @@ from backend.models.schemas import ResolvedPlan
 _CONTACT_COLUMNS = {"nickname": "nickname", "phone": "phone"}
 
 
+class AlreadyExecuted(Exception):
+    """This draft has already been through the executor. Carries the original
+    execution so the caller can hand it back instead of an error."""
+
+    def __init__(self, prior: dict):
+        self.prior = prior
+        super().__init__(f"draft {prior['draft_id']} already executed")
+
+
 class MockExecutor:
     def __init__(self, db_path=DB_PATH):
         self.db_path = db_path
 
-    def execute(self, plan: ResolvedPlan) -> dict:
+    # ------------------------------------------------------------ at most once
+    # A fresh nonce and a fresh signature are available for the same draft on
+    # every request, and neither says "not again". So the guarantee lives here,
+    # at the one place money moves: every execution first CLAIMS its draft_id
+    # in `executions` (PRIMARY KEY), inside the same transaction as the debit.
+    # A second claim cannot be written; a concurrent one blocks on SQLite's
+    # write lock, then fails, and its transaction — debit included — rolls back.
+
+    def prior_execution(self, draft_id: str) -> dict | None:
+        """The recorded execution of this draft, or None if it never ran."""
+        conn = connect(self.db_path)
+        try:
+            row = conn.execute("SELECT * FROM executions WHERE draft_id=?",
+                               (draft_id,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {"draft_id": row["draft_id"], "kind": row["kind"],
+                "payload_hash": row["payload_hash"], "outcome": row["outcome"],
+                "result": json.loads(row["result"]), "executed_at": row["executed_at"]}
+
+    def _claim(self, conn, draft_id: str, kind: str, payload_hash: str) -> None:
+        """First write of the transaction: take the draft, or learn it is taken."""
+        try:
+            conn.execute("INSERT INTO executions VALUES (?,?,?,?,?,?)",
+                         (draft_id, kind, payload_hash, "PENDING", "{}", int(time.time())))
+        except sqlite3.IntegrityError:
+            conn.rollback()
+            prior = self.prior_execution(draft_id)
+            raise AlreadyExecuted(prior) from None
+
+    @staticmethod
+    def _record(conn, draft_id: str, result: dict) -> None:
+        conn.execute("UPDATE executions SET outcome=?, result=? WHERE draft_id=?",
+                     (result["status"], json.dumps(result), draft_id))
+
+    # ------------------------------------------------------------ execution
+    def execute(self, plan: ResolvedPlan, *, payload_hash: str) -> dict:
+        """Run the plan at most once per draft_id. Raises AlreadyExecuted."""
         conn = connect(self.db_path)
         results = []
         aborted = False
         try:
+            self._claim(conn, plan.draft_id, "payment", payload_hash)
             for leg in plan.plan:
                 if aborted:
                     results.append({"id": leg.id, "type": leg.type, "status": "BLOCKED"})
@@ -63,13 +115,18 @@ class MockExecutor:
                     results.append({"id": leg.id, "type": leg.type,
                                     "status": "FAILED", "error": str(exc)})
                     aborted = True
+            result = {"draft_id": plan.draft_id, "legs": results,
+                      "status": "FAILED" if aborted else "EXECUTED"}
+            # A failed execution is recorded too: one draft, one attempt,
+            # whatever the outcome — the card the user signed is spent.
+            self._record(conn, plan.draft_id, result)
             conn.commit()
         finally:
             conn.close()
-        return {"draft_id": plan.draft_id, "legs": results,
-                "status": "FAILED" if aborted else "EXECUTED"}
+        return result
 
-    def apply_contact_change(self, change: ResolvedContactChange) -> dict:
+    def apply_contact_change(self, change: ResolvedContactChange, *,
+                             payload_hash: str) -> dict:
         """Write a signed contact change. All edits or none.
 
         Each UPDATE is conditional on the stored value still being the OLD value
@@ -79,24 +136,34 @@ class MockExecutor:
         conn = connect(self.db_path)
         results = []
         try:
+            self._claim(conn, change.draft_id, "contact_edit", payload_hash)
+            # Edits in a savepoint: a stale value undoes the edits but KEEPS the
+            # claim, so a failed change is recorded as this draft's one attempt.
+            conn.execute("SAVEPOINT edits")
+            result = None
             for e in change.edits:
                 col = _CONTACT_COLUMNS[e.field]
                 cur = conn.execute(
                     f"UPDATE payees SET {col}=? WHERE id=? AND COALESCE({col}, '')=?",
                     (e.new_value, e.payee_id, e.old_value))
                 if cur.rowcount != 1:
-                    conn.rollback()
-                    return {"draft_id": change.draft_id, "status": "FAILED",
-                            "error": f"{e.payee_display}'s {e.field} changed since this "
-                                     "draft was made — nothing was updated",
-                            "changes": []}
+                    conn.execute("ROLLBACK TO SAVEPOINT edits")
+                    result = {"draft_id": change.draft_id, "status": "FAILED",
+                              "error": f"{e.payee_display}'s {e.field} changed since this "
+                                       "draft was made — nothing was updated",
+                              "changes": []}
+                    break
                 results.append({"payee_display": e.payee_display, "field": e.field,
                                 "old_value": e.old_value, "new_value": e.new_value,
                                 "status": "UPDATED"})
+            conn.execute("RELEASE SAVEPOINT edits")
+            if result is None:
+                result = {"draft_id": change.draft_id, "status": "UPDATED", "changes": results}
+            self._record(conn, change.draft_id, result)
             conn.commit()
         finally:
             conn.close()
-        return {"draft_id": change.draft_id, "status": "UPDATED", "changes": results}
+        return result
 
     def _record_leg(self, conn, leg) -> None:
         """Append EVERY executed leg to transaction_history, so the M5 daily and

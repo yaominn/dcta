@@ -347,7 +347,7 @@ def test_non_transfer_legs_count_toward_the_daily_limit(tmp_path):
                           estimated_fill_price_cents=24_150),
         ResolvedPayBill(id="t2", source_account="acct_savings", biller_id="biller_03",
                         biller_display="SP Group", amount_cents=12_345),
-    ))
+    ), payload_hash="test")
     assert result["status"] == "EXECUTED"
 
     rows = [dict(r) for r in connect(db).execute(
@@ -372,7 +372,7 @@ def test_payee_less_rows_cannot_pollute_the_anomaly_baseline(tmp_path):
     MockExecutor(db).execute(_plan(
         ResolvedBuyEquity(id="t1", source_account="acct_savings", ticker="AAPL",
                           amount_cents=241_500, estimated_shares=10,
-                          estimated_fill_price_cents=24_150)))
+                          estimated_fill_price_cents=24_150)), payload_hash="test")
 
     ctx = load_context(user_id="u_alice", db_path=db, now=_NOW)
     # $5,000 to a payee whose history is all $50 must still escalate.

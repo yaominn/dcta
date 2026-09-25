@@ -127,6 +127,13 @@ async function signAndExecute(plan, credentialIds, rpId,
 
   // 2. draft-bound server nonce (single-use, 120s TTL).
   const nonceResp = await jget(API + "/api/auth/nonce?draft_id=" + encodeURIComponent(plan.draft_id));
+  // Already executed (a retry after a lost response, a double tap): the server
+  // issues no nonce, so don't ask for a fingerprint — report what happened.
+  const done = nonceResp.detail;
+  if (done && done.already_executed) {
+    return { status: 409, json: { accepted: false, rejection: "DUPLICATE",
+                                  execution: done.execution, executed_at: done.executed_at } };
+  }
   const nonce = nonceResp.nonce;
 
   // 3. build the challenge OURSELF: sha256(payload_hash + nonce). The server
@@ -433,7 +440,34 @@ function newResultCard(ok) {
   return card;
 }
 
+// A repeat of a draft that already ran. Not a failure: the one real execution
+// is shown, stated as such, so a retry after a lost response ends in the truth.
+function showAlreadySent(res) {
+  const exec = res.json.execution || {};
+  const card = newResultCard(exec.status !== "FAILED");
+  card.append(el("h3", null, "ALREADY SENT"));
+  const at = res.json.executed_at
+    ? new Date(res.json.executed_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+    : "earlier";
+  card.append(el("p", "lead", "This was already sent at " + at + ". Nothing was sent twice."));
+  const ul = el("ul");
+  for (const leg of exec.legs || []) {
+    const li = el("li");
+    li.append(el("span", null, LEG_NAME[leg.type] || leg.type),
+              el("span", null, (leg.amount_cents != null ? centsToDisplay(leg.amount_cents) + " · " : "") + leg.status));
+    ul.append(li);
+  }
+  for (const c of exec.changes || []) {
+    const li = el("li");
+    li.append(el("span", null, c.payee_display + " · " + (c.field === "phone" ? "phone" : "name")),
+              el("span", null, c.new_value));
+    ul.append(li);
+  }
+  card.append(ul);
+}
+
 function showResult(res) {
+  if (res.json.rejection === "DUPLICATE") return showAlreadySent(res);
   const ok = !!res.json.accepted;
   const exec = res.json.execution || {};
   const status = ok ? (exec.status || "EXECUTED") : res.json.rejection || "REJECTED";
