@@ -232,22 +232,40 @@ and no execution until it ends, whatever the client sends; when it ends
 signature** and writes `HOLD_CANCELLED`. The gateway **re-runs the score**:
 the drafted outcome still binds (a lower score later doesn't lift the hold or
 the phone code), and a *higher* one the user was never shown refuses the
-payment (`RESCORED` — cancel and ask again). `SCAM_HOLD_SECONDS` sets the length.
+payment (`RESCORED` — cancel and ask again). The hour is judged when the user
+asked, so a hold that runs past midnight doesn't make the payment a "night-time"
+one. `SCAM_HOLD_SECONDS` sets the length (30 s by default), **capped at 240 s**:
+a draft lasts 5 minutes, and a held one must still be signable when the hold ends.
 
 **Phrase flags** on the user's own words — one list, shared with the
 add-a-contact flow (`backend/policy/new_contact.py`): a "safe account", an
-official *telling you* to pay (police/MAS/CPF + "told me" — so "the badminton
-court" isn't flagged), secrecy, "new number", guaranteed returns, pay-to-earn
-jobs, plus "ignore previous instructions". Run by rule, outside the model (an
-injection could switch off model-made flags). They only ever **add** friction;
-"urgent" alone adds none. Advisory evidence, not a security boundary. A
-warning shows even when the request can't be drafted yet.
+official telling you to pay, secrecy, "new number", guaranteed returns,
+pay-to-earn jobs, plus "ignore previous instructions". Two rules are **stricter
+for payments**, because there one of them alone holds the payment:
+
+- *An official's orders* needs an official, an instruction **and** a money verb:
+  "the officer said I must pay 3000 to mom", "the caller told me to pay mom",
+  "police said to transfer everything" are flagged; "she asked me to book the
+  court", "Mas told me to pay him back 30" and "my officer told me to pay 40 for
+  the unit dinner" are not.
+- *Pay-to-earn* needs the job scam's words ("pay 50 to unlock my commission",
+  "part-time job", "task fee"), not a bare "commission" — "pay the agent 2000
+  commission" is a routine payment.
+
+Run by rule, outside the model (an injection could switch off model-made
+flags). They only ever **add** friction; "urgent" alone adds none. Advisory
+evidence, not a security boundary. A warning shows even when the request can't
+be drafted yet (a refused new contact already carries its own, so it gets no
+second one).
 
 **Kill switch**: **Freeze** in the header stops every outgoing payment at once
 (no signature — safer should be easy), cancels every payment waiting for
 approval (and its hold), burns issued signing challenges, and blocks contact
-adds and edits; **unfreezing needs a code on the phone** (at most 3 codes an
-hour).
+adds and edits. Every press is audited, and what it cancelled is labelled
+`"by": "kill switch"`. **Unfreezing needs a code on the phone**: at most 3
+codes an hour, and the count resets after a successful unfreeze. Unfreezing
+also **cancels anything drafted while frozen** — its hold ran out during the
+freeze, so it would otherwise be signable at once, with no cooling-off.
 
 Every assessment is written to the audit log (`SCAM_ASSESSMENT`, source "rules
 (not the model)") as codes, weights and the outcome — never the user's words. With `CONSOLE_DEBUG` on (default; `CONSOLE_DEBUG=0` to turn
