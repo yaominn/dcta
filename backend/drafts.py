@@ -33,7 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from backend.audit.canonical import payload_hash
-from backend.models.contacts import ResolvedContactChange
+from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
 from backend.models.schemas import MAX_AUTH_WINDOW_S, ResolvedPlan
 
 
@@ -62,11 +62,16 @@ class Draft:
     transcript: str
     intent_plan: dict
     created_at: float
-    kind: str = "payment"             # payment | contact_edit
+    kind: str = "payment"             # payment | contact_edit | contact_add
     status: str = "clarify"
     answers: dict[str, str] = field(default_factory=dict)
     resolved_plan: ResolvedPlan | None = None
     resolved_change: ResolvedContactChange | None = None     # kind == contact_edit
+    resolved_add: ResolvedContactAdd | None = None           # kind == contact_add
+    # contact_add: why it needs what it needs (policy/new_contact.py), and the
+    # draft whose question it answers (a payment that named an unknown payee).
+    risk: dict | None = None
+    origin_draft_id: str | None = None
     policy: dict | None = None
     validation: dict | None = None
     question: dict | None = None
@@ -74,6 +79,8 @@ class Draft:
     @property
     def payload(self):
         """Whatever this draft would have the user sign, or None."""
+        if self.kind == "contact_add":
+            return self.resolved_add
         return self.resolved_plan if self.kind == "payment" else self.resolved_change
 
     def is_expired(self, now: float, ttl: int) -> bool:

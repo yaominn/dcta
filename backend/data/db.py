@@ -51,9 +51,10 @@ def migrate(conn: sqlite3.Connection) -> None:
     (a re-seed would drop the user's own edits and registered passkeys).
     Idempotent; called at app startup."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
-    if cols and "phone" not in cols:
-        conn.execute("ALTER TABLE payees ADD COLUMN phone TEXT")
-        conn.commit()
+    for col in ("phone TEXT", "added_at INTEGER", "hold_until INTEGER"):
+        if cols and col.split()[0] not in cols:
+            conn.execute(f"ALTER TABLE payees ADD COLUMN {col}")
+            conn.commit()
     conn.executescript(EXECUTIONS_DDL)
 
 
@@ -82,8 +83,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
             nickname    TEXT NOT NULL,                   -- 'Mom'  <- shown to the LLM
             legal_name  TEXT NOT NULL,                   -- 'Jane Tan'  <- NEVER shown to the LLM
             last4       TEXT NOT NULL,                   -- '3310'
-            phone       TEXT                             -- '+65 9123 3310'; NEVER shown to the LLM.
+            phone       TEXT,                            -- '+65 9123 3310'; NEVER shown to the LLM.
                                                          -- Editable by the user, via a signed draft only.
+            added_at    INTEGER,                         -- Unix s; NULL for the seeded contacts
+            hold_until  INTEGER                          -- Unix s; payments blocked until then
+                                                         -- (a new contact's HOLD safeguard)
         );
 
         CREATE TABLE IF NOT EXISTS billers (

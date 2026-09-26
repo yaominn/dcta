@@ -152,6 +152,9 @@ class Clarify:
     kind: str                       # payee | biller | account | equity | empty | zero | insufficient | equity_too_small | amount | restate
     choices: list[dict]
     resume_state: dict
+    # A 0-match: the user's words that matched nothing. For a payee it lets the
+    # page offer "add them as a new contact" alongside the existing ones.
+    unknown_mention: str | None = None
 
 
 @dataclass
@@ -511,6 +514,7 @@ def _pick(
     return Clarify(
         question=question, field=field, kind=kind,
         choices=choices, resume_state=resume,
+        unknown_mention=None if rows else mention,
     )
 
 

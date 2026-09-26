@@ -56,3 +56,14 @@ def change_summary(change) -> str:
         what = "phone number" if e.field == "phone" else "name"
         parts.append(f"change {e.payee_display}'s {what} to {e.new_value}")
     return "; and ".join(parts)
+
+
+def add_summary(add) -> str:
+    """The out-of-band message text for a ResolvedContactAdd, from the server's
+    copy — the number is spelled out, so a tampered screen can't hide it."""
+    hold = ""
+    if add.hold_minutes:
+        h, m = divmod(add.hold_minutes, 60)
+        hold = (f", with payments to them on hold for "
+                f"{f'{h} h' if h else ''}{' ' if h and m else ''}{f'{m} min' if m else ''}")
+    return f"add a new contact {add.nickname} ({add.phone}){hold}"

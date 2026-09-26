@@ -126,8 +126,10 @@ class StepUpStore:
 @dataclass
 class SimulatedPhone:
     """# MOCK: the user's registered device. Holds the messages an SMS gateway
-    would have delivered, so the demo can show the second channel on a second
-    screen. Nothing on the confirmation overlay reads from here."""
+    would have delivered, so the demo can show the second channel — at /phone,
+    or as a drop-down banner on the assistant page (frontend/phone-notify.js).
+    The assistant code (app.js) and the draft/confirm responses never carry
+    the code."""
     _inbox: dict[str, list[dict]] = field(default_factory=dict)
 
     def deliver(self, user_id: str, text: str) -> None:

@@ -84,6 +84,11 @@ class Settings:
     # the same plan and the retry budget is spent on real ambiguity, not
     # sampling noise.
     llm_temperature: float = float(os.getenv("LLM_TEMPERATURE", "0"))
+
+    # How long payments to a new contact are held when it was added with the
+    # HOLD safeguard (backend/policy/new_contact.py). 12 hours by default; set
+    # it to a few minutes for a rehearsal that needs to see the hold lift.
+    new_contact_hold_minutes: int = int(os.getenv("NEW_CONTACT_HOLD_MINUTES", "720"))
     # A hung upstream call must not hold the HTTP request open indefinitely.
     llm_timeout_s: float = float(os.getenv("LLM_TIMEOUT_S", "30"))
     hunyuan_region: str = os.getenv("TENCENT_HUNYUAN_REGION", "ap-guangzhou")

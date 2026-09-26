@@ -215,6 +215,10 @@ function typing(on) {
 const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign", "decline",
                   "stepup", "stepup-reason", "stepup-form", "stepup-code"];
 function retireLiveCard() {
+  // Every control on the spent card, not only the ones with ids — the
+  // step-up Verify button stayed live after a Cancel.
+  const live = document.getElementById("plan");
+  if (live) live.querySelectorAll("button, input").forEach((n) => { n.disabled = true; });
   for (const id of LIVE_IDS) {
     const n = document.getElementById(id);
     if (!n) continue;
@@ -370,13 +374,122 @@ function buildContactsCard(contacts) {
     const li = el("li");
     const av = el("div", "cavatar", (c.nickname || "?").charAt(0).toUpperCase());
     const who = el("div", "cwho");
-    who.append(el("div", "cname", c.display), el("div", "cphone", c.phone || "No phone number"));
+    who.append(el("div", "cname", c.display), el("div", "cphone",
+      (c.phone || "No phone number") + (c.hold_until ? " \u00b7 payments open " + atTime(c.hold_until) : "")));
     li.append(av, who);
     ul.append(li);
   }
   card.append(ul);
-  card.append(el("p", "hint", "Say \"rename John to Johnny\" or \"change Mom's number to 9123 4567\"."));
+  card.append(el("p", "hint", "Say \"add Bob as a contact, 9123 4567\", \"rename John to Johnny\" "
+    + "or \"change Mom's number to 9123 4567\"."));
   return card;
+}
+
+/* A NEW contact. Same template rules as the other cards: the name and number
+   come from the signed payload; the warnings are the server's FIXED sentences
+   (backend/policy/new_contact.py), never model text; the safeguards shown are
+   the ones inside the payload the biometric signs. */
+function holdLabel(minutes) {
+  const h = Math.floor(minutes / 60), m = minutes % 60;
+  return [h ? h + (h === 1 ? " hour" : " hours") : "", m ? m + " min" : ""].filter(Boolean).join(" ");
+}
+function atTime(unix) {
+  return new Date(unix * 1000).toLocaleString([], { weekday: "short", hour: "numeric", minute: "2-digit" });
+}
+function riskBox(risk, heading) {
+  const box = el("div", "risk " + (risk.rung === "CODE" || risk.rung === "STANDARD" ? "mid" : "high"));
+  box.append(el("p", "risk-title", heading));
+  const ul = el("ul", "risk-list");
+  const warnings = (risk.warnings || []).slice()
+    .sort((a, b) => (a.weight === "ai") - (b.weight === "ai"));    // the rules first
+  for (const w of warnings) ul.append(el("li", w.weight === "ai" ? "ai" : null, w.text));
+  box.append(ul);
+  return box;
+}
+
+function buildAddCard(add, risk, confirmation) {
+  retireLiveCard();
+  const card = el("div", "bubble card plan-card plan");
+  card.id = "plan";
+  card.append(el("p", "card-title", "Add new contact"));
+  const legs = el("div", "legs"); legs.id = "legs";
+  const row = el("div", "leg change");
+  row.append(el("div", "icon", "+"), el("div", "title", add.nickname), el("div", "amt", ""));
+  const sub = el("div", "sub diff");
+  sub.append(el("span", null, "Mobile: "), el("b", "new", add.phone));
+  row.append(sub);
+  legs.append(row);
+  card.append(legs);
+
+  if (risk && (risk.warnings || []).length) {
+    card.append(riskBox(risk, risk.rung === "HOLD" ? "Some of this looks like a scam"
+                                                   : "Worth a second look"));
+  }
+  const sg = el("ul", "safeguards");
+  const item = (icon, text) => {
+    const li = el("li");
+    li.append(el("span", "sg-icon", icon), el("span", null, text));
+    sg.append(li);
+  };
+  item("\u2713", "Your biometric, over exactly this contact");
+  if (add.safeguards.includes("PHONE_CODE")) item("\u2713", "A code sent to your phone");
+  if (add.safeguards.includes("HOLD")) {
+    item("\u23F8", "No payments to " + add.nickname + " for " + holdLabel(add.hold_minutes)
+      + " after saving \u2014 time to call them and check");
+  }
+  card.append(el("p", "sg-title", "Safeguards"), sg);
+
+  const sec = el("details", "sec");
+  sec.append(el("summary", null, "Security details"));
+  const dl = el("dl", "meta");
+  const addRow = (k, v, id, cls) => {
+    const dd = el("dd", cls, v); if (id) dd.id = id;
+    dl.append(el("dt", null, k), dd);
+  };
+  addRow("Scam check (AI)", risk ? risk.ai_risk : "\u2014");
+  addRow("Authorization window", windowLabel(add.created_at, add.expires_at), "window");
+  addRow("Transcript hash", add.transcript_hash.slice(0, 16) + "\u2026", "txhash", "mono");
+  addRow("Payload hash (your browser)", "computed when you confirm", "phash", "mono");
+  sec.append(dl);
+  card.append(sec);
+
+  if (confirmation) card.append(buildStepUp(confirmation));
+  const btn = el("button", "btn primary", "Save contact with biometric");
+  btn.id = "sign";
+  btn.disabled = !!confirmation;
+  btn.onclick = onSign;
+  card.append(btn, declineButton());
+  card.append(el("p", "hint", "Nothing is saved until you confirm. Your device signs exactly "
+    + "this contact and these safeguards."));
+  return card;
+}
+
+function showContactRefused(body) {
+  retireLiveCard();
+  CURRENT.afterAdd = null;
+  const card = newResultCard(false);
+  card.append(el("h3", null, "NOT ADDED"));
+  card.append(el("p", "lead", "I won't save " + ((body.contact && body.contact.display) || "this contact")
+    + ". Nothing was saved and nothing was sent."));
+  card.append(riskBox(body.risk || {}, "Why"));
+  card.append(el("p", "scam-help", "If someone asked you to do this, stop. Call the ScamShield "
+    + "Helpline on 1799, or your bank on the number on your card."));
+  Voice.speak("I won't save this contact. It looks like a scam. Nothing was sent.");
+}
+
+/* "What's their number?" — the next thing the user says answers it. The server
+   gets only the id of the draft that asked; it reads the name and any waiting
+   payment from its own copy. */
+let NEW_CONTACT = null;          // { forDraft, name } while waiting for a number
+function awaitNumber(forDraft, name) {
+  NEW_CONTACT = { forDraft, name };
+  const input = document.getElementById("say");
+  if (input) { input.placeholder = name + "'s mobile number\u2026"; input.focus(); }
+}
+function stopAwaitingNumber() {
+  NEW_CONTACT = null;
+  const input = document.getElementById("say");
+  if (input) input.placeholder = "Pay, invest, or edit a contact\u2026";
 }
 
 /* Out-of-band step-up. The code is NOT in any response this page receives: it
@@ -388,7 +501,8 @@ function buildStepUp(conf) {
   const reason = el("p", "stepup-reason", (conf.reasons || []).join(" "));
   reason.id = "stepup-reason";
   box.append(reason);
-  const hint = el("p", "hint", "We texted a 6-digit code to your phone. Check the details there, then enter it. ");
+  const hint = el("p", "hint", "We texted a 6-digit code to your phone. Check the details in the "
+    + "message at the top of the screen, then enter it. ");
   const a = el("a", null, "Open the demo phone");
   a.href = "/phone"; a.target = "dcta-phone";
   hint.append(a);
@@ -416,7 +530,9 @@ function buildStepUp(conf) {
       form.remove();
       const sign = document.getElementById("sign");
       if (sign) sign.disabled = false;
-      botSay("Code accepted. Confirm with your biometric to send it.");
+      botSay("Code accepted. Confirm with your biometric to "
+        + (CURRENT.kind === "contact_add" ? "save the contact."
+           : CURRENT.kind === "contact_edit" ? "make the change." : "send it."));
       return;
     }
     go.disabled = false;
@@ -569,6 +685,9 @@ function successToast(exec, plan) {
       : "Transfer successful";
     return { title, lines };
   }
+  if (exec.status === "ADDED" && exec.contact) {
+    return { title: "Contact added", lines: [exec.contact.payee_display + " \u00b7 " + exec.contact.phone] };
+  }
   if (exec.status === "UPDATED") {
     return { title: "Contact updated", lines: (exec.changes || []).map((c) =>
       c.payee_display + " · " + (c.field === "phone" ? "phone" : "name") + " → " + c.new_value) };
@@ -600,6 +719,17 @@ function showResult(res) {
   if (ok) {
     card.append(el("p", "lead", "Done. Here's what went through:"));
     const ul = el("ul");
+    if (exec.contact) {
+      const c = exec.contact;
+      const li = el("li");
+      li.append(el("span", null, c.payee_display), el("span", null, c.phone));
+      ul.append(li);
+      if (c.hold_until) {
+        const hold = el("li");
+        hold.append(el("span", null, "Payments open"), el("span", null, atTime(c.hold_until)));
+        ul.append(hold);
+      }
+    }
     for (const c of exec.changes || []) {
       const li = el("li");
       li.append(el("span", null, c.payee_display + " · " + (c.field === "phone" ? "phone" : "name")),
@@ -613,12 +743,37 @@ function showResult(res) {
       ul.append(li);
     }
     card.append(ul);
+    if (exec.contact) afterContactAdded(exec.contact);
   } else {
     card.append(el("p", "lead", res.json.reason || "The gateway refused this payment."));
     const pre = el("pre");
     pre.textContent = JSON.stringify(res.json, null, 2);
     card.append(pre);
   }
+}
+
+// The contact exists now. If it was added to pay them, offer to carry on —
+// unless it is on hold, in which case say when payments open instead.
+function afterContactAdded(c) {
+  const pending = CURRENT.afterAdd;
+  CURRENT.afterAdd = null;
+  if (c.hold_until) {
+    botSay(c.nickname + " is saved. Payments to them open " + atTime(c.hold_until)
+      + ". Use the time to call them on a number you already know.");
+    return;
+  }
+  if (!pending) return;
+  const m = botSay(c.nickname + " is saved. Shall I carry on with your payment?");
+  const chips = el("div", "chips live");
+  const b = el("button", "chip choice", "Continue: " + pending);
+  b.type = "button";
+  b.onclick = () => {
+    chips.classList.remove("live");
+    b.disabled = true;
+    submitTranscript(pending);
+  };
+  chips.append(b);
+  m.append(chips);
 }
 
 function showRefusal(title, detail, explanation) {
@@ -636,7 +791,8 @@ function showRefusal(title, detail, explanation) {
    id. The client never holds or returns the plan — so it cannot substitute one,
    and a clarify round-trip re-RESOLVES against the stored IntentPlan rather
    than re-parsing the transcript. */
-let CURRENT = { draftId: null, plan: null, kind: "payment", credentialIds: [], rpId: undefined, transcript: "" };
+let CURRENT = { draftId: null, plan: null, kind: "payment", credentialIds: [], rpId: undefined, transcript: "",
+                afterAdd: null };   // afterAdd: the payment to carry on with once a new contact is saved
 
 function setStatus(msg) {
   const s = document.getElementById("status");
@@ -652,6 +808,10 @@ function handleDraft(res) {
   }
   const body = res.json;
   CURRENT.draftId = body.draft_id;
+  if (body.kind === "contact_add" && body.status === "blocked") {   // refused: a scam
+    showContactRefused(body);
+    return;
+  }
 
   // Four outcomes, and the user must be able to tell them apart. All are HTTP
   // 200: needing to ask is a normal conversational result, and a refusal is a
@@ -680,6 +840,19 @@ function handleDraft(res) {
     return;
   }
   const conf = body.requires_extra_confirmation ? (body.confirmation || {}) : null;
+  if (body.kind === "contact_add") {
+    CURRENT.plan = body.contact_add;
+    CURRENT.kind = "contact_add";
+    const rung = (body.risk && body.risk.rung) || "STANDARD";
+    const intro = el("div", "bubble",
+      rung === "HOLD" ? "I can save them, but with extra protection \u2014 parts of this look like "
+                        + "common scams. Please read the warnings first."
+      : conf ? "Here's the new contact. Before I save them, I've texted a code to your phone."
+      : "Here's the new contact. Check the number, then confirm with your biometric.");
+    addMsg("bot", intro, buildAddCard(body.contact_add, body.risk, conf));
+    if (conf) { const code = document.getElementById("stepup-code"); if (code) code.focus(); }
+    return;
+  }
   if (body.kind === "contact_edit") {
     CURRENT.plan = body.contact_change;
     CURRENT.kind = "contact_edit";
@@ -704,6 +877,7 @@ function handleDraft(res) {
 }
 
 async function submitTranscript(transcript, via) {
+  Voice.silence();                  // don't talk over the user's next request
   CURRENT.transcript = transcript;
   userSay(transcript);
   if (via) {
@@ -711,7 +885,12 @@ async function submitTranscript(transcript, via) {
     last.append(el("p", "meta-note", "via " + via));
   }
   typing(true);
-  handleDraft(await jpost(API + "/api/drafts", { transcript, user_id: DEMO_USER }));
+  const nc = NEW_CONTACT;
+  stopAwaitingNumber();
+  if (!nc) CURRENT.afterAdd = null;       // a fresh request, not the number we asked for
+  handleDraft(await jpost(API + "/api/drafts", {
+    transcript, user_id: DEMO_USER, ...(nc ? { new_contact_for: nc.forDraft } : {}),
+  }));
 }
 
 async function answerClarification(field, choiceId) {
@@ -724,8 +903,16 @@ async function answerClarification(field, choiceId) {
 
 function renderClarify(body) {
   retireLiveCard();
+  stopAwaitingNumber();
   const m = addMsg("bot", el("div", "bubble", body.question));
-  if (body.choices && body.choices.length) {
+  const nc = body.new_contact;
+  if (nc && body.kind !== "payee") {
+    // A new contact still missing (or with a bad) number: the reply is the number.
+    awaitNumber(body.draft_id, nc.name);
+    m.append(el("p", "meta-note", "Say or type their number."));
+    return;
+  }
+  if (body.choices && body.choices.length || nc) {
     // 2+ disambiguation: the user picks, and we resume with `answers`. The
     // resolver re-validates the chosen id against a fresh deterministic match,
     // so a tampered choice cannot inject a payee the mention never justified.
@@ -737,8 +924,27 @@ function renderClarify(body) {
         chips.classList.remove("live");
         chips.querySelectorAll("button").forEach((x) => { x.disabled = true; });
         b.classList.add("chosen");
+        stopAwaitingNumber();
         userSay(c.display);
         answerClarification(body.field, c.id);
+      };
+      chips.append(b);
+    }
+    if (nc) {
+      // Someone who isn't a contact yet. Adding them is its own signed draft,
+      // with safeguards chosen by how risky it looks.
+      const b = el("button", "chip choice add", "+ Add " + nc.name + " as a new contact");
+      b.type = "button";
+      b.onclick = () => {
+        chips.classList.remove("live");
+        chips.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+        b.classList.add("chosen");
+        userSay("Add " + nc.name + " as a new contact");
+        CURRENT.afterAdd = CURRENT.transcript;        // the payment to carry on with
+        const ask = "What's " + nc.name + "'s mobile number? It's where payments to them will go.";
+        botSay(ask);
+        Voice.speak(ask);
+        awaitNumber(body.draft_id, nc.name);
       };
       chips.append(b);
     }
@@ -753,7 +959,7 @@ function renderClarify(body) {
 // Cancel, before confirming. The server records the decline durably and the
 // draft can never be signed afterwards — not a button that merely hides a card.
 function declineButton() {
-  const b = el("button", "btn secondary", "Cancel");
+  const b = el("button", "btn danger", "Cancel");
   b.id = "decline";
   b.onclick = onDecline;
   return b;
@@ -797,10 +1003,15 @@ async function onSign() {
     const res = CURRENT.kind === "contact_edit"
       ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
                              "/api/contacts/apply-webauthn", "contact_change")
+      : CURRENT.kind === "contact_add"
+      ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
+                             "/api/contacts/add-webauthn", "contact_add")
       : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId);
-    showResult(res);
     // One draft, one signature: the card is spent whatever the outcome.
+    // Retired BEFORE the result renders, so chips the result offers (carry on
+    // with the payment) are not retired along with it.
     retireLiveCard();
+    showResult(res);
   } catch (e) {
     showErr(e && e.name === "NotAllowedError"
       ? "Biometric cancelled — nothing was sent. Tap confirm to try again."
@@ -873,6 +1084,7 @@ function wireVoice() {
   }
 
   mic.onclick = async () => {
+    Voice.silence();                // the mic must not hear the assistant
     // A second press stops whichever tier is listening.
     if (active) { active.stop(); active = null; return; }
     if (serverAsrDown) { startWebSpeech(); return; }
@@ -907,6 +1119,7 @@ const SUGGESTIONS = [
   "Pay mom five hundred then buy Apple with the rest",
   "Send fifty to John",
   "Send five thousand to John",
+  "Send 200 to Uncle Bob",
   "Show my contacts",
   "Change Mom's number to 9123 4567",
 ];
@@ -931,7 +1144,28 @@ function tickClock() {
 }
 
 /* ---------- bootstrap ---------- */
+/* The voice button, top right. What a tap does depends on the moment:
+   talking -> stop now and mute; on -> mute; muted -> unmute. */
+const SOUND_LABELS = {
+  speaking: "Stop talking and mute the assistant",
+  on: "Mute the assistant's voice",
+  muted: "Unmute the assistant's voice",
+};
+function wireSound() {
+  const btn = document.getElementById("sound");
+  if (!btn || !Voice.ttsAvailable()) return;   // no speech engine: nothing to mute
+  btn.hidden = false;
+  Voice.onStateChange((st) => {
+    btn.dataset.state = st;
+    btn.setAttribute("aria-pressed", String(st === "muted"));
+    btn.setAttribute("aria-label", SOUND_LABELS[st]);
+    btn.title = SOUND_LABELS[st];
+  });
+  btn.onclick = () => Voice.setMuted(!Voice.isMuted());
+}
+
 async function init() {
+  wireSound();
   tickClock();
   setInterval(tickClock, 15000);
   refreshBalances();

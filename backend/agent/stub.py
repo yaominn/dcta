@@ -34,6 +34,11 @@ class StubProvider:
         context = _extract_context(user)
         if system == prompts.contact_system_prompt():
             return json.dumps(_rules_contact_edit(transcript, context))
+        if system == prompts.contact_add_system_prompt():
+            return json.dumps(_rules_contact_add(transcript, _extract_block(
+                user, prompts.NAME_HINT_MARKER)))
+        if system == prompts.scam_system_prompt():
+            return json.dumps(_rules_scam(transcript, _extract_facts(user)))
         plan = _rules_plan(transcript, context)
         return json.dumps(plan)
 
@@ -43,9 +48,28 @@ def _extract_transcript(user_prompt: str) -> str:
     """Lift the verbatim transcript out of the prompt (a real model just reads
     it; the stub needs it as a string)."""
     after = user_prompt.split(prompts.TRANSCRIPT_MARKER, 1)[1]
-    for footer in (prompts.OUTPUT_FOOTER, prompts.CONTACT_OUTPUT_FOOTER):
-        after = after.split(footer, 1)[0]
+    for end in (prompts.OUTPUT_FOOTER, prompts.CONTACT_OUTPUT_FOOTER,
+                prompts.CONTACT_ADD_OUTPUT_FOOTER, prompts.SCAM_OUTPUT_FOOTER,
+                *prompts.TRAILING_MARKERS):
+        after = after.split(end, 1)[0]
     return after.strip()
+
+
+def _extract_block(user_prompt: str, marker: str) -> str | None:
+    """A trailing data block (e.g. the name hint), or None if absent."""
+    if marker not in user_prompt:
+        return None
+    after = user_prompt.split(marker, 1)[1]
+    for end in (prompts.CONTACT_ADD_OUTPUT_FOOTER, prompts.SCAM_OUTPUT_FOOTER):
+        after = after.split(end, 1)[0]
+    return after.strip() or None
+
+
+def _extract_facts(user_prompt: str) -> dict:
+    try:
+        return json.loads(_extract_block(user_prompt, prompts.FACTS_MARKER) or "{}")
+    except json.JSONDecodeError:
+        return {}
 
 
 def _extract_context(user_prompt: str) -> dict:
@@ -303,3 +327,75 @@ def _rules_contact_edit(transcript: str, context: dict) -> dict:
         else:
             unresolved.append(f"could not tell what to change in: {clause!r}")
     return {"edits": edits, "unresolved": unresolved}
+
+
+
+# --------------------------------------------------------------------------- new contacts
+# "add Bob as a contact, 9123 4567", "new contact uncle bob 9123 4567",
+# "save Jim's number 8123 0000", or — answering "what's Bob's number?" — just
+# "9123 4567". Both values are copied VERBATIM; validating them is the
+# resolver's job.
+_A_NAME = r"(?P<name>[A-Za-z][A-Za-z.'\- ]*?)"
+_A_STOP = r"(?=\s*(?:,|;|\.|with\b|whose\b|his\b|her\b|their\b|number\b|phone\b|mobile\b|at\b|on\b|is\b|\+|\d|$))"
+_A_PATTERNS = [
+    re.compile(r"\b(?:add|save|create)\s+" + _A_NAME + r"\s+as\s+(?:a\s+)?(?:new\s+)?(?:contact|payee)\b", re.I),
+    re.compile(r"\b(?:add|save|create)\s+(?:a\s+)?(?:new\s+)?(?:contact|payee)\s*(?:called|named|for|:)?\s+"
+               + _A_NAME + _A_STOP, re.I),
+    re.compile(r"\bnew\s+(?:contact|payee)\s*(?:called|named|for|:)?\s*" + _A_NAME + _A_STOP, re.I),
+    re.compile(r"\bsave\s+" + _A_NAME + r"(?:'s|’s)\s+(?:number|phone|mobile)", re.I),
+    re.compile(r"^\s*(?:please\s+)?(?:add|save)\s+" + _A_NAME + _A_STOP, re.I),
+]
+_A_DIGITS = re.compile(r"\+?\d[\d\s\-]{5,}\d")
+_A_WORD_DIGITS = re.compile(
+    r"\b(?:(?:zero|oh|one|two|three|four|five|six|seven|eight|nine|double|triple)\b[\s,-]*){6,}", re.I)
+
+
+def _rules_contact_add(transcript: str, name_hint: str | None) -> dict:
+    text = transcript.strip()
+    name = None
+    for pat in _A_PATTERNS:
+        m = pat.search(text)
+        if m:
+            cand = re.sub(r"^(?:my|a|the|our)\s+", "", m.group("name").strip(), flags=re.I)
+            if cand and cand.lower() not in ("contact", "payee", "new", "number"):
+                name = cand
+                break
+    m = _A_DIGITS.search(text) or _A_WORD_DIGITS.search(text)
+    phone = m.group(0).strip(" ,-") if m else None
+    contact = {"nickname": name or name_hint, "phone": phone}
+    unresolved = [f"{k} for the new contact" for k, v in
+                  (("name", contact["nickname"]), ("phone number", phone)) if not v]
+    return {"contact": contact, "unresolved": unresolved}
+
+
+# --------------------------------------------------------------------------- scam review
+# A keyword stand-in for the model's judgement, so the pipeline (and the demo)
+# runs offline. Written separately from backend/policy/new_contact.py on
+# purpose: the rules there are the floor, this plays the second opinion.
+_S_SIGNALS = [
+    ("urgency", r"\burgent|\bright now\b|\bimmediately\b|\basap\b|\bhurry\b|\bquick(?:ly)?\b"),
+    ("secrecy", r"\bdon'?t tell\b|\bdo not tell\b|\bsecret\b|\bbetween us\b"),
+    ("impersonation_family", r"\bnew (?:phone )?number\b|\blost (?:my|his|her) phone\b|\bit'?s me\b"),
+    ("impersonation_official", r"\b(?:police|officer|mas|cpf|iras|ica|interpol|government|bank staff)\b"),
+    ("safe_account", r"\b(?:safe|safety|secure|holding) account\b"),
+    ("investment_promise", r"\bguaranteed\b|\breturns?\b|\bcrypto\b|\bbitcoin\b|\binvest(?:ment)?\b"),
+    ("job_or_task", r"\bcommission\b|\bpart[- ]time\b|\btask\b"),
+    ("parcel_or_refund", r"\bparcel\b|\bcustoms\b|\brefund\b|\bdelivery fee\b"),
+    ("romance", r"\b(?:met|know) (?:him|her|them) online\b|\bdating\b|\bboyfriend\b|\bgirlfriend\b"),
+    ("third_party_instructions", r"\b(?:he|she|they|someone) (?:told|asked|wants?) me to\b"),
+]
+_S_SEVERE = {"secrecy", "impersonation_official", "safe_account", "investment_promise",
+             "job_or_task", "impersonation_family"}
+
+
+def _rules_scam(conversation: str, facts: dict) -> dict:
+    signals = [s for s, pat in _S_SIGNALS if re.search(pat, conversation, re.I)]
+    if set(signals) & _S_SEVERE or len(signals) >= 2:
+        risk = "high"
+    elif signals or facts.get("same_name_as_an_existing_contact_with_a_different_number"):
+        risk = "medium"
+    else:
+        risk = "low"
+    reason = ("no scam indicators in what the customer said" if not signals
+              else "indicators: " + ", ".join(signals))
+    return {"risk": risk, "signals": signals, "reason": reason}

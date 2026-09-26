@@ -15,8 +15,8 @@
       <p class="muted">Scenario 1 — Voice-Enabled Payment &amp; Transaction,
         with KYC and basic risk control.</p>
       <p class="muted small">Unusual payments and phone-number changes send a
-        code to the user's phone.
-        <a href="/phone" target="dcta-phone">Open the demo phone</a> in a
+        code to the user's phone. It drops down at the top of the screen here, or
+        <a href="/phone" target="dcta-phone">open the demo phone</a> in a
         second window.</p>
       <p class="muted small"><a href="/data" target="dcta-data">See exactly what
         the AI was told</a>, step by step, for every request.</p>
@@ -42,6 +42,13 @@
             <p class="name">DCTA Assistant</p>
             <p class="sub"><span class="dot"></span>Drafts only · you approve every payment</p>
           </div>
+          <!-- The assistant's voice. Its icon follows the situation: waves
+               while it is talking (tap = stop now and mute), a speaker when
+               on (tap = mute), a crossed speaker when muted (tap = unmute). -->
+          <button id="sound" class="sound" type="button" data-state="on" hidden
+                  aria-label="Mute the assistant's voice" title="Mute the assistant's voice">
+            <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 9.5h3.2L12 5.5v13l-4.8-4H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Z"/><path class="w1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.2 9.2a4 4 0 0 1 0 5.6"/><path class="w2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M17.8 6.8a7.5 7.5 0 0 1 0 10.4"/><path class="x" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.5 9.5l5 5m0-5-5 5"/></svg>
+          </button>
           <div class="shield" title="Every payment needs your biometric">
             <svg width="20" height="20" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M12 3l7 3v5.5c0 4.3-2.9 7.9-7 9.5-4.1-1.6-7-5.2-7-9.5V6l7-3Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8.8 12.2l2.2 2.2 4.3-4.6"/></svg>
           </div>
@@ -58,6 +65,10 @@
         <!-- The drop-down notification after a payment goes through. Built with
              textContent only; announced to screen readers via role=status. -->
         <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+
+        <!-- MOCK: the demo phone's text messages drop down here (phone-notify.js),
+             so the step-up code shows without a second window. -->
+        <div id="sms-banner" class="sms-banner" role="status" aria-live="polite" hidden></div>
 
         <!-- The conversation. Every value from the server is set with
              textContent (never innerHTML), and a payment is rendered as a
@@ -105,5 +116,6 @@
   <script src="/static/canonical.js"></script>
   <script src="/static/voice.js"></script>
   <script src="/static/app.js"></script>
+  <script src="/static/phone-notify.js"></script>
 </body>
 </html>

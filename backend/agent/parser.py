@@ -17,7 +17,7 @@ from backend.agent import prompts
 from backend.agent.context import PromptContext
 from backend.agent.provider import LLMProvider
 from backend.agent.errors import ProviderError, ProviderUnavailable
-from backend.models.contacts import ContactEditPlan
+from backend.models.contacts import ContactAddPlan, ContactEditPlan, ScamAssessment
 from backend.models.schemas import IntentPlan
 
 MAX_ATTEMPTS = 3   # 1 initial try + 2 repairs; then fail closed
@@ -74,10 +74,34 @@ def parse_contact_edit(transcript: str, *, provider: LLMProvider,
         max_attempts=max_attempts)
 
 
-def _generate_validated(schema, transcript: str, context: PromptContext, *,
+def parse_contact_add(transcript: str, *, provider: LLMProvider, context: PromptContext,
+                      name_hint: str | None = None,
+                      max_attempts: int = MAX_ATTEMPTS) -> ContactAddPlan:
+    """Turn "add Bob, 9123 4567" (or just "9123 4567", with the name the user
+    gave earlier as `name_hint`) into a validated ContactAddPlan."""
+    return _generate_validated(
+        ContactAddPlan, transcript, context, system=prompts.contact_add_system_prompt(),
+        footer=prompts.contact_add_footer(name_hint), provider=provider,
+        max_attempts=max_attempts)
+
+
+def assess_scam_risk(conversation: str, *, facts: dict, provider: LLMProvider,
+                     max_attempts: int = 2) -> ScamAssessment:
+    """The LLM's scam-risk read of a new contact. ADVISORY — see
+    backend/policy/new_contact.py for how little it is allowed to decide.
+    Raises ParseFailure / ProviderUnavailable like the parsers; the caller
+    treats either as "the check could not run", which adds care."""
+    return _generate_validated(
+        ScamAssessment, conversation, None, system=prompts.scam_system_prompt(),
+        footer=prompts.SCAM_OUTPUT_FOOTER, provider=provider, max_attempts=max_attempts,
+        user=prompts.scam_user_prompt(conversation, facts))
+
+
+def _generate_validated(schema, transcript: str, context: PromptContext | None, *,
                         system: str, footer: str, provider: LLMProvider,
-                        max_attempts: int):
-    user = prompts.user_prompt(transcript, context, footer=footer)
+                        max_attempts: int, user: str | None = None):
+    first = user if user is not None else prompts.user_prompt(transcript, context, footer=footer)
+    user = first
     errors: list[str] = []
 
     for attempt in range(1, max_attempts + 1):
@@ -99,8 +123,5 @@ def _generate_validated(schema, transcript: str, context: PromptContext, *,
         except ValueError as exc:     # JSON errors AND pydantic ValidationError
             errors.append(f"attempt {attempt}: {exc}")
             if attempt < max_attempts:
-                user = prompts.retry_prompt(
-                    transcript, context, previous_output=raw, error=str(exc),
-                    footer=footer,
-                )
+                user = prompts.repair_prompt(first, previous_output=raw, error=str(exc))
     raise ParseFailure(errors)

@@ -23,7 +23,7 @@ import re
 from backend.audit.canonical import hash_transcript
 from backend.audit.log import AuditLog
 from backend.data.db import connect, get_conn
-from backend.models.contacts import ContactEditPlan, ResolvedContactChange
+from backend.models.contacts import ContactEditPlan, ResolvedContactAdd, ResolvedContactChange
 from backend.validator import (FreezeSet, ValidationReport, _fail, _finish, _pass,
                                _word_in, default_freeze_set)
 
@@ -93,3 +93,28 @@ def validate_contact_change(intent: ContactEditPlan, change: ResolvedContactChan
 
     return _finish(change.draft_id, change, checks, [], llm_check="skipped",
                    audit=audit, fset=fset)
+
+
+def validate_contact_add(add: ResolvedContactAdd, transcript: str, *, audit: AuditLog,
+                         freeze_set: FreezeSet | None = None) -> ValidationReport:
+    """A new contact's name and number must be words the user actually said.
+    `transcript` is everything they said for this contact (the payment that
+    named them, then the number). A compromised parser or resolver cannot slip
+    in a number — or a name — the user never gave."""
+    fset = freeze_set if freeze_set is not None else default_freeze_set
+    if hash_transcript(transcript) != add.transcript_hash:
+        return _finish(add.draft_id, add, [_fail("transcript_binding", "*",
+                                                 "the contact is not bound to this transcript")],
+                       [], llm_check="skipped", audit=audit, fset=fset)
+    checks = [_pass("transcript_binding", "*", "bound to this transcript")]
+    said = " ".join(transcript.split())
+    ok = _word_in(add.nickname, said)
+    checks.append((_pass if ok else _fail)(
+        "name", "new", f"name {add.nickname!r} {'is' if ok else 'is NOT'} in what was said"))
+    national = re.sub(r"\D", "", add.phone)
+    if add.phone.startswith("+65 "):
+        national = national[2:]
+    ok = bool(national) and national in _digit_stream(transcript)
+    checks.append((_pass if ok else _fail)(
+        "number", "new", f"number {add.phone} {'is' if ok else 'is NOT'} in what was said"))
+    return _finish(add.draft_id, add, checks, [], llm_check="skipped", audit=audit, fset=fset)

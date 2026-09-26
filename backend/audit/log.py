@@ -36,6 +36,7 @@ class AuditEntryType(str, Enum):
     POLICY = "POLICY"
     CONFIRMATION = "CONFIRMATION"   # out-of-band step-up (gateway/stepup.py)
     CONTACT_UPDATE = "CONTACT_UPDATE"   # a signed payee rename / phone change
+    CONTACT_ADD = "CONTACT_ADD"         # a signed new payee (and its safeguards)
     SIGNATURE = "SIGNATURE"
     EXECUTION = "EXECUTION"
     DRAFT_DECLINED = "DRAFT_DECLINED"     # the user said no before signing

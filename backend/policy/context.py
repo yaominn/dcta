@@ -28,13 +28,18 @@ def load_context(user_id: str, *, db_path=None, now: int | None = None) -> Polic
         history = [dict(r) for r in conn.execute(
             "SELECT payee_id, leg_type, amount, ts FROM transaction_history WHERE user_id=?",
             (user_id,))]
+        now = int(time.time()) if now is None else int(now)
+        holds = {r["id"]: r["hold_until"] for r in conn.execute(
+            "SELECT id, hold_until FROM payees WHERE user_id=? AND hold_until > ?",
+            (user_id, now))}
     finally:
         conn.close()
     return PolicyContext(
         user=dict(user_row) if user_row else {},
         limits=limits,
         history=history,
-        now=int(time.time()) if now is None else int(now),
+        now=now,
+        holds=holds,
     )
 
 

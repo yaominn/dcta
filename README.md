@@ -647,8 +647,12 @@ This is the channel the client-integrity caveat below refers to: a compromised
 renderer can lie about the amount on screen, but not about what the text
 message says.
 
-**The phone is simulated** (`backend/gateway/stepup.py: SimulatedPhone`). Open
-**http://localhost:8000/phone** in a second window for the demo. A deployment
+**The phone is simulated** (`backend/gateway/stepup.py: SimulatedPhone`). Its
+text drops down as a notification banner at the top of the assistant page
+(`frontend/phone-notify.js`), so the demo needs one window; tap it to open the
+full inbox at **http://localhost:8000/phone** in its own tab.
+The banner is the simulated phone drawing over the page: `app.js` never reads
+the inbox, and no draft or confirm response carries the code. A deployment
 would send an SMS or push notification instead; the binding and enforcement do
 not change. Tests: `pytest tests/test_stepup.py`.
 
@@ -694,6 +698,50 @@ which is the classic account-takeover step. So:
 Tests: `pytest tests/test_contacts.py`. Routing between payments and contact
 requests is a small keyword rule (`backend/agent/router.py`). A mis-route can
 only ever produce a question or a card the user declines.
+
+## Adding a new contact — and deciding how careful to be
+
+Adding a payee is the step just before most scam payments ("Hi Mum, new
+number", the officer who needs your savings in a "safe account", the job that
+pays commission once you top up). So a new contact takes the same road as money.
+
+**Two ways in.** Say *"add Bob as a contact, 9123 4567"*, or pay someone who
+isn't a contact (*"send 200 to Uncle Bob"*): the question that follows offers
+**+ Add Uncle Bob as a new contact**, asks for the number, and after saving
+offers to carry on with the payment. The answer is tied to the server's copy of
+the payment that asked (`new_contact_for`), so the name and the waiting amount
+come from the server, not the page.
+
+**Who decides what.** The LLM parses the name and number (copied verbatim) and
+gives a scam read of the conversation (`ScamAssessment`: low / medium / high +
+signal codes). Deterministic rules (`backend/policy/new_contact.py`) set the
+floor, and the LLM can only raise it:
+
+| Rung | The user must… | When |
+|---|---|---|
+| STANDARD | confirm with their biometric | nothing unusual |
+| CODE | + enter a code sent to their phone | one mild sign (adding them to pay right now, an overseas number, "urgent"), the LLM says medium, or the LLM check could not run |
+| HOLD | + code, and payments to the contact are **blocked for 12 h** (`NEW_CONTACT_HOLD_MINUTES`) | a strong sign (same name as an existing contact with a different number, "new number", secrecy, investment or pay-to-earn wording, a first payment of $1,000+, 2+ contacts added today), two mild ones, or the LLM says high |
+| REFUSE | nothing is saved; the page says why and points to ScamShield (1799) | a reported number (mock list), a "safe account", an official giving payment orders, or the LLM's "high" agreeing with secrecy / investment / pay-to-earn wording |
+
+The LLM alone can never refuse a contact and never remove a safeguard. Every
+warning on the card is a fixed sentence from the rules; the LLM's own text is
+kept for `/data` only.
+
+**Enforced where it matters.** The safeguards and warning codes are inside the
+signed `ResolvedContactAdd`; the gateway (`submit_contact_add`) applies only the
+exact drafted payload, re-checks the reported-number list, and refuses without
+the phone code when one was required. A HOLD is a policy rule
+(`new_contact_hold`), which the gateway re-runs before any payment. The
+validator freezes a contact whose name or number isn't in what the user said.
+Saved contacts carry `added_at` / `hold_until` (added by `migrate()`, no
+re-seed). Tests: `tests/test_contact_add.py`.
+
+**Demo lines.** `add Bob as a contact, 9123 4567` (biometric only) ·
+`send 200 to Uncle Bob` → add → `9123 4567` (code, then carry on) ·
+`add Mom as a contact, her new number is 8765 4321` (held 12 h) ·
+`add Officer Tan as a contact, 9000 1111, the police told me to move my money to
+a safe account` (refused) · `add Ken as a contact, 8888 1234` (reported number).
 
 ## `/data`: what the AI was told, step by step
 

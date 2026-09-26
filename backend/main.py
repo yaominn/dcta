@@ -36,13 +36,17 @@ from backend.auth import (
     verify_registration,
 )
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
-from backend.agent import (ParseFailure, ProviderUnavailable, build_context,
-                           classify_request, get_provider, parse_contact_edit,
-                           parse_transcript)
-from backend.models.contacts import ContactEditPlan, ResolvedContactChange
+from backend.agent import (ParseFailure, ProviderUnavailable, assess_scam_risk,
+                           build_context, classify_request, get_provider,
+                           parse_contact_add, parse_contact_edit, parse_transcript)
+from backend.models.contacts import (ContactAddPlan, ContactEditPlan, ResolvedContactAdd,
+                                     ResolvedContactChange)
+from backend.models.schemas import MAX_AUTH_WINDOW_S
+from backend.policy.new_contact import NewContactFacts, decide as decide_new_contact
 from backend.policy import contact_change_step_up
-from backend.resolver.contacts import resolve_contact_edit
-from backend.validator.contacts import validate_contact_change
+from backend.resolver.contacts import (InvalidValue, NewContact, normalize_nickname,
+                                       resolve_contact_add, resolve_contact_edit)
+from backend.validator.contacts import validate_contact_add, validate_contact_change
 from backend.asr import (MAX_AUDIO_BYTES,
                          ASRNoSpeech, ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
@@ -51,7 +55,7 @@ from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
 from backend.drafts import Draft, DraftStore
 from backend.trace import RecordingProvider, TraceStore
-from backend.display import change_summary, plan_summary
+from backend.display import add_summary, change_summary, cents_to_display, plan_summary
 
 from pathlib import Path
 
@@ -706,6 +710,11 @@ class DraftRequest(BaseModel):
     fine"). The transcript is user speech: untrusted but authorized."""
     transcript: str
     user_id: str = DEMO_USER_ID
+    # Set when this message answers "what's Bob's number?": the id of the draft
+    # that asked (a payment that named an unknown payee, or a new contact still
+    # missing its number). The server reads the name and any waiting payment
+    # from ITS copy of that draft, never from the client.
+    new_contact_for: str | None = None
 
 
 class ClarifyAnswer(BaseModel):
@@ -736,6 +745,9 @@ def _pipeline(draft: Draft) -> dict:
         draft.resolved_plan = None
         draft.question = {"question": outcome.question, "field": outcome.field,
                           "kind": outcome.kind, "choices": outcome.choices}
+        offer = _new_contact_offer(plan, outcome)
+        if offer:
+            draft.question["new_contact"] = offer
         _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
         return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
 
@@ -826,7 +838,9 @@ def create_draft(req: DraftRequest):
 
     # Which pipeline. Not a security decision: every route ends at a draft the
     # user must sign, or (the list) a read-only view of their own contacts.
-    route = classify_request(req.transcript)
+    # An answer to "what's Bob's number?" continues the new contact it belongs to.
+    origin = _new_contact_origin(req) if req.new_contact_for else None
+    route = "contact_add" if origin else classify_request(req.transcript)
     if route == "contact_list":
         view = _contacts_view(req.user_id)
         tid = "list-" + DraftStore.new_id()
@@ -839,6 +853,11 @@ def create_draft(req: DraftRequest):
     try:
         if route == "contact_edit":
             plan = parse_contact_edit(req.transcript, provider=provider, context=context)
+        elif route == "contact_add":
+            plan = parse_contact_add(req.transcript, provider=provider, context=context,
+                                     name_hint=origin["name"] if origin else None)
+            if origin and not plan.contact.nickname:
+                plan.contact.nickname = origin["name"]
         else:
             plan = parse_transcript(req.transcript, provider=provider, context=context)
     except (ProviderUnavailable, ParseFailure) as exc:
@@ -856,9 +875,15 @@ def create_draft(req: DraftRequest):
 
     draft = _drafts.put(Draft(
         draft_id=DraftStore.new_id(), user_id=req.user_id,
-        transcript=req.transcript, intent_plan=plan.model_dump(),
+        # A continued new contact binds EVERYTHING the user said for it: the
+        # payment that named them, then the number.
+        transcript=(origin["transcript"] + "\n" + req.transcript) if origin else req.transcript,
+        intent_plan=plan.model_dump(),
         created_at=time.time(),
-        kind="contact_edit" if route == "contact_edit" else "payment",
+        kind=route if route in ("contact_edit", "contact_add") else "payment",
+        origin_draft_id=req.new_contact_for if origin else None,
+        risk={"for_payment": origin["for_payment"], "pending_cents": origin["pending_cents"]}
+             if origin else None,
     ))
     _traces.start(draft.draft_id, transcript=req.transcript, route=route, user_id=req.user_id)
     _traces.event(draft.draft_id, "parse", provider=provider.name, llm_calls=provider.calls,
@@ -888,7 +913,162 @@ def create_draft(req: DraftRequest):
 
 
 def _run(draft: Draft) -> dict:
+    if draft.kind == "contact_add":
+        return _contact_add_pipeline(draft)
     return _contact_pipeline(draft) if draft.kind == "contact_edit" else _pipeline(draft)
+
+
+# --------------------------------------------------------------------------- adding a contact
+def _new_contact_offer(plan: IntentPlan, q: Clarify) -> dict | None:
+    """A payment named someone who is not a contact: offer to add them, next to
+    the existing contacts. Transfers only — a bill or a share has no "new
+    contact" to add."""
+    if q.kind != "payee" or not q.unknown_mention:
+        return None
+    leg = next((l for l in plan.plan if q.field == f"{l.id}.target"), None)
+    if leg is None or leg.type != "TRANSFER":
+        return None
+    try:
+        name = normalize_nickname(q.unknown_mention)
+    except InvalidValue:
+        return None
+    return {"name": name, "awaiting": "phone"}
+
+
+def _new_contact_origin(req: DraftRequest) -> dict:
+    """The draft a "what's their number?" answer continues, read from OUR copy:
+    the name, whether a payment is waiting, and how much. 404/409 rather than a
+    guess if it is gone or was not asking."""
+    d = _drafts.get(req.new_contact_for)
+    if d is None or d.user_id != req.user_id:
+        raise HTTPException(404, {"error": "that question has expired — please say it again"})
+    offer = (d.question or {}).get("new_contact")
+    if d.status != "clarify" or not offer:
+        raise HTTPException(409, {"error": "that draft isn't waiting for a new contact's number"})
+    if d.kind == "payment":
+        field = (d.question or {}).get("field", "")
+        leg = next((l for l in IntentPlan.model_validate(d.intent_plan).plan
+                    if field == f"{l.id}.target"), None)
+        amount = getattr(getattr(leg, "amount", None), "literal_cents", None)
+        return {"name": offer["name"], "transcript": d.transcript,
+                "for_payment": True, "pending_cents": amount}
+    ctx = d.risk or {}
+    return {"name": offer["name"], "transcript": d.transcript,
+            "for_payment": bool(ctx.get("for_payment")), "pending_cents": ctx.get("pending_cents")}
+
+
+def _contact_add_pipeline(draft: Draft) -> dict:
+    """resolve -> risk (rules + the LLM's advisory read) -> refuse, or a
+    signable draft with the safeguards the risk calls for -> validate ->
+    (phone code). Re-run in full on every pass, like the other pipelines."""
+    plan = ContactAddPlan.model_validate(draft.intent_plan)
+    outcome = resolve_contact_add(plan, user_id=draft.user_id)
+    ctx = draft.risk or {}
+    if isinstance(outcome, Clarify):
+        draft.status = "clarify"
+        draft.resolved_add = None
+        draft.question = {"question": outcome.question, "field": outcome.field,
+                          "kind": outcome.kind, "choices": []}
+        if outcome.kind in ("need_phone", "invalid_phone") and outcome.unknown_mention:
+            draft.question["new_contact"] = {"name": outcome.unknown_mention, "awaiting": "phone"}
+        draft.risk = {"for_payment": ctx.get("for_payment", False),
+                      "pending_cents": ctx.get("pending_cents")}
+        _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
+        return {"status": "clarify", "kind": "contact_add", "draft_id": draft.draft_id,
+                **draft.question}
+    new: NewContact = outcome
+
+    conn = get_conn()
+    try:
+        existing = [dict(r) for r in conn.execute(
+            "SELECT nickname, phone FROM payees WHERE user_id=?", (draft.user_id,))]
+        recent = conn.execute(
+            "SELECT COUNT(*) FROM payees WHERE user_id=? AND added_at > ?",
+            (draft.user_id, int(time.time()) - 86400)).fetchone()[0]
+    finally:
+        conn.close()
+    facts = NewContactFacts(nickname=new.nickname, phone=new.phone, existing=existing,
+                            added_last_24h=recent, conversation=draft.transcript,
+                            pending_cents=ctx.get("pending_cents"),
+                            for_payment=bool(ctx.get("for_payment")))
+
+    # The LLM's read of the conversation — advisory. It sees the user's words
+    # and a few facts, never the number, an account or a balance.
+    provider = RecordingProvider(get_provider(settings))
+    llm_facts = {
+        "new_contact_name": new.nickname,
+        "number_is_overseas": not new.phone.startswith("+65 "),
+        "same_name_as_an_existing_contact_with_a_different_number": any(
+            c["nickname"].lower() == new.nickname.lower() for c in existing),
+        "contacts_added_in_the_last_24_hours": recent,
+        "payment_waiting_for_this_contact": (
+            "$" + cents_to_display(facts.pending_cents) if facts.pending_cents
+            else ("yes (amount not stated)" if facts.for_payment else None)),
+    }
+    try:
+        assessment = assess_scam_risk(draft.transcript, facts=llm_facts, provider=provider)
+        ai_risk, ai_signals, ai_error = assessment.risk, list(assessment.signals), None
+    except (ProviderUnavailable, ParseFailure) as exc:
+        assessment, ai_risk, ai_signals, ai_error = None, None, [], str(exc)
+    decision = decide_new_contact(facts, ai_risk=ai_risk, ai_signals=ai_signals,
+                                  hold_minutes=settings.new_contact_hold_minutes)
+    warnings = [{"code": w.code, "text": w.text, "weight": w.weight} for w in decision.warnings]
+    draft.risk = {"for_payment": facts.for_payment, "pending_cents": facts.pending_cents,
+                  "rung": decision.rung, "ai_risk": decision.ai_risk, "warnings": warnings}
+    _audit.append(AuditEntryType.POLICY, decision.to_audit_payload(draft.draft_id))
+    _traces.event(draft.draft_id, "scam_check", provider=provider.name,
+                  llm_calls=provider.calls, facts=llm_facts,
+                  assessment=assessment.model_dump() if assessment else None,
+                  error=ai_error, rung=decision.rung, warnings=[w["code"] for w in warnings])
+    risk_view = {"rung": decision.rung, "ai_risk": decision.ai_risk, "warnings": warnings,
+                 "for_payment": facts.for_payment}
+
+    if decision.refused:
+        draft.status = "blocked"
+        draft.resolved_add = None
+        return {"status": "blocked", "kind": "contact_add", "draft_id": draft.draft_id,
+                "contact": {"display": new.display}, "risk": risk_view}
+
+    now = int(time.time())
+    add = ResolvedContactAdd(
+        draft_id=draft.draft_id, user_id=draft.user_id, nickname=new.nickname,
+        phone=new.phone, payee_display=new.display, safeguards=list(decision.safeguards),
+        hold_minutes=decision.hold_minutes, warnings=[w["code"] for w in warnings],
+        transcript_hash=hash_transcript(draft.transcript),
+        created_at=now, expires_at=now + MAX_AUTH_WINDOW_S)
+    report = validate_contact_add(add, draft.transcript, audit=_audit)
+    draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
+                        "checks": report.checks}
+    draft.resolved_add = add
+    draft.question = None
+    draft.status = "frozen" if report.frozen else "ready"
+    p_hash = payload_hash(add)
+    _traces.event(draft.draft_id, "validate", verdict=report.verdict, frozen=report.frozen,
+                  checks=report.checks, llm_check=report.llm_check, llm_calls=[])
+
+    needs_code = draft.status == "ready" and "PHONE_CODE" in add.safeguards
+    reasons = [w["text"] for w in warnings if w["weight"] != "ai"] or [
+        "A code on your phone makes sure it's really you adding this contact."]
+    if needs_code:
+        code = _step_up.issue(draft.draft_id, p_hash)
+        _traces.event(draft.draft_id, "step_up", sent=True, channel="phone (simulated)",
+                      reasons=reasons)
+        _phone.deliver(draft.user_id,
+                       f"DCTA: to {add_summary(add)}, enter code {code}. Valid 5 min. "
+                       f"Never share this code. If someone asked you to add this "
+                       f"contact, stop and call 1799 (ScamShield).")
+    return {
+        "status": draft.status,
+        "kind": "contact_add",
+        "draft_id": draft.draft_id,
+        "contact_add": add.model_dump(mode="json"),
+        "payload_hash": p_hash,
+        "validation": draft.validation,
+        "risk": risk_view,
+        "requires_extra_confirmation": needs_code,
+        "confirmation": ({"channel": "your registered phone", "reasons": []}
+                         if needs_code else None),
+    }
 
 
 def _contacts_view(user_id: str) -> dict:
@@ -897,13 +1077,15 @@ def _contacts_view(user_id: str) -> dict:
     conn = get_conn()
     try:
         rows = conn.execute(
-            "SELECT nickname, last4, phone FROM payees WHERE user_id=? ORDER BY nickname, last4",
-            (user_id,)).fetchall()
+            "SELECT nickname, last4, phone, hold_until FROM payees WHERE user_id=? "
+            "ORDER BY nickname, last4", (user_id,)).fetchall()
     finally:
         conn.close()
     return {"status": "info", "kind": "contacts", "contacts": [
         {"display": f"{r['nickname']} ··{r['last4']}", "nickname": r["nickname"],
-         "last4": r["last4"], "phone": r["phone"] or ""} for r in rows]}
+         "last4": r["last4"], "phone": r["phone"] or "",
+         "hold_until": r["hold_until"] if (r["hold_until"] or 0) > time.time() else None}
+        for r in rows]}
 
 
 def _contact_pipeline(draft: Draft) -> dict:
@@ -1062,8 +1244,9 @@ def confirm_draft(draft_id: str, req: ConfirmRequest):
 
 @app.get("/api/phone/messages", response_model=None)
 def phone_messages(user_id: str = Query(DEMO_USER_ID)):
-    """# MOCK: the simulated phone's inbox, rendered by /phone. Stands in for
-    an SMS gateway so the demo can show the second channel on a second screen.
+    """# MOCK: the simulated phone's inbox, rendered by /phone and by the
+    drop-down banner on the assistant page (phone-notify.js). Stands in for an
+    SMS gateway so the demo can show the second channel.
     Would NOT exist in a deployment — like /api/auth/mock-sign."""
     return {"user_id": user_id, "messages": _phone.messages(user_id)}
 
@@ -1143,6 +1326,36 @@ def contacts_apply_webauthn(req: ContactApplyWebAuthnRequest):
     return _traced_gateway(req.contact_change.draft_id, "WebAuthn",
                            _webauthn_gateway.submit_contact_change(req.contact_change, req.assertion,
                                                                    req.nonce, req.credential_id))
+
+
+class ContactAddRequest(BaseModel):
+    """Mock-signer path (tests / red-team only, like /api/contacts/apply)."""
+    contact_add: ResolvedContactAdd
+    signature: str | None = None
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/contacts/add", **_MOCK_ONLY)
+def contacts_add(req: ContactAddRequest):
+    return _traced_gateway(req.contact_add.draft_id, "mock signer",
+                           _gateway.submit_contact_add(req.contact_add, req.signature,
+                                                       req.nonce, req.credential_id))
+
+
+class ContactAddWebAuthnRequest(BaseModel):
+    contact_add: ResolvedContactAdd
+    assertion: dict
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/contacts/add-webauthn")
+def contacts_add_webauthn(req: ContactAddWebAuthnRequest):
+    """The only route by which a new contact is saved."""
+    return _traced_gateway(req.contact_add.draft_id, "WebAuthn",
+                           _webauthn_gateway.submit_contact_add(req.contact_add, req.assertion,
+                                                                req.nonce, req.credential_id))
 
 
 # Serve frontend assets (canonical.js, app.js, style.css). Mounted LAST so the

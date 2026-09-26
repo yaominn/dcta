@@ -170,6 +170,27 @@
       });
       return out;
     },
+    scam_check(e) {
+      // A new contact: the LLM's scam read (advisory), then the rules' decision.
+      const out = [];
+      const h1 = el("h3"); h1.append(who("llm"), document.createTextNode("Scam check — how risky does this new contact look?"));
+      out.push(h1);
+      (e.llm_calls || []).forEach((c, i) => {
+        if (i === 0) out.push(block("System prompt — the rules it is given", c.system, false));
+        out.push(block("User prompt — your words and a few facts (never the number)", c.user, false));
+        out.push(c.error ? block("Call failed", c.error, true) : block(`Raw reply · ${c.ms} ms`, c.output, true, "reply"));
+      });
+      out.push(el("p", "muted", e.assessment
+        ? `It said: ${e.assessment.risk} risk${(e.assessment.signals || []).length ? " (" + e.assessment.signals.join(", ") + ")" : ""}. Advisory — it can add safeguards, never remove them, and can't refuse a contact on its own.`
+        : "The check could not run, so at least a phone code is required."));
+      const h2 = el("h3"); h2.append(who("code"), document.createTextNode("Safeguards decided by the rules"));
+      const RUNG = { STANDARD: "biometric only", CODE: "biometric + phone code",
+                     HOLD: "biometric + phone code + payment hold", REFUSE: "REFUSED — not added" };
+      const ul = el("ul", "checks");
+      for (const w of e.warnings || []) ul.append(el("li", "info", w));
+      out.push(h2, el("p", null, `${e.rung}: ${RUNG[e.rung] || ""}`), ul);
+      return out;
+    },
     step_up(e) {
       const h = el("h3"); h.append(who("code"), document.createTextNode("Extra confirmation — code texted to your phone"));
       return [h, el("p", null, (e.reasons || []).join(" ")), el("p", "muted", "The code itself is never shown here.")];
@@ -202,6 +223,7 @@
     if (gw) return gw.accepted ? ["ok", (gw.execution && gw.execution.status) || "EXECUTED"] : ["bad", "REJECTED"];
     const v = last("validate"); if (v && v.frozen) return ["bad", "FROZEN"];
     const p = last("policy"); if (p && p.decision === "BLOCK") return ["bad", "BLOCKED"];
+    const sc = last("scam_check"); if (sc && sc.rung === "REFUSE") return ["bad", "NOT ADDED"];
     const parse = last("parse"); if (parse && parse.error) return ["bad", "PARSE FAILED"];
     if (last("contacts")) return ["ok", "LISTED"];
     const r = last("resolve"); const lastEv = ev[ev.length - 1];

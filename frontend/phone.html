@@ -6,7 +6,8 @@
   <title>Demo Phone</title>
   <!-- MOCK: the user's registered phone, for the demo. Stands in for an SMS
        gateway so the out-of-band channel can be shown on a second screen. The
-       assistant page never reads from here. -->
+       same messages also drop down on the assistant page (phone-notify.js);
+       the assistant's own code, app.js, never reads them. -->
   <link rel="stylesheet" href="/static/style.css" />
   <style>
     .sms-head { flex: none; text-align: center; padding: 6px 16px 12px; border-bottom: 1px solid var(--line); }

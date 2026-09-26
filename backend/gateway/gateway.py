@@ -41,10 +41,11 @@ from backend.gateway.executor import AlreadyExecuted, MockExecutor
 # Outcomes recorded for a draft that ended WITHOUT running.
 CLOSED_OUTCOMES = frozenset({"DECLINED", "CANCELLED"})
 from backend.auth.credentials import MockCredentialStore
-from backend.models.contacts import ResolvedContactChange
+from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
 from backend.policy import (Decision, contact_change_step_up, evaluate,
                             load_context, owner_of)
+from backend.policy.new_contact import required_at_gateway
 
 
 class Gateway:
@@ -244,6 +245,77 @@ class Gateway:
                 "payload_hash": p_hash, "execution": result,
                 **({} if result["status"] == "UPDATED"
                    else {"rejection": "FAILED", "reason": result["error"]})}
+
+    def submit_contact_add(
+        self,
+        add: ResolvedContactAdd,
+        signature: str | None,
+        nonce: str,
+        credential_id: str,
+    ) -> dict:
+        """The same chokepoint for a NEW contact: expiry -> nonce -> signature
+        -> at most once -> exactly the drafted payload -> never a reported
+        number -> the phone code if the draft required one -> write -> audit.
+        Payees are added nowhere else."""
+        draft_id = add.draft_id
+        p_hash = payload_hash(add)
+        refused = self._authenticate(draft_id, p_hash, add.expires_at, signature,
+                                     nonce, credential_id)
+        if refused is not None:
+            return refused
+        prior = self.executor.prior_execution(draft_id)
+        if prior is not None:
+            return self._already_final(draft_id, p_hash, prior)
+        refused = self.drafts.executable(draft_id, kind="contact_add", submitted_hash=p_hash)
+        if refused is not None:
+            return self._reject(draft_id, p_hash, *refused)
+        # Re-derived HERE from the payload: whatever was drafted or signed, a
+        # number on the scam list is never added.
+        stop = required_at_gateway(add.nickname, add.phone)
+        if stop:
+            return self._reject(draft_id, p_hash, "POLICY", stop)
+        needs_code = "PHONE_CODE" in add.safeguards
+        if needs_code and not (self.step_up is not None
+                               and self.step_up.is_confirmed(draft_id, p_hash)):
+            return self._reject(draft_id, p_hash, "CONFIRMATION",
+                                "adding this contact needs the code sent to your phone first")
+        try:
+            result = self.executor.add_contact(add, payload_hash=p_hash)
+        except AlreadyExecuted as exc:
+            return self._already_final(draft_id, p_hash, exc.prior)
+        if self.step_up is not None and needs_code:
+            self.step_up.consume(draft_id)
+        # Safeguards and warning codes, not the number or the name: the chain is
+        # append-only and hard to redact (the same rule as CONTACT_UPDATE).
+        self.audit.append(AuditEntryType.CONTACT_ADD, {
+            "draft_id": draft_id, "payload_hash": p_hash, "outcome": result["status"],
+            "safeguards": add.safeguards, "hold_minutes": add.hold_minutes,
+            "warnings": add.warnings,
+        })
+        ok = result["status"] == "ADDED"
+        return {"accepted": ok, "draft_id": draft_id, "payload_hash": p_hash,
+                "execution": result,
+                **({} if ok else {"rejection": "FAILED", "reason": result["error"]})}
+
+    def _authenticate(self, draft_id: str, p_hash: str, expires_at: int,
+                      signature: str | None, nonce: str, credential_id: str) -> dict | None:
+        """expiry -> nonce -> signature, in that order. A rejection dict, or None."""
+        now = int(time.time())
+        if now > expires_at:
+            return self._reject(draft_id, p_hash, "EXPIRED",
+                                f"payload expired at {expires_at}, now {now}")
+        try:
+            self.nonce_store.consume(nonce, draft_id)
+        except NonceError as exc:
+            return self._reject(draft_id, p_hash, "NONCE", str(exc))
+        pubkey = self.credentials.get(credential_id)
+        if pubkey is None:
+            return self._reject(draft_id, p_hash, "SIGNATURE", "unknown credential")
+        if not signature:
+            return self._reject(draft_id, p_hash, "SIGNATURE", "missing signature")
+        if not self.signer.verify(pubkey, signature, challenge_hash(p_hash, nonce)):
+            return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
+        return None
 
     def _already_final(self, draft_id: str, p_hash: str, prior: dict) -> dict:
         """The draft already has its one outcome. Declined/cancelled is a STATE

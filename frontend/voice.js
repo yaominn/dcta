@@ -146,12 +146,45 @@ const Voice = (() => {
   }
 
   /* ---------- speak (clarifying questions) ---------- */
+  // Mute is a per-viewer preference, remembered across reloads when storage
+  // allows it (it may throw in a private window; then it lasts for the page).
+  const MUTE_KEY = "dcta.voice.muted";
+  let muted = null;                 // read lazily: tests load this file without storage
+  let speaking = false;
+  const listeners = [];
+
+  function ttsAvailable() { return !!(window.speechSynthesis && window.SpeechSynthesisUtterance); }
+  function isMuted() {
+    if (muted === null) {
+      try { muted = window.localStorage.getItem(MUTE_KEY) === "1"; } catch (_) { muted = false; }
+    }
+    return muted;
+  }
+  function state() { return isMuted() ? "muted" : speaking ? "speaking" : "on"; }
+  function notify() { for (const fn of listeners) { try { fn(state()); } catch (_) {} } }
+  function onStateChange(fn) { listeners.push(fn); fn(state()); }
+  function setSpeaking(v) { if (speaking !== v) { speaking = v; notify(); } }
+
+  // Stop talking now (the user is talking, or typed something).
+  function silence() {
+    try { if (window.speechSynthesis) window.speechSynthesis.cancel(); } catch (_) {}
+    setSpeaking(false);
+  }
+  function setMuted(v) {
+    muted = !!v;
+    try { window.localStorage.setItem(MUTE_KEY, muted ? "1" : "0"); } catch (_) {}
+    if (muted) silence();
+    notify();                       // silence() only notifies if it was talking
+  }
+
   function speak(text) {
     try {
-      if (!window.speechSynthesis) return;
+      if (!window.speechSynthesis || isMuted()) return;
       window.speechSynthesis.cancel();
       const u = new SpeechSynthesisUtterance(text);
       u.lang = "en-SG";
+      u.onstart = () => setSpeaking(true);
+      u.onend = u.onerror = () => setSpeaking(false);
       window.speechSynthesis.speak(u);
     } catch (_) {
       /* speaking is an enhancement; never let it break the flow */
@@ -159,5 +192,6 @@ const Voice = (() => {
   }
 
   return { listenWebSpeech, recordAndUpload, stop, speak, speechRecognitionAvailable,
-           voiceFormatOf, pickRecorderOptions };
+           voiceFormatOf, pickRecorderOptions,
+           ttsAvailable, isMuted, setMuted, silence, onStateChange };
 })();

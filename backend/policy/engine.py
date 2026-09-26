@@ -8,7 +8,8 @@ never imports it.
 
 PRECEDENCE, and why it is explicit (a judge will ask):
 
-    KYC  ->  per-transaction limit  ->  daily limit  ->  velocity  ->  anomaly
+    KYC  ->  new-contact hold  ->  per-transaction limit  ->  daily limit
+         ->  velocity  ->  anomaly
 
 The first BLOCK wins and the remaining rules are not consulted — a blocked leg
 has one reason, not four. Anomaly is the only rule that may *escalate* rather
@@ -55,7 +56,7 @@ class Verdict:
     limit", not "ERR_LIMIT_2"."""
     leg_id: str
     decision: Decision
-    rule: str          # kyc | investment_eligibility | per_transaction | daily | velocity | anomaly | ok
+    rule: str          # kyc | investment_eligibility | new_contact_hold | per_transaction | daily | velocity | anomaly | ok
     reason: str
 
 
@@ -105,6 +106,9 @@ class PolicyContext:
     limits: dict
     history: list[dict]          # [{payee_id, amount, ts}, ...] — transfers only
     now: int                     # Unix seconds UTC; injected, never read from the clock
+    # payee_id -> hold_until (Unix seconds) for contacts added with a HOLD
+    # safeguard (policy/new_contact.py). Only payees still on hold are listed.
+    holds: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- helpers
@@ -156,6 +160,26 @@ def check_kyc(leg: Any, ctx: PolicyContext) -> Verdict | None:
         return Verdict(leg.id, Decision.BLOCK, "investment_eligibility",
                        "This account is not approved for investing yet.")
     return None
+
+
+def check_new_contact_hold(leg: Any, ctx: PolicyContext) -> Verdict | None:
+    """A contact added with the HOLD safeguard cannot be paid until the hold
+    ends. BLOCKS, and the gateway re-runs this engine, so the hold is enforced
+    where money moves — not by a page that hides a button. The point of a hold
+    is time: time to call the real person, or for the bank to hear it was a
+    scam, before the first dollar leaves."""
+    if not _is_transfer(leg):
+        return None
+    until = ctx.holds.get(leg.payee_id)
+    if until is None or ctx.now >= int(until):
+        return None
+    left = -(-(int(until) - ctx.now) // 60)            # whole minutes, rounded up
+    hours, mins = divmod(left, 60)
+    wait = (f"{hours} h {mins} min" if hours and mins else f"{hours} h" if hours
+            else f"{mins} min")
+    return Verdict(leg.id, Decision.BLOCK, "new_contact_hold",
+                   f"{leg.payee_display} was added with a safety hold. Payments to "
+                   f"them open in {wait} — time to check it's really them.")
 
 
 def check_per_transaction(leg: Any, ctx: PolicyContext) -> Verdict | None:
@@ -244,6 +268,7 @@ def evaluate(plan: ResolvedPlan, ctx: PolicyContext) -> PolicyResult:
     for leg in plan.plan:
         verdict = (
             check_kyc(leg, ctx)
+            or check_new_contact_hold(leg, ctx)
             or check_per_transaction(leg, ctx)
             or check_daily(leg, ctx, running_today)
             or check_velocity(leg, ctx, recent)

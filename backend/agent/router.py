@@ -14,6 +14,13 @@ import re
 
 _FIELD = r"(?:nick\s?name|name|phone(?:\s+number)?|mobile(?:\s+number)?|number|contact\s+number|handphone)"
 
+# "add Bob as a contact", "save a new payee", "new contact Bob 9123 4567",
+# "add uncle bob, his number is 9123 4567". Checked before _EDIT: "set up a new
+# contact" is an add, not an edit.
+_ADD = re.compile(
+    r"\b(?:add|save|create|new)\b.*\b(?:contacts?|payees?)\b"
+    r"|^\s*(?:please\s+)?(?:add|save)\s+.+\b(?:number|phone|mobile|\d{4})",
+    re.I)
 _LIST = re.compile(
     r"\b(?:show|list|see|view|display|what\s+are|who\s+are)\b.*\b(?:contacts?|payees?)\b"
     r"|^\s*(?:my\s+)?(?:contacts?|payees?)\s*[?.!]*\s*$",
@@ -25,9 +32,11 @@ _EDIT = re.compile(
 
 
 def classify_request(transcript: str) -> str:
-    """'contact_list' | 'contact_edit' | 'payment'."""
+    """'contact_list' | 'contact_add' | 'contact_edit' | 'payment'."""
     if _LIST.search(transcript):
         return "contact_list"
+    if _ADD.search(transcript):
+        return "contact_add"
     if _EDIT.search(transcript):
         return "contact_edit"
     return "payment"

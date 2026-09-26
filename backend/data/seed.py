@@ -104,7 +104,8 @@ def seed(db_path: Path = DB_PATH, *, reset_audit: bool = False) -> None:
 
         conn.executemany("INSERT INTO users VALUES (?,?,?,?)", USERS)
         conn.executemany("INSERT INTO accounts VALUES (?,?,?,?,?)", ACCOUNTS)
-        conn.executemany("INSERT INTO payees VALUES (?,?,?,?,?,?)", PAYEES)
+        conn.executemany("INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone) "
+                         "VALUES (?,?,?,?,?,?)", PAYEES)
         conn.executemany("INSERT INTO billers VALUES (?,?,?)", BILLERS)
         conn.executemany("INSERT INTO equities VALUES (?,?)", EQUITIES)
         conn.executemany("INSERT INTO limits VALUES (?,?)",

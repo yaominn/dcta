@@ -20,12 +20,14 @@ skipped.
 from __future__ import annotations
 
 import json
+import re
+import secrets
 import sqlite3
 import time
 from datetime import datetime, timezone
 
 from backend.data.db import DB_PATH, connect
-from backend.models.contacts import ResolvedContactChange
+from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
 
 # Contact fields a signed change may write -> their column. A fixed map, so a
@@ -179,6 +181,45 @@ class MockExecutor:
             if result is None:
                 result = {"draft_id": change.draft_id, "status": "UPDATED", "changes": results}
             self._record(conn, change.draft_id, result)
+            conn.commit()
+        finally:
+            conn.close()
+        return result
+
+    def add_contact(self, add: ResolvedContactAdd, *, payload_hash: str) -> dict:
+        """Write a signed new contact, with the hold it was signed with. At most
+        once per draft, like everything else here.
+
+        Refused (FAILED, nothing written) if the number was saved as another
+        contact after the draft was made: the user approved adding a NEW
+        destination, not a second name for an existing one."""
+        conn = connect(self.db_path)
+        try:
+            self._claim(conn, add.draft_id, "contact_add", payload_hash)
+            now = int(time.time())
+            taken = conn.execute("SELECT nickname, last4 FROM payees WHERE user_id=? AND phone=?",
+                                 (add.user_id, add.phone)).fetchone()
+            if taken is not None:
+                result = {"draft_id": add.draft_id, "status": "FAILED",
+                          "error": f"that number was saved as {taken['nickname']} "
+                                   f"\u00b7\u00b7{taken['last4']} since this draft was made "
+                                   "\u2014 nothing was added"}
+            else:
+                payee_id = "payee_" + secrets.token_hex(4)
+                hold_until = now + add.hold_minutes * 60 if add.hold_minutes else None
+                # legal_name: a real bank would fill it from the PayNow lookup
+                # of this number. There is no directory in the mock, so it is
+                # left empty rather than invented.
+                conn.execute(
+                    "INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone, "
+                    "added_at, hold_until) VALUES (?,?,?,?,?,?,?,?)",
+                    (payee_id, add.user_id, add.nickname, "",
+                     re.sub(r"\D", "", add.phone)[-4:], add.phone, now, hold_until))
+                result = {"draft_id": add.draft_id, "status": "ADDED",
+                          "contact": {"payee_display": add.payee_display,
+                                      "nickname": add.nickname, "phone": add.phone,
+                                      "hold_until": hold_until}}
+            self._record(conn, add.draft_id, result)
             conn.commit()
         finally:
             conn.close()

@@ -27,8 +27,8 @@ from dataclasses import dataclass
 
 from backend.audit.canonical import hash_transcript
 from backend.data.db import connect, get_conn
-from backend.models.contacts import (ContactEditPlan, ResolvedContactChange,
-                                     ResolvedContactEdit)
+from backend.models.contacts import (ContactAddPlan, ContactEditPlan,
+                                     ResolvedContactChange, ResolvedContactEdit)
 from backend.models.schemas import MAX_AUTH_WINDOW_S
 from backend.resolver import Clarify, _match, _pick
 
@@ -165,3 +165,65 @@ def resolve_contact_edit(plan: ContactEditPlan, *, transcript: str, user_id: str
                                 "did you mean?", field="edits", kind="duplicate",
                        choices=[], resume_state={})
     return ResolvedChange(change=change)
+
+
+# --------------------------------------------------------------------------- adding a contact
+@dataclass
+class NewContact:
+    """A validated, normalised new contact — not yet a signable payload: which
+    safeguards it needs is policy's call (backend/policy/new_contact.py)."""
+    nickname: str
+    phone: str
+    last4: str
+
+    @property
+    def display(self) -> str:
+        return f"{self.nickname} \u00b7\u00b7{self.last4}"
+
+
+def resolve_contact_add(plan: ContactAddPlan, *, user_id: str, name_hint: str | None = None,
+                        db_path=None):
+    """-> NewContact | Clarify. Deterministic; reads the DB, writes nothing.
+
+    `name_hint` is the name the user already gave (the payee a payment named
+    that matched no contact); the parser's own reading wins when it has one."""
+    c = plan.contact
+    raw_name = (c.nickname or name_hint or "").strip()
+    if not raw_name:
+        return Clarify(question="What should I call this new contact?",
+                       field="contact.nickname", kind="need_name", choices=[],
+                       resume_state={})
+    try:
+        nickname = normalize_nickname(raw_name)
+    except InvalidValue as exc:
+        return Clarify(question=f"Sorry, {exc}. What should I call this contact?",
+                       field="contact.nickname", kind="invalid_nickname", choices=[],
+                       resume_state={})
+    if not (c.phone or "").strip():
+        return Clarify(question=f"What's {nickname}'s mobile number? It's where "
+                                "payments to them will go.",
+                       field="contact.phone", kind="need_phone", choices=[],
+                       resume_state={}, unknown_mention=nickname)
+    try:
+        phone = normalize_phone(c.phone)
+    except InvalidValue as exc:
+        return Clarify(question=f"Sorry, {exc}. What's {nickname}'s mobile number?",
+                       field="contact.phone", kind="invalid_phone", choices=[],
+                       resume_state={}, unknown_mention=nickname)
+
+    conn = connect(db_path) if db_path else get_conn()
+    try:
+        taken = conn.execute(
+            "SELECT nickname, last4 FROM payees WHERE user_id=? AND phone=?",
+            (user_id, phone)).fetchone()
+    finally:
+        conn.close()
+    if taken is not None:
+        # Not a second contact for one number: two names for the same
+        # destination is how a payment ends up somewhere the user didn't mean.
+        return Clarify(question=f"That number is already saved as {taken['nickname']} "
+                                f"\u00b7\u00b7{taken['last4']}, so there's nothing to add. "
+                                f"You can pay them by that name.",
+                       field="contact.phone", kind="phone_exists", choices=[],
+                       resume_state={})
+    return NewContact(nickname=nickname, phone=phone, last4=re.sub(r"\D", "", phone)[-4:])
