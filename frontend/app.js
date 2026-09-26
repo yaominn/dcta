@@ -257,7 +257,30 @@ function windowLabel(created, expires) {
 const LEG_ICON = { TRANSFER: "→", PAY_BILL: "≡", BUY_EQUITY: "↗" };
 const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "Buy shares" };
 
-function legRow(leg) {
+// Where each field of a payment came from, as one short line. Quotes are the
+// user's OWN words, cut from the transcript by the server (backend/narrate.py);
+// "by default" / "calculated" say what the assistant filled in. Pure — the
+// review card's evidence is tested under Node (tests/js/app_runner.js).
+function evidenceText(ev, leg) {
+  if (!ev) return "";
+  const q = (x) => "\u201c" + x + "\u201d";
+  const parts = [];
+  const a = ev.amount || {};
+  if (a.kind === "said") parts.push(q(a.quote));
+  else if (a.kind === "chosen") parts.push("you chose " + (a.quote ? q(a.quote) : centsToDisplay(leg.amount_cents)));
+  else if (a.kind === "calculated") parts.push("calculated: " + a.text);
+  else parts.push("\u26a0 amount not in your words");
+  const t = ev.to || {};
+  parts.push(t.kind === "said" ? q(t.quote) : "\u26a0 recipient not in your words");
+  const f = ev.from || {};
+  if (f.kind === "said") parts.push(q(f.quote));
+  else if (f.kind === "default") parts.push(acctLabel(leg.source_account) + " by default");
+  else if (f.kind === "derived") parts.push("same account");
+  else if (f.kind === "not_found") parts.push("\u26a0 account not in your words");
+  return parts.join(" · ");
+}
+
+function legRow(leg, ev) {
   const row = el("div", "leg");
   row.append(el("div", "icon", LEG_ICON[leg.type] || "•"));
   // payee_display / biller_display are already the safe DB-sourced labels
@@ -276,17 +299,22 @@ function legRow(leg) {
   row.append(el("div", "sub right",
     leg.type === "BUY_EQUITY" && leg.estimated_fill_price_cents
       ? "@ " + centsToDisplay(leg.estimated_fill_price_cents) : ""));
+  const evidence = evidenceText(ev, leg);
+  if (evidence) row.append(el("div", "ev", evidence));
   return row;
 }
 
-function buildPlanCard(plan, confirmation) {
+function buildPlanCard(plan, confirmation, narration, transcript) {
   retireLiveCard();
   const card = el("div", "bubble card plan-card plan");
   card.id = "plan";
   card.append(el("p", "card-title", "Review payment"));
+  // The server's copy of what was said — what the draft was actually built from.
+  if (transcript) card.append(el("p", "said", "You said: \u201c" + transcript + "\u201d"));
 
   const legs = el("div", "legs"); legs.id = "legs";
-  for (const leg of plan.plan) legs.append(legRow(leg));
+  const ev = (narration && narration.evidence) || {};
+  for (const leg of plan.plan) legs.append(legRow(leg, ev[leg.id]));
   card.append(legs);
 
   const sec = el("details", "sec");
@@ -756,7 +784,9 @@ function showResult(res) {
 // unless it is on hold, in which case say when payments open instead.
 function afterContactAdded(c) {
   const pending = CURRENT.afterAdd;
+  const pendingVia = CURRENT.afterAddVia || null;
   CURRENT.afterAdd = null;
+  CURRENT.afterAddVia = null;
   if (c.hold_until) {
     botSay(c.nickname + " is saved. Payments to them open " + atTime(c.hold_until)
       + ". Use the time to call them on a number you already know.");
@@ -770,7 +800,7 @@ function afterContactAdded(c) {
   b.onclick = () => {
     chips.classList.remove("live");
     b.disabled = true;
-    submitTranscript(pending);
+    submitTranscript(pending, pendingVia);   // a spoken payment keeps its spoken reply
   };
   chips.append(b);
   m.append(chips);
@@ -866,10 +896,15 @@ function handleDraft(res) {
 
   CURRENT.plan = body.resolved_plan;
   CURRENT.kind = "payment";
-  const intro = el("div", "bubble",
-    conf ? "Here's the draft. It's unusual for you, so I need one more check first."
-         : "Here's the draft. Check it, then confirm with your biometric.");
-  addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf));
+  // The assistant's reply: what it worked out, built by the server from the
+  // same checked data as the card (backend/narrate.py) — never model text.
+  const reply = body.narration && body.narration.reply;
+  const intro = el("div", "bubble", reply
+    ? reply + " Check it, then confirm with your biometric."
+    : conf ? "Here's the draft. It's unusual for you, so I need one more check first."
+           : "Here's the draft. Check it, then confirm with your biometric.");
+  addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf, body.narration, body.transcript));
+  if (reply && CURRENT.via) Voice.speak(reply);     // spoken request -> spoken reply
   if (conf) {
     const code = document.getElementById("stepup-code");
     if (code) code.focus();
@@ -879,6 +914,7 @@ function handleDraft(res) {
 async function submitTranscript(transcript, via) {
   Voice.silence();                  // don't talk over the user's next request
   CURRENT.transcript = transcript;
+  CURRENT.via = via || null;        // spoken requests get a spoken reply
   userSay(transcript);
   if (via) {
     const last = thread().lastElementChild;
@@ -941,6 +977,7 @@ function renderClarify(body) {
         b.classList.add("chosen");
         userSay("Add " + nc.name + " as a new contact");
         CURRENT.afterAdd = CURRENT.transcript;        // the payment to carry on with
+        CURRENT.afterAddVia = CURRENT.via;            // ...and whether it was spoken
         const ask = "What's " + nc.name + "'s mobile number? It's where payments to them will go.";
         botSay(ask);
         Voice.speak(ask);

@@ -91,6 +91,14 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             assert "Mom" in plan_text, "payee_display 'Mom' must be rendered"
             assert "$500.00" in plan_text, "amount $500.00 must be rendered"
 
+            # 3b. the assistant's reply (what it worked out) and the card's
+            #     evidence: the user's own words, quoted from the transcript.
+            reply = page.locator(".msg.bot").last.inner_text()
+            assert "$500.00 to Mom from your Savings account" in reply, reply
+            assert "in line with what you usually send Mom" in reply, reply
+            assert "You said: \u201ctransfer five hundred from my savings to mom\u201d" in plan_text
+            assert "\u201cfive hundred\u201d \u00b7 \u201cmom\u201d \u00b7 \u201csavings\u201d" in plan_text, plan_text
+
             # 4. biometric sign -> gateway execute. The virtual authenticator
             #    auto-approves (UV flag set), so navigator.credentials.get
             #    resolves with a genuine assertion over sha256(phash + nonce).

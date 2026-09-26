@@ -11,7 +11,7 @@ const env = {
   navigator: {},
 };
 const app = new Function(...Object.keys(env),
-  SRC + "\nreturn { acctLabel, executedLines, successToast };")(...Object.values(env));
+  SRC + "\nreturn { acctLabel, executedLines, successToast, evidenceText };")(...Object.values(env));
 
 const plan = { plan: [
   { id: "t1", type: "TRANSFER", source_account: "acct_joint", payee_display: "Mom ··3310" },
@@ -33,6 +33,20 @@ process.stdout.write(JSON.stringify({
   partial: app.successToast(exec, plan),          // FAILED overall, 2 of 3 legs ran
   single: app.successToast(single, plan),
   noneRan: app.successToast(noneRan, plan),
+  evidence: [
+    app.evidenceText({ amount: { kind: "said", quote: "50 dollars" }, to: { kind: "said", quote: "mom" },
+                       from: { kind: "default" } }, { source_account: "acct_savings", amount_cents: 5000 }),
+    app.evidenceText({ amount: { kind: "chosen", quote: "500" }, to: { kind: "said", quote: "mom" },
+                       from: { kind: "said", quote: "spending" } }, { source_account: "acct_joint", amount_cents: 50000 }),
+    app.evidenceText({ amount: { kind: "calculated", text: "the rest of what's left in Savings" },
+                       to: { kind: "said", quote: "apple" }, from: { kind: "derived" } },
+                     { source_account: "acct_savings", amount_cents: 772800 }),
+    app.evidenceText({ amount: { kind: "not_found" }, to: { kind: "not_found" }, from: { kind: "default" } },
+                     { source_account: "acct_savings", amount_cents: 100 }),
+    app.evidenceText({ amount: { kind: "said", quote: "50" }, to: { kind: "said", quote: "mom" },
+                       from: { kind: "not_found" } }, { source_account: "acct_joint", amount_cents: 5000 }),
+    app.evidenceText(null, {}),
+  ],
   contact: app.successToast({ status: "UPDATED", changes: [
     { payee_display: "John ··8892", field: "nickname", new_value: "Johnny" }] }, null),
 }));

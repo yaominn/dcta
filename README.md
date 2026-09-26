@@ -825,6 +825,35 @@ dcta/
 | 8 | Red-team demo + polish | done |
 | 9 | Submission package | **next** — the only milestone left |
 
+## The assistant's reply and the review card's evidence
+
+A ready draft gets a conversational reply that says what the assistant **worked
+out**, not a rephrase of what the user said:
+
+> *"Got it — $50.00 to Mom from your Savings account. That's less than you
+> usually send Mom ($500.00). You didn't say which account, so I've used
+> Savings. To use another, cancel and ask again with the account. You'll have
+> $8,370.50 in Savings left afterwards."*
+
+It compares with what the user usually sends that person (first payment /
+in line / more / less / N×), explains a defaulted account, a calculated
+amount ("the rest") and a chosen one ("$50 or $500?"), states the balance
+left, and says why an extra check was triggered. A spoken request gets a
+spoken reply.
+
+**It is not model text.** `backend/narrate.py` builds it from the resolved
+plan, the ledger and the transcript — the same checked data as the card — so
+the reply can never say "only $5" beside a $5,000 card, however the model was
+steered.
+
+The card now shows **"You said: …"** (the server's copy of the transcript) and,
+under each payment, where each field came from: *"five hundred" · "mom" ·
+"savings"*, *Savings by default*, *calculated: the rest of what's left in
+Savings*, *you chose "500"*. Quotes are cut from the **transcript**, not from
+the parser's reading; a field whose words aren't there is flagged ⚠, never
+papered over. `tests/test_narration.py`; the browser test checks the reply and
+the evidence.
+
 ## Balances and the payment notification (demo)
 
 The top of the phone screen shows **Savings** and **Spending** balances, read

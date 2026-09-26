@@ -54,6 +54,7 @@ from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
 from backend.drafts import Draft, DraftStore
+from backend.narrate import narrate
 from backend.trace import RecordingProvider, TraceStore
 from backend.display import add_summary, change_summary, cents_to_display, plan_summary
 
@@ -757,7 +758,8 @@ def _pipeline(draft: Draft) -> dict:
                   resolved_plan=resolved.model_dump(mode="json"))
 
     # --- policy (M5). A BLOCKED draft keeps NO plan: there is nothing to sign.
-    verdicts = evaluate(resolved, load_context(draft.user_id, db_path=DB_PATH))
+    policy_ctx = load_context(draft.user_id, db_path=DB_PATH)      # reused by the reply below
+    verdicts = evaluate(resolved, policy_ctx)
     draft.policy = {
         "decision": verdicts.decision.value,
         "verdicts": [{"leg_id": v.leg_id, "decision": v.decision.value,
@@ -803,9 +805,34 @@ def _pipeline(draft: Draft) -> dict:
                        f"Valid 5 min. Never share this code. If this wasn't "
                        f"you, ignore this message.")
 
+    # --- what the assistant says about it (backend/narrate.py): built from the
+    #     same checked data as the card — never LLM text — so the reply and the
+    #     card cannot disagree. Only for a draft the user can actually approve.
+    #     Cosmetic: a failure here must never turn a valid, signable draft (whose
+    #     step-up code may already be on the user's phone) into an error — it
+    #     degrades to the plain card.
+    narration = None
+    if draft.status == "ready":
+        try:
+            conn = get_conn()
+            try:
+                accounts = {r["id"]: {"type": r["type"], "balance": r["balance"]}
+                            for r in conn.execute("SELECT id, type, balance FROM accounts "
+                                                  "WHERE user_id=?", (draft.user_id,))}
+            finally:
+                conn.close()
+            narration = narrate(plan, resolved, draft.transcript, accounts=accounts,
+                                history=policy_ctx.history, answers=draft.answers,
+                                extra_check=needs_step_up)
+        except Exception:
+            logging.exception("narration failed for draft %s; showing the plain card",
+                              draft.draft_id)
+
     return {
         "status": draft.status,
         "draft_id": draft.draft_id,
+        "transcript": draft.transcript,       # the SERVER's copy of what was said
+        "narration": narration,
         "resolved_plan": resolved.model_dump(mode="json"),
         "payload_hash": p_hash,
         "policy": draft.policy,

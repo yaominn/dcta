@@ -122,6 +122,13 @@ ACCOUNT_TYPE_SYNONYMS: dict[str, str] = {
 # before signing. A default you can see is consent; a default you cannot is the
 # failure this project exists to prevent.
 _DEFAULT_ACCOUNT_MENTIONS = frozenset({"default", "", "mine", "usual"})
+
+
+def names_an_account(mention: str) -> bool:
+    """True if this source-account mention NAMES an account; False if the user
+    was silent and the default applies — the resolver's own rule, for anything
+    (the review card) that must say which one happened."""
+    return _normalize(mention) not in _DEFAULT_ACCOUNT_MENTIONS
 _DEFAULT_ACCOUNT_TYPE = "savings"
 
 

@@ -694,3 +694,24 @@ def _match_clause_ids(legs, transcript: str) -> tuple[list[str], list[int]]:
         if chosen[i] is None:
             chosen[i] = next(remaining, -1)
     return clauses, chosen
+
+
+# --------------------------------------------------------------------------- public readings (for the review card)
+def match_legs(legs, transcript: str):
+    """(clauses, ids): the pairing the amount check uses — pass it to
+    competing_amounts(matched=) and leg_clauses() to compute it once."""
+    return _match_clause_ids(legs, transcript)
+
+
+def leg_clauses(legs, transcript: str, matched=None) -> list[str]:
+    """The part of the transcript each leg was checked against — the same
+    pairing the amount check uses, so the review card quotes exactly the words
+    the validator judged."""
+    clauses, ids = matched or _match_clause_ids(legs, transcript)
+    return [transcript if k < 0 else clauses[k] for k in ids]
+
+
+def named_source_accounts(text: str) -> dict[str, str]:
+    """{account type: the word used} for accounts NAMED as the source in text —
+    the same reading as the hard source-account check."""
+    return _named_account_types(text)

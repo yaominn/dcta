@@ -66,8 +66,12 @@ RULES — violating any of them makes your output invalid:
    "whatever is left" is {"after_leg": "t1", "op": "ALL"}. Do not compute
    balances, remainders, or totals.
 4. after_leg may only name a leg EARLIER in your own plan.
-5. source_account is the account the user named (e.g. {"mention": "savings"});
-   if they did not name one, use {"mention": "default"}.
+5. source_account is the account the user named, IN THEIR OWN WORDS, even if
+   the words are not one of the context's account types: "from my spending
+   account" is {"mention": "spending"}, "out of savings" is {"mention":
+   "savings"}. Words are mapped to accounts later — never replace them with
+   "default". Use {"mention": "default"} ONLY when the user named no account
+   at all.
 6. If you cannot determine a required field, DO NOT guess: omit the leg and
    list the gap in "unresolved" (e.g. "amount for t1").
 7. Number legs t1, t2, ... in the order the user stated them.
