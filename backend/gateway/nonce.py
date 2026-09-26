@@ -39,6 +39,17 @@ class NonceStore:
         self._store[nonce] = _NonceRecord(draft_id=draft_id, issued_at=time.time())
         return nonce
 
+    def revoke(self, belongs) -> int:
+        """Burn every unused nonce whose draft `belongs(draft_id)` — the kill
+        switch invalidates signing challenges already handed out. Returns how
+        many were revoked."""
+        n = 0
+        for rec in list(self._store.values()):         # a snapshot: requests run in threads
+            if not rec.used and belongs(rec.draft_id):
+                rec.used = True
+                n += 1
+        return n
+
     def consume(self, nonce: str, draft_id: str) -> None:
         """Verify freshness, binding, single-use; then invalidate. Raises NonceError."""
         rec = self._store.get(nonce)

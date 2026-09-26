@@ -17,6 +17,7 @@ from backend.data.db import connect
 from backend.data.seed import seed
 from backend.gateway import Gateway, NonceStore, MockSigner, MockExecutor
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer, ResolvedBuyEquity
+from support import dest
 
 
 class _EveryPayloadIsTheDraft:
@@ -72,6 +73,7 @@ def _plan(draft_id="d1", amount_cents=50000, source="acct_savings",
             ResolvedTransfer(
                 id="t1", type="TRANSFER", source_account=source,
                 payee_id="payee_17", payee_display="Mom", amount_cents=amount_cents,
+                **dest("payee_17"),
             )
         ],
         transcript_hash=transcript_hash,
@@ -240,7 +242,8 @@ def test_two_leg_sequential_execution(tmp_path):
         draft_id="d2",
         plan=[
             ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
-                             payee_id="payee_17", payee_display="Mom", amount_cents=50000),
+                             payee_id="payee_17", payee_display="Mom", amount_cents=50000,
+                             **dest("payee_17")),
             ResolvedBuyEquity(id="t2", type="BUY_EQUITY", source_account="acct_savings",
                               ticker="AAPL", amount_cents=100000,
                               estimated_shares=4, estimated_fill_price_cents=24150),
@@ -267,9 +270,11 @@ def test_stop_at_first_failure_marks_rest_blocked(tmp_path):
         draft_id="d3",
         plan=[
             ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
-                             payee_id="payee_17", payee_display="Mom", amount_cents=99999900),
+                             payee_id="payee_17", payee_display="Mom", amount_cents=99999900,
+                             **dest("payee_17")),
             ResolvedTransfer(id="t2", type="TRANSFER", source_account="acct_joint",
-                             payee_id="payee_17", payee_display="Mom", amount_cents=1000),
+                             payee_id="payee_17", payee_display="Mom", amount_cents=1000,
+                             **dest("payee_17")),
         ],
         transcript_hash=_STUB_TX_HASH,
         created_at=_CREATED,

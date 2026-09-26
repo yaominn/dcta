@@ -21,6 +21,8 @@ import pytest
 import requests
 
 REPO = Path(__file__).resolve().parent.parent
+# Shared test helpers (tests/support.py) importable as `support`.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # The suite needs no keys and no network, even on a machine whose .env holds
 # real credentials. Set before backend.config is imported: load_dotenv never

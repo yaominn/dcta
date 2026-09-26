@@ -174,6 +174,13 @@ class MockExecutor:
                                        "draft was made — nothing was updated",
                               "changes": []}
                     break
+                if e.field == "phone":
+                    # A new number is a new DESTINATION: bump its version and
+                    # record when, in the same savepoint. A transfer drafted for
+                    # the old number is now SUPERSEDED, and the scam rules see a
+                    # recent change (backend/data/destinations.py).
+                    conn.execute("UPDATE payees SET dest_version = dest_version + 1, "
+                                 "dest_changed_at = ? WHERE id = ?", (int(time.time()), e.payee_id))
                 results.append({"payee_display": e.payee_display, "field": e.field,
                                 "old_value": e.old_value, "new_value": e.new_value,
                                 "status": "UPDATED"})
@@ -210,11 +217,14 @@ class MockExecutor:
                 # legal_name: a real bank would fill it from the PayNow lookup
                 # of this number. There is no directory in the mock, so it is
                 # left empty rather than invented.
+                # A brand-new destination: version 1, "changed" now — so the
+                # scam rules treat its first payments as a new destination.
                 conn.execute(
                     "INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone, "
-                    "added_at, hold_until) VALUES (?,?,?,?,?,?,?,?)",
+                    "added_at, hold_until, dest_version, dest_changed_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,1,?)",
                     (payee_id, add.user_id, add.nickname, "",
-                     re.sub(r"\D", "", add.phone)[-4:], add.phone, now, hold_until))
+                     re.sub(r"\D", "", add.phone)[-4:], add.phone, now, hold_until, now))
                 result = {"draft_id": add.draft_id, "status": "ADDED",
                           "contact": {"payee_display": add.payee_display,
                                       "nickname": add.nickname, "phone": add.phone,
@@ -242,10 +252,11 @@ class MockExecutor:
         if row is None:  # pragma: no cover - _debit already raised
             return
         conn.execute(
-            "INSERT INTO transaction_history (user_id, payee_id, leg_type, amount, ts) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO transaction_history (user_id, payee_id, leg_type, amount, ts, "
+            "dest_version) VALUES (?,?,?,?,?,?)",
             (row["user_id"], getattr(leg, "payee_id", None), leg.type,
-             leg.amount_cents, datetime.now(timezone.utc).isoformat()),
+             leg.amount_cents, datetime.now(timezone.utc).isoformat(),
+             getattr(leg, "destination_version", None)),   # which destination was paid
         )
 
     def _debit(self, conn, account_id: str, amount_cents: int) -> None:

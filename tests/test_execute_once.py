@@ -41,6 +41,7 @@ from backend.gateway import Gateway, MockExecutor, MockSigner, NonceStore
 from backend.gateway.executor import AlreadyExecuted
 from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer
+from support import dest
 
 
 class _EveryPayloadIsTheDraft:
@@ -77,7 +78,8 @@ def _plan(cents=5000, draft_id="draft-once", source="acct_savings"):
     return ResolvedPlan(
         draft_id=draft_id,
         plan=[ResolvedTransfer(id="t1", source_account=source, payee_id="payee_17",
-                               payee_display="Mom ··3310", amount_cents=cents)],
+                               payee_display="Mom ··3310", amount_cents=cents,
+                               **dest("payee_17"))],
         transcript_hash=hash_transcript("pay mom"), created_at=now, expires_at=now + 300)
 
 

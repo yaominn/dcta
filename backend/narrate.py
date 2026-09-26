@@ -90,7 +90,7 @@ def _source_evidence(ileg, text: str, account_type: str | None) -> dict:
 def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
             accounts: dict[str, dict], history: list[dict],
             answers: dict[str, str] | None = None,
-            extra_check: bool = False) -> dict:
+            extra_check: bool = False, hold_seconds: int | None = None) -> dict:
     """The assistant's reply and per-leg evidence for a READY payment draft.
 
     accounts: account id -> {"type", "balance"} BEFORE this plan (the ledger).
@@ -194,6 +194,9 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
     touched = list(dict.fromkeys(leg.source_account for leg in resolved.plan))
     left = " and ".join(f"{_money(after[a])} in {account_label(a)}" for a in touched)
     notes.append(f"You'll have {left} left afterwards.")
+    if hold_seconds:
+        notes.append(f"I've paused this for {hold_seconds} seconds so you can check it — "
+                     f"cancel any time and nothing will be sent.")
     if extra_check:
         notes.append(f"Because {check_reason}, I've texted a code to your phone to make "
                      f"sure it's really you." if check_reason else

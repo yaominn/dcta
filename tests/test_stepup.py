@@ -21,6 +21,7 @@ from backend.data.seed import seed
 from backend.gateway import (Gateway, MockExecutor, MockSigner, NonceStore,
                              StepUpError, StepUpStore)
 from backend.models.schemas import ResolvedPlan, ResolvedTransfer
+from support import dest
 
 
 class _EveryPayloadIsTheDraft:
@@ -41,7 +42,7 @@ def _anomalous_plan(cents=500000, draft_id="d-stepup"):
         draft_id=draft_id,
         plan=[ResolvedTransfer(id="t1", type="TRANSFER", source_account="acct_savings",
                                payee_id="payee_21", payee_display="John ··4521",
-                               amount_cents=cents)],
+                               amount_cents=cents, **dest("payee_21"))],
         transcript_hash=hash_transcript("send five thousand to john"),
         created_at=_NOW, expires_at=_NOW + 300)
 

@@ -46,16 +46,42 @@ CREATE TABLE IF NOT EXISTS executions (
 """
 
 
+# Scam protection (backend/policy/scam.py). A server-enforced HOLD on one draft:
+# the gateway refuses it until release_at, whatever the page sends, and the end
+# of the countdown sends NOTHING by itself — the user still confirms. And the
+# user's KILL SWITCH: while engaged, no outgoing payment executes.
+SAFETY_DDL = """
+CREATE TABLE IF NOT EXISTS holds (
+    draft_id    TEXT PRIMARY KEY,
+    user_id     TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    release_at  INTEGER NOT NULL,
+    status      TEXT NOT NULL CHECK (status IN ('PENDING','CANCELLED','RELEASED'))
+);
+CREATE TABLE IF NOT EXISTS kill_switch (
+    user_id     TEXT PRIMARY KEY,
+    engaged_at  INTEGER NOT NULL,
+    released_at INTEGER                 -- NULL while engaged
+);
+"""
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing ledger up to the current schema without re-seeding
     (a re-seed would drop the user's own edits and registered passkeys).
     Idempotent; called at app startup."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
-    for col in ("phone TEXT", "added_at INTEGER", "hold_until INTEGER"):
+    for col in ("phone TEXT", "added_at INTEGER", "hold_until INTEGER",
+                "dest_version INTEGER NOT NULL DEFAULT 1", "dest_changed_at INTEGER"):
         if cols and col.split()[0] not in cols:
             conn.execute(f"ALTER TABLE payees ADD COLUMN {col}")
             conn.commit()
+    hcols = {r["name"] for r in conn.execute("PRAGMA table_info(transaction_history)")}
+    if hcols and "dest_version" not in hcols:
+        conn.execute("ALTER TABLE transaction_history ADD COLUMN dest_version INTEGER")
+        conn.commit()
     conn.executescript(EXECUTIONS_DDL)
+    conn.executescript(SAFETY_DDL)
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
@@ -86,8 +112,13 @@ def init_schema(conn: sqlite3.Connection) -> None:
             phone       TEXT,                            -- '+65 9123 3310'; NEVER shown to the LLM.
                                                          -- Editable by the user, via a signed draft only.
             added_at    INTEGER,                         -- Unix s; NULL for the seeded contacts
-            hold_until  INTEGER                          -- Unix s; payments blocked until then
+            hold_until  INTEGER,                         -- Unix s; payments blocked until then
                                                          -- (a new contact's HOLD safeguard)
+            -- WHERE the money goes, versioned (backend/data/destinations.py):
+            -- bumps on every routing change (a new phone number), and the time
+            -- of that change. A transfer signs the version it was drafted for.
+            dest_version    INTEGER NOT NULL DEFAULT 1,
+            dest_changed_at INTEGER                      -- Unix s; NULL = unchanged since set up
         );
 
         CREATE TABLE IF NOT EXISTS billers (
@@ -112,7 +143,9 @@ def init_schema(conn: sqlite3.Connection) -> None:
             payee_id  TEXT REFERENCES payees(id),
             leg_type  TEXT NOT NULL DEFAULT 'TRANSFER',   -- TRANSFER | PAY_BILL | BUY_EQUITY
             amount    INTEGER NOT NULL,               -- cents (int minor units; never float)
-            ts        TEXT NOT NULL                   -- ISO-8601
+            ts        TEXT NOT NULL,                  -- ISO-8601
+            dest_version INTEGER                      -- the payee destination version paid;
+                                                      -- NULL = before versioning (= version 1)
         );
 
         CREATE TABLE IF NOT EXISTS limits (
@@ -134,3 +167,4 @@ def init_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.executescript(EXECUTIONS_DDL)
+    conn.executescript(SAFETY_DDL)

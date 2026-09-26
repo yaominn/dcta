@@ -32,6 +32,7 @@ from backend.policy import (
     check_anomaly,
     Decision, PolicyContext, evaluate, load_context, owner_of,
 )
+from support import dest
 
 
 class _EveryPayloadIsTheDraft:
@@ -56,7 +57,8 @@ def _plan(*legs, draft_id="d1"):
 
 def _transfer(cents, leg_id="t1", payee="payee_17", display="Mom ··3310"):
     return ResolvedTransfer(id=leg_id, type="TRANSFER", source_account="acct_savings",
-                            payee_id=payee, payee_display=display, amount_cents=cents)
+                            payee_id=payee, payee_display=display, amount_cents=cents,
+                            **dest(payee))
 
 
 def _equity(cents=24150, leg_id="t1"):

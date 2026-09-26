@@ -322,6 +322,24 @@ details.sec[open] summary::before { transform: rotate(90deg); }
 .bal-amt { font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; transition: color .6s; }
 .bal-amt.changed { color: var(--accent); }
 
+/* ---------- scam protection ---------- */
+.scam-warn { border-radius: 12px; padding: 8px 10px; margin: 6px 0 10px; font-size: 13px; line-height: 1.35; }
+.scam-warn p { margin: 4px 0; }
+.scam-warn.warn { background: #fff7e6; color: #7a4b00; border: 1px solid #f3d9a4; }
+.scam-warn.stop { background: #fdecec; color: #8a1c1c; border: 1px solid #f2b8b8; }
+.leg .dest { grid-column: 2 / -1; font-size: 12px; color: var(--fg); font-variant-numeric: tabular-nums; }
+.name-check { margin: 8px 0; display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+.name-check input { padding: 9px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--surface); color: var(--fg); }
+.freeze { border: 1px solid #f2b8b8; background: #fdecec; color: #8a1c1c; border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.freeze.on { background: #8a1c1c; color: #fff; }
+.frozen { margin: 0 14px 8px; padding: 10px 12px; border-radius: 12px; background: #fdecec; color: #8a1c1c; border: 1px solid #f2b8b8; font-size: 13px; }
+.frozen p { margin: 0 0 8px; }
+@media (prefers-color-scheme: dark) {
+  .scam-warn.warn { background: #3a2a0a; color: #f3d9a4; border-color: #5c4414; }
+  .scam-warn.stop, .frozen { background: #3a1414; color: #f6c2c2; border-color: #5c2020; }
+  .freeze { background: #3a1414; color: #f6c2c2; border-color: #5c2020; }
+}
+
 /* ---------- drop-down notification ---------- */
 .toast {
   position: absolute; top: 44px; left: 10px; right: 10px; z-index: 20;

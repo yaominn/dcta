@@ -89,6 +89,21 @@ class Settings:
     # HOLD safeguard (backend/policy/new_contact.py). 12 hours by default; set
     # it to a few minutes for a rehearsal that needs to see the hold lift.
     new_contact_hold_minutes: int = int(os.getenv("NEW_CONTACT_HOLD_MINUTES", "720"))
+
+    # --- Scam protection (backend/policy/scam.py) ---
+    # How long a HOLD / HOLD_STEP_UP payment is held by the server before it can
+    # be confirmed. 30 s for the demo; capped at 4 min (main._hold_seconds) so a
+    # held draft can still be signed inside its 5-minute window. Longer holds
+    # (a deployment might want hours) need longer-lived drafts first.
+    scam_hold_seconds: int = int(os.getenv("SCAM_HOLD_SECONDS", "30"))
+    # A destination changed (or added) this recently counts as a recent change.
+    recent_change_hours: int = int(os.getenv("RECENT_CHANGE_HOURS", "24"))
+    # A passkey added this recently (and not the user's first) is a risk signal.
+    credential_cooling_hours: int = int(os.getenv("CREDENTIAL_COOLING_HOURS", "12"))
+    # Log each draft's scam score and every prompt sent to the model to the
+    # BROWSER console (and the score to the server log). On for the demo — the
+    # /data page shows the same prompts; set CONSOLE_DEBUG=0 for a public deploy.
+    console_debug: bool = os.getenv("CONSOLE_DEBUG", "1").strip().lower() not in {"0", "false", "no", "off"}
     # A hung upstream call must not hold the HTTP request open indefinitely.
     llm_timeout_s: float = float(os.getenv("LLM_TIMEOUT_S", "30"))
     hunyuan_region: str = os.getenv("TENCENT_HUNYUAN_REGION", "ap-guangzhou")

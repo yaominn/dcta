@@ -47,6 +47,7 @@ from typing import Any, Callable
 from backend.audit.canonical import hash_transcript
 from backend.data.db import connect, get_conn
 from backend.display import account_label, cents_to_display
+from backend.data import destinations
 # The validator's reading of which numbers are money, so the resolver asks
 # about exactly what the validator will accept. Allowed by the import
 # boundary: the validator reaches data/audit/models only, never the agent.
@@ -446,9 +447,15 @@ def _resolve_leg(
 
     # 6. BUILD THE RESOLVED LEG ---------------------------------------------
     if isinstance(leg, TransferIntent):
+        # Bind the DESTINATION as it is now: a routing change after this draft
+        # (a new number for "Mom") makes it SUPERSEDED at the gateway.
+        dest = destinations.current(conn, payee_id)
         rleg = ResolvedTransfer(
             id=leg.id, type="TRANSFER", source_account=source_acct,
             payee_id=payee_id, payee_display=payee_display, amount_cents=debit,
+            destination_version=dest.version if dest else None,
+            destination_masked=dest.masked if dest else None,
+            destination_hash=dest.routing_hash if dest else None,
         )
     elif isinstance(leg, PayBillIntent):
         rleg = ResolvedPayBill(

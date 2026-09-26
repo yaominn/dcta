@@ -216,6 +216,13 @@ class ResolvedTransfer(BaseModel):
     payee_id: str            # resolver mapped the mention -> concrete id
     payee_display: str       # safe label for the overlay (user nickname)
     amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)   # concrete, computed by the resolver
+    # WHERE the money goes, signed (backend/data/destinations.py). Optional in
+    # the schema only so hand-built plans in older tests still parse; the
+    # gateway REFUSES a transfer without them, and refuses one whose version is
+    # no longer the payee's current destination (SUPERSEDED).
+    destination_version: int | None = None
+    destination_masked: str | None = None      # "+65 9123 ••10" — what the user saw
+    destination_hash: str | None = None        # sha256 of the full routing value
 
 
 class ResolvedPayBill(BaseModel):

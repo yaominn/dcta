@@ -212,9 +212,11 @@ function typing(on) {
    the live controls are unambiguous. A newer card retires the older one:
    its ids are dropped and its controls disabled — an old draft can't be
    signed from further up the conversation. */
-const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign", "decline",
+const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign", "decline", "name-check",
                   "stepup", "stepup-reason", "stepup-form", "stepup-code"];
 function retireLiveCard() {
+  clearInterval(CURRENT.holdTimer);
+  CURRENT.gate = {};                  // a new card starts with no gates of its own
   // Every control on the spent card, not only the ones with ids — the
   // step-up Verify button stayed live after a Cancel.
   const live = document.getElementById("plan");
@@ -261,6 +263,54 @@ const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "
 // user's OWN words, cut from the transcript by the server (backend/narrate.py);
 // "by default" / "calculated" say what the assistant filled in. Pure — the
 // review card's evidence is tested under Node (tests/js/app_runner.js).
+/* ---------- scam protection: the sign gate, the hold, the name check ---------- */
+const SIGN_LABEL = "Confirm with biometric";
+
+function updateSignGate() {
+  const btn = document.getElementById("sign");
+  if (!btn) return;
+  const g = CURRENT.gate || {};
+  btn.disabled = !!(g.code || g.name || g.hold);
+}
+
+// A server-enforced hold, shown as a countdown. When it ends NOTHING is sent:
+// Confirm simply becomes available, and the user still decides.
+function startHoldCountdown(seconds) {
+  clearInterval(CURRENT.holdTimer);
+  let left = Math.max(0, Math.ceil(seconds));
+  const paint = () => {
+    const btn = document.getElementById("sign");
+    if (!btn) { clearInterval(CURRENT.holdTimer); return; }
+    if (left > 0) {
+      btn.textContent = "\u23f3 Confirm available in " + Math.floor(left / 60) + ":"
+        + String(left % 60).padStart(2, "0");
+    } else {
+      clearInterval(CURRENT.holdTimer);
+      btn.textContent = SIGN_LABEL;
+      CURRENT.gate.hold = false;
+      updateSignGate();
+    }
+    left -= 1;
+  };
+  paint();
+  CURRENT.holdTimer = setInterval(paint, 1000);
+}
+
+function buildNameCheck(name) {
+  const box = el("div", "name-check");
+  box.append(el("label", null, "To continue, type " + name + "\u2019s name:"));
+  const input = el("input");
+  input.type = "text";
+  input.autocomplete = "off";
+  input.id = "name-check";
+  input.oninput = () => {
+    CURRENT.gate.name = input.value.trim().toLowerCase() !== name.toLowerCase();
+    updateSignGate();
+  };
+  box.append(input);
+  return box;
+}
+
 function evidenceText(ev, leg) {
   if (!ev) return "";
   const q = (x) => "\u201c" + x + "\u201d";
@@ -299,16 +349,25 @@ function legRow(leg, ev) {
   row.append(el("div", "sub right",
     leg.type === "BUY_EQUITY" && leg.estimated_fill_price_cents
       ? "@ " + centsToDisplay(leg.estimated_fill_price_cents) : ""));
+  // WHERE the money goes — signed as part of the payment (data/destinations.py).
+  if (leg.destination_masked) row.append(el("div", "dest", "PayNow " + leg.destination_masked));
   const evidence = evidenceText(ev, leg);
   if (evidence) row.append(el("div", "ev", evidence));
   return row;
 }
 
-function buildPlanCard(plan, confirmation, narration, transcript) {
+function buildPlanCard(plan, confirmation, narration, transcript, risk) {
   retireLiveCard();
   const card = el("div", "bubble card plan-card plan");
   card.id = "plan";
   card.append(el("p", "card-title", "Review payment"));
+  // Scam warnings: FIXED sentences from the server's rules (policy/scam.py),
+  // never model text — the card only renders trusted text.
+  if (risk && risk.warnings && risk.warnings.length) {
+    const box = el("div", "scam-warn " + (risk.outcome === "WARN" ? "warn" : "stop"));
+    for (const w of risk.warnings) box.append(el("p", null, "\u26a0\ufe0f " + w));
+    card.append(box);
+  }
   // The server's copy of what was said — what the draft was actually built from.
   if (transcript) card.append(el("p", "said", "You said: \u201c" + transcript + "\u201d"));
 
@@ -333,14 +392,21 @@ function buildPlanCard(plan, confirmation, narration, transcript) {
 
   if (confirmation) card.append(buildStepUp(confirmation));
 
-  const btn = el("button", "btn primary", "Confirm with biometric");
+  // HOLD_STEP_UP: type the payee's name. Someone rushing through a coached
+  // call is more likely to stop at typing than at a button. (UX friction; the
+  // server enforces the hold and the code whatever this page does.)
+  if (risk && risk.confirm_name) card.append(buildNameCheck(risk.confirm_name));
+
+  const btn = el("button", "btn primary", SIGN_LABEL);
   btn.id = "sign";
-  // Escalated: signing stays disabled until the out-of-band code is verified.
-  // That is UX only — the gateway refuses an unconfirmed escalated plan
-  // whatever this page does (gateway/stepup.py).
-  btn.disabled = !!confirmation;
   btn.onclick = onSign;
+  // Gates that must ALL clear before Confirm enables — each is UX only; the
+  // gateway refuses an unconfirmed, unheld or unbound payment regardless.
+  CURRENT.gate = { code: !!confirmation, name: !!(risk && risk.confirm_name),
+                   hold: !!(risk && risk.hold && risk.hold.seconds_left > 0) };
   card.append(btn, declineButton());
+  if (CURRENT.gate.hold) startHoldCountdown(risk.hold.seconds_left);
+  updateSignGate();
   card.append(el("p", "hint",
     "Your device signs a hash of exactly this payment, recomputed in your browser."));
   return card;
@@ -556,8 +622,9 @@ function buildStepUp(conf) {
       box.classList.add("done");
       box.querySelector(".stepup-title").textContent = "Confirmed on your phone";
       form.remove();
-      const sign = document.getElementById("sign");
-      if (sign) sign.disabled = false;
+      CURRENT.gate = CURRENT.gate || {};
+      CURRENT.gate.code = false;          // one gate of several (hold, name, code)
+      updateSignGate();
       botSay("Code accepted. Confirm with your biometric to "
         + (CURRENT.kind === "contact_add" ? "save the contact."
            : CURRENT.kind === "contact_edit" ? "make the change." : "send it."));
@@ -829,6 +896,33 @@ function setStatus(msg) {
   if (s) { s.textContent = msg; s.hidden = !msg; }
 }
 
+// CONSOLE_DEBUG (server setting): the scam score and every prompt sent to the
+// model, printed to the browser console for each request.
+function logDebug(body) {
+  const d = body && body.debug;
+  if (!d || typeof console === "undefined") return;
+  const s = d.scam;
+  console.groupCollapsed("%cDCTA scam check: " + (s ? s.outcome + " (score " + s.score + ")"
+                                                     : "no payment to score"), "font-weight:bold");
+  if (s) {
+    console.table((s.signals || []).map((x) => ({ signal: x.code, weight: "+" + x.weight,
+                                                  detail: x.detail })));
+    console.log("warnings shown:", s.warnings);
+    console.log("full assessment (rules, not the model):", s);
+  }
+  if (d.scam_language && Object.keys(d.scam_language).length) {
+    console.log("scam phrases found in your words:", d.scam_language);
+  }
+  console.groupEnd();
+  (d.llm_calls || []).forEach((c, i) => {
+    console.groupCollapsed("DCTA \u2192 model call " + (i + 1) + " (" + (c.ms != null ? c.ms : "?") + " ms)");
+    console.log("SYSTEM PROMPT:\n" + c.system);
+    console.log("USER PROMPT:\n" + c.user);
+    console.log(c.error ? "ERROR: " + c.error : "REPLY:\n" + c.output);
+    console.groupEnd();
+  });
+}
+
 function handleDraft(res) {
   typing(false);
   if (res.status !== 200) {
@@ -837,7 +931,12 @@ function handleDraft(res) {
     return;
   }
   const body = res.json;
+  logDebug(body);
   CURRENT.draftId = body.draft_id;
+  // Scam phrases in the user's own words, even with no draft to review yet.
+  if (body.scam_language && body.scam_language.warning) {
+    botSay("\u26a0\ufe0f " + body.scam_language.warning);
+  }
   if (body.kind === "contact_add" && body.status === "blocked") {   // refused: a scam
     showContactRefused(body);
     return;
@@ -903,7 +1002,8 @@ function handleDraft(res) {
     ? reply + " Check it, then confirm with your biometric."
     : conf ? "Here's the draft. It's unusual for you, so I need one more check first."
            : "Here's the draft. Check it, then confirm with your biometric.");
-  addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf, body.narration, body.transcript));
+  addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf, body.narration, body.transcript,
+                                     body.scam));
   if (reply && CURRENT.via) Voice.speak(reply);     // spoken request -> spoken reply
   if (conf) {
     const code = document.getElementById("stepup-code");
@@ -1201,8 +1301,71 @@ function wireSound() {
   btn.onclick = () => Voice.setMuted(!Voice.isMuted());
 }
 
+/* ---------- kill switch ---------- */
+function paintFreeze(engaged) {
+  const banner = document.getElementById("frozen");
+  const btn = document.getElementById("freeze");
+  if (banner) banner.hidden = !engaged;
+  if (btn) { btn.classList.toggle("on", engaged); btn.textContent = engaged ? "Frozen" : "Freeze"; }
+}
+
+async function refreshKillSwitch() {
+  try {
+    paintFreeze(!!(await jget(API + "/api/killswitch?user_id=" + DEMO_USER)).engaged);
+  } catch (_) { /* the banner is a convenience; the server enforces the freeze */ }
+}
+
+function wireKillSwitch() {
+  const btn = document.getElementById("freeze");
+  const unfreeze = document.getElementById("unfreeze");
+  const form = document.getElementById("unfreeze-form");
+  const code = document.getElementById("unfreeze-code");
+  if (!btn) return;
+  // One tap (plus "are you sure") — making things safer should be easy.
+  btn.onclick = async () => {
+    if (btn.classList.contains("on")) return;
+    if (!confirm("Freeze all outgoing payments? Unfreezing needs a code sent to your phone.")) return;
+    const r = await jpost(API + "/api/killswitch", { user_id: DEMO_USER });
+    paintFreeze(true);
+    retireLiveCard();
+    botSay("Done — all outgoing payments are frozen. " + (r.json.drafts_cancelled
+      ? r.json.drafts_cancelled + " request(s) waiting for approval were cancelled. " : "")
+      + (r.json.already_sent
+      ? r.json.already_sent + " payment(s) had already gone through before the freeze — check your balance. " : "")
+      + "Nothing can be sent until you unfreeze with a code from your phone.");
+  };
+  unfreeze.onclick = async () => {
+    const r = await jpost(API + "/api/killswitch/release/begin", { user_id: DEMO_USER });
+    if (r.status !== 200) {                    // too many codes this hour
+      showErr(((r.json.detail || {}).error || "Couldn't send a code") + ".");
+      return;
+    }
+    if (r.json.engaged === false) { paintFreeze(false); return; }
+    form.hidden = false;
+    code.focus();
+    botSay("I've texted a code to your phone. Enter it to unfreeze your payments.");
+  };
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const r = await jpost(API + "/api/killswitch/release", { user_id: DEMO_USER, code: code.value.trim() });
+    if (r.status === 200 && r.json.engaged === false) {
+      form.hidden = true;
+      code.value = "";
+      paintFreeze(false);
+      if (r.json.drafts_cancelled) retireLiveCard();
+      botSay("Payments are unfrozen." + (r.json.drafts_cancelled
+        ? " " + r.json.drafts_cancelled + " request(s) made while frozen were cancelled — ask again if you still want them."
+        : ""));
+    } else {
+      showErr(((r.json.detail || {}).error || "That code didn't work") + ".");
+    }
+  };
+}
+
 async function init() {
   wireSound();
+  wireKillSwitch();
+  refreshKillSwitch();
   tickClock();
   setInterval(tickClock, 15000);
   refreshBalances();

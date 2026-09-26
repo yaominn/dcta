@@ -74,6 +74,12 @@ class Draft:
     origin_draft_id: str | None = None
     policy: dict | None = None
     validation: dict | None = None
+    scam: dict | None = None               # the scam assessment (policy/scam.py)
+    # The strictest scam outcome this draft has ever been given. Re-running the
+    # pipeline (a clarification) can raise it, never lower it: the safeguards
+    # the user was shown stay the ones the gateway enforces.
+    scam_floor: str | None = None
+    llm_calls: list = field(default_factory=list)   # model prompts, for CONSOLE_DEBUG
     question: dict | None = None
 
     @property
@@ -128,6 +134,23 @@ class DraftStore:
             return ("OUTDATED", "this is not the payment that was drafted and "
                                 "checked — nothing was sent")
         return None
+
+    def transcript_of(self, draft_id: str) -> str:
+        """What the user said for this draft — for the gateway's scam re-check."""
+        draft = self.get(draft_id)
+        return draft.transcript if draft is not None else ""
+
+    def scam_outcome_of(self, draft_id: str) -> str | None:
+        """The strictest scam outcome the draft was shown with (None: never assessed)."""
+        draft = self.get(draft_id)
+        return draft.scam_floor if draft is not None else None
+
+    def open_ids(self, user_id: str) -> list[str]:
+        """The user's drafts that could still be signed — every "ready" one,
+        including those on a hold or waiting for a phone code."""
+        self._sweep()
+        return [k for k, d in list(self._drafts.items())     # a snapshot: other
+                if d.user_id == user_id and d.status == "ready"]  # requests may add drafts
 
     def _sweep(self) -> None:
         now = time.time()

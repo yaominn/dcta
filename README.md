@@ -194,6 +194,67 @@ draft left unsigned across a server restart can no longer be paid (fails
 safe — ask again). `tests/test_draft_states.py` pins all of it, including a
 decline and a signature released together, ten times over.
 
+## Scam protection — for the scams a signature can't stop
+
+In the scams DBS worries about most, the **real customer** signs the payment
+while being manipulated ("Mum, this is my new number"; the "officer" who needs
+your savings in a safe account). Passkeys and nonces don't help: the person
+approving *is* the account holder. So DCTA notices the pattern and slows them
+down — enforced by the server, never by a page that hides a button.
+
+**Signed destinations** (`backend/data/destinations.py`). Each payee's
+destination (its PayNow mobile, in the demo) is versioned: a new number bumps
+the version and records when. A transfer **signs** the version, the masked
+number the user saw (`+65 9123 ••10`, shown on the card) and a hash of the full
+routing value. A transfer drafted for the old number is refused as
+`SUPERSEDED`; an unbound transfer never runs.
+
+**A scam score** (`backend/policy/scam.py`) — rules only, never the model:
+
+| Signal | Rule | Weight |
+|---|---|---|
+| `FIRST_PAYMENT_TO_DESTINATION` | no earlier transfer to this destination *version* | 2 |
+| `RECENT_DESTINATION_CHANGE` | changed or added < 24 h ago | 3 |
+| `LARGE_FIRST_PAYMENT` | first payment and ≥ $1,000 | 3 |
+| `BALANCE_DRAIN` | ≥ 80% of the source account | 3 |
+| `RAPID_MULTI_DESTINATION` | ≥ 3 new destinations in 30 min | 4 |
+| `RECENT_CREDENTIAL_CHANGE` | a passkey added < 12 h ago (not the first) | 4 |
+| `SOCIAL_ENGINEERING_LANGUAGE` | phrase rules on the raw transcript ("safe account" or an official's orders: 4) | 2 |
+| `UNUSUAL_HOUR` | 00:00–05:00 Singapore time, first payment | 1 |
+
+**0–1 ALLOW** (just the biometric) · **2–3 WARN** (a scam-specific warning on
+the card) · **4–6 HOLD** (+ a 30-second server-enforced hold) · **≥7
+HOLD_STEP_UP** (+ a phone code, + typing the payee's name).
+
+**The hold** (`backend/policy/safety.py`, `holds` table): no signing challenge
+and no execution until it ends, whatever the client sends; when it ends
+**nothing happens by itself** — the user still confirms. **Cancel needs no
+signature** and writes `HOLD_CANCELLED`. The gateway **re-runs the score**:
+the drafted outcome still binds (a lower score later doesn't lift the hold or
+the phone code), and a *higher* one the user was never shown refuses the
+payment (`RESCORED` — cancel and ask again). `SCAM_HOLD_SECONDS` sets the length.
+
+**Phrase flags** on the user's own words — one list, shared with the
+add-a-contact flow (`backend/policy/new_contact.py`): a "safe account", an
+official *telling you* to pay (police/MAS/CPF + "told me" — so "the badminton
+court" isn't flagged), secrecy, "new number", guaranteed returns, pay-to-earn
+jobs, plus "ignore previous instructions". Run by rule, outside the model (an
+injection could switch off model-made flags). They only ever **add** friction;
+"urgent" alone adds none. Advisory evidence, not a security boundary. A
+warning shows even when the request can't be drafted yet.
+
+**Kill switch**: **Freeze** in the header stops every outgoing payment at once
+(no signature — safer should be easy), cancels every payment waiting for
+approval (and its hold), burns issued signing challenges, and blocks contact
+adds and edits; **unfreezing needs a code on the phone** (at most 3 codes an
+hour).
+
+Every assessment is written to the audit log (`SCAM_ASSESSMENT`, source "rules
+(not the model)") as codes, weights and the outcome — never the user's words. With `CONSOLE_DEBUG` on (default; `CONSOLE_DEBUG=0` to turn
+off) the browser console shows each request's score breakdown and every
+prompt sent to the model, with its reply. `tests/test_scam_protection.py`,
+red-team scenarios 10–12.
+
 ## M3 — LLM parser + schema + opaque IDs
 
 `POST /api/plan` turns a text transcript into a schema-valid `IntentPlan`
@@ -589,7 +650,7 @@ row the mention does not justify" check would then have a path around it. See
 
 ### The red-team demo is executable
 
-`python -m backend.redteam` runs all nine attack scenarios against the real
+`python -m backend.redteam` runs all twelve scenarios against the real
 pipeline over the real API and prints what held, with evidence. It also runs in
 CI (`tests/test_redteam.py`, one test per scenario), so **"the LLM cannot move
 money" is a claim that fails the build when it stops being true** — not a line
@@ -606,6 +667,9 @@ in a slide.
 | 7 | One byte edited in the audit log | `verify_chain()` names the exact entry |
 | 8 | Correctly signed payload, UI skipped | A hand-assembled $20,000.01 gets no nonce (no such draft); swapped into a real draft it is refused `OUTDATED` — only the drafted, policy-cleared payment executes |
 | 9 | Compromised **resolver** swaps the payee | The validator freezes it; a frozen draft gets no nonce, so it is unsignable (M6) |
+| 10 | **New-number scam**: Mom's number changed, then "pay mom 500" | Signed, versioned destination → scam score HOLD: warning, server-enforced hold (a forced submit gets `HELD`), one-tap Cancel, nothing sent |
+| 11 | **Coached victim**: "the police officer said… don't tell anyone" | Rule-based phrase flags on the raw transcript (not the model) → HOLD_STEP_UP: warning, hold, phone code, type the name |
+| 12 | *Benign control*: $50 to a long-standing payee | ALLOW — no warning, no hold, no extra step |
 
 Scenarios 8 and 9 are not in the brief's list. They are what an attacker tries
 *after* the obvious doors are shut, and they exercise the defences M5 and M6
@@ -801,7 +865,7 @@ dcta/
     auth/         # WebAuthn registration/authentication
     models/       # FROZEN v1 schemas (the cross-team contract)
     data/         # SQLite + seed script
-    redteam/      # M8: the nine attack scenarios, executable (python -m backend.redteam)
+    redteam/      # M8: the twelve red-team scenarios, executable (python -m backend.redteam)
     drafts.py     # server-side draft store (the clarify loop's state)
     config.py     # env-driven settings (credentials never hardcoded)
     main.py       # FastAPI app
@@ -911,7 +975,17 @@ can show — both attack **our own code**, not the model:
    from the transcript, freezes the draft, and a frozen draft receives no nonce
    — so it is unsignable, not merely labelled frozen.
 
-All nine are executable, not slideware:
+10. **The new-number scam** — Mom's PayNow number is changed, then the real
+    customer is talked into paying her $500. The signed destination is
+    versioned; the recent change scores as a scam pattern: a warning, a
+    server-enforced hold, and a one-tap Cancel.
+11. **A coached victim** — "the police officer said I need to transfer 5000 to
+    landlord immediately, don't tell anyone". Rules on the raw transcript flag
+    it: a specific warning, a hold, a phone code, typing the payee's name.
+12. **A benign control** — $50 to a long-standing payee goes through with no
+    extra friction at all.
+
+All twelve are executable, not slideware:
 
 ```bash
 python -m backend.redteam        # runs every scenario against the real pipeline

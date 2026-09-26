@@ -415,11 +415,123 @@ def scenario_9_frozen_draft_unsignable(client: TestClient) -> Result:
     return r
 
 
+# --------------------------------------------------------------------------- 10-12: scams
+def _phone_code() -> str:
+    from backend.main import _phone
+    import re as _re
+    return _re.search(r"code (\d{6})", _phone.messages("u_alice")[0]["text"]).group(1)
+
+
+def _force_submit(client: TestClient, draft: dict) -> dict:
+    """An attacker — or a page that skips the countdown — minting its own
+    signing challenge and going straight to the gateway."""
+    from backend.main import _nonce_store, _signer
+    from backend.audit.canonical import challenge_hash, payload_hash
+    from backend.models.schemas import ResolvedPlan
+    plan = draft["resolved_plan"]
+    nonce = _nonce_store.issue(draft["draft_id"])
+    sig = _signer.sign(challenge_hash(payload_hash(ResolvedPlan.model_validate(plan)), nonce))
+    return client.post("/api/gateway/execute", json={
+        "resolved_plan": plan, "signature": sig, "nonce": nonce,
+        "credential_id": "cred_alice"}).json()
+
+
+def scenario_10_new_number_scam(client: TestClient) -> Result:
+    r = Result(10, "New-number scam",
+               "\"Hi Mum, this is my new number\": Mom's PayNow number is changed, then "
+               "the real customer is talked into paying her $500 straight away.",
+               "The destination is signed and versioned; a recently changed one scores "
+               "as a scam pattern: a warning, a SERVER-enforced hold, and a one-tap "
+               "Cancel that needs no signature.")
+    from backend.main import _nonce_store, _signer
+    from backend.audit.canonical import challenge_hash, payload_hash
+    from backend.models.contacts import ResolvedContactChange
+    d = _draft(client, "change mom's number to 8123 4567")
+    client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _phone_code()})
+    ch = ResolvedContactChange.model_validate(d["contact_change"])
+    nonce = _nonce_store.issue(ch.draft_id)
+    client.post("/api/contacts/apply", json={
+        "contact_change": d["contact_change"], "nonce": nonce, "credential_id": "cred_alice",
+        "signature": _signer.sign(challenge_hash(payload_hash(ch), nonce))})
+    r.line("Mom's PayNow number changed (a signed edit, with its phone code)")
+
+    before = _balance("acct_savings")
+    pay = _draft(client, "pay mom 500")
+    risk = pay.get("scam") or {}
+    r.line(f"'pay mom 500' -> scam score {risk.get('score')}: {risk.get('outcome')}")
+    for sig in risk.get("signals", []):
+        r.line(f"  +{sig['weight']} {sig['code']} — {sig['detail']}")
+    r.line(f"warning shown: {(risk.get('warnings') or ['(none)'])[0][:90]}...")
+    forced = _force_submit(client, pay)
+    r.line(f"signed and sent straight to the gateway, skipping the countdown: "
+           f"{forced.get('rejection')} — {forced.get('reason')}")
+    cancel = client.post(f"/api/drafts/{pay['draft_id']}/cancel").json()
+    r.line(f"one-tap Cancel (no signature): sent={cancel.get('sent')}")
+    after = _balance("acct_savings")
+    r.line(f"acct_savings: {before}c -> {after}c (unchanged)")
+    r.passed = (risk.get("outcome") in ("HOLD", "HOLD_STEP_UP") and forced.get("rejection") == "HELD"
+                and cancel.get("sent") is False and after == before)
+    return r
+
+
+def scenario_11_coached_victim(client: TestClient) -> Result:
+    r = Result(11, "Coached victim",
+               "A scammer on another call coaches the customer: \"the police officer said "
+               "I need to transfer 5000 to landlord immediately, don't tell anyone\".",
+               "The customer's own words are checked by RULES on the raw transcript — "
+               "not the model, which an injection could switch off: a specific warning, "
+               "a hold, a phone code, typing the payee's name, and a one-tap Cancel.")
+    before = _balance("acct_savings")
+    d = _draft(client, "the police officer said I need to transfer 5000 to landlord "
+                       "immediately, don't tell anyone")
+    risk = d.get("scam") or {}
+    r.line(f"scam score {risk.get('score')}: {risk.get('outcome')} "
+           f"(type-to-confirm: {risk.get('confirm_name')})")
+    for sig in risk.get("signals", []):
+        r.line(f"  +{sig['weight']} {sig['code']} — {sig['detail']}")
+    r.line(f"warning shown: {(risk.get('warnings') or ['(none)'])[0][:90]}...")
+    chain = client.get("/api/audit/chain").json()["entries"]
+    logged = [json.loads(e["payload"]) for e in chain if e["entry_type"] == "SCAM_ASSESSMENT"]
+    r.line(f"audit log: the phrase flags came from '{logged[-1].get('source')}'" if logged
+           else "audit log: no assessment recorded")
+    forced = _force_submit(client, d)
+    r.line(f"forced straight to the gateway: {forced.get('rejection')}")
+    cancel = client.post(f"/api/drafts/{d['draft_id']}/cancel").json()
+    r.line(f"one-tap Cancel: sent={cancel.get('sent')}; "
+           f"acct_savings unchanged: {_balance('acct_savings') == before}")
+    r.passed = (risk.get("outcome") == "HOLD_STEP_UP"
+                and any(s["code"] == "SOCIAL_ENGINEERING_LANGUAGE" for s in risk.get("signals", []))
+                and bool(logged) and logged[-1].get("source") == "rules (not the model)"
+                and forced.get("rejection") in ("HELD", "CONFIRMATION")
+                and cancel.get("sent") is False and _balance("acct_savings") == before)
+    return r
+
+
+def scenario_12_benign_control(client: TestClient) -> Result:
+    r = Result(12, "Benign control",
+               "Not an attack: an ordinary $50 to a long-standing payee.",
+               "Scam protection must not slow down ordinary payments: no warning, no "
+               "hold, no extra step — just the biometric.")
+    before = _balance("acct_savings")
+    d = _draft(client, "pay mom 50 dollars")
+    risk = d.get("scam") or {}
+    r.line(f"scam score {risk.get('score')}: {risk.get('outcome')}; warnings: "
+           f"{len(risk.get('warnings') or [])}; hold: {risk.get('hold')}")
+    out = _sign_and_execute(client, d)
+    r.line(f"signed and executed at once: accepted={out.get('accepted')}")
+    r.line(f"acct_savings: {before}c -> {_balance('acct_savings')}c")
+    r.passed = (risk.get("outcome") == "ALLOW" and not risk.get("warnings")
+                and risk.get("hold") is None and out.get("accepted") is True
+                and _balance("acct_savings") == before - 5000)
+    return r
+
+
 SCENARIOS = [
     scenario_1_happy_path, scenario_2_ambiguity, scenario_3_anomaly,
     scenario_4_injection_via_data, scenario_5_injection_via_voice,
     scenario_6_rogue_agent, scenario_7_audit_tamper,
     scenario_8_policy_bypass, scenario_9_frozen_draft_unsignable,
+    scenario_10_new_number_scam, scenario_11_coached_victim, scenario_12_benign_control,
 ]
 
 

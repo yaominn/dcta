@@ -13,6 +13,7 @@ gateway -> audit) is built in Milestones 1-8.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
@@ -55,6 +56,7 @@ from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
 from backend.drafts import Draft, DraftStore
 from backend.narrate import narrate
+from backend.policy import safety, scam
 from backend.trace import RecordingProvider, TraceStore
 from backend.display import add_summary, change_summary, cents_to_display, plan_summary
 
@@ -237,6 +239,8 @@ _gateway = Gateway(
     policy_db_path=DB_PATH,      # M5: policy is enforced at the chokepoint
     step_up=_step_up,
     drafts=_drafts,
+    recent_change_hours=settings.recent_change_hours,
+    cooling_hours=settings.credential_cooling_hours,
 )
 
 
@@ -263,6 +267,8 @@ _webauthn_gateway = Gateway(
     policy_db_path=DB_PATH,       # shared — the same limits on both paths
     step_up=_step_up,             # shared — one confirmation, either path
     drafts=_drafts,               # shared — the same drafts on both paths
+    recent_change_hours=settings.recent_change_hours,
+    cooling_hours=settings.credential_cooling_hours,
 )
 
 # In-memory registration challenges (user_id -> (challenge bytes, issued_at)).
@@ -322,6 +328,32 @@ def issue_nonce(draft_id: str = Query(...)):
         raise HTTPException(status_code=409, detail={
             "error": f"draft is {draft.status}", "draft_id": draft_id,
             "status": draft.status})
+    # Frozen, or still on a safety hold: no signing challenge yet, so the page
+    # never asks for a fingerprint that the gateway would refuse. (The gateway
+    # enforces both regardless — this is what keeps the prompt honest.)
+    if safety.kill_switch_engaged(draft.user_id) is not None:
+        _traces.event(draft_id, "nonce", issued=False, reason="payments frozen")
+        raise HTTPException(status_code=409, detail={
+            "error": "payments are frozen", "draft_id": draft_id, "frozen": True})
+    hold = safety.get_hold(draft_id)
+    if hold and hold["status"] == "CANCELLED":
+        _traces.event(draft_id, "nonce", issued=False, reason="hold cancelled")
+        raise HTTPException(status_code=409, detail={
+            "error": "this payment's hold was cancelled", "draft_id": draft_id})
+    if hold and hold["status"] == "PENDING" and time.time() < hold["release_at"]:
+        left = int(hold["release_at"] - time.time())
+        _traces.event(draft_id, "nonce", issued=False, reason="on hold", seconds_left=left)
+        raise HTTPException(status_code=409, detail={
+            "error": f"on a safety hold for {left} more seconds", "draft_id": draft_id,
+            "held": True, "seconds_left": left})
+    if draft.kind == "payment" and draft.resolved_plan is not None and draft.scam_floor:
+        fresh = _rescore(draft, draft.resolved_plan, int(time.time()))
+        if scam.rose_past_drafted(draft.scam_floor, fresh.outcome):
+            _traces.event(draft_id, "nonce", issued=False, reason="riskier than drafted",
+                          drafted=draft.scam_floor, now=fresh.outcome)
+            raise HTTPException(status_code=409, detail={
+                "error": "this payment looks riskier than when it was drafted — cancel "
+                         "it and ask again", "draft_id": draft_id, "rescored": True})
     _traces.event(draft_id, "nonce", issued=True, ttl_seconds=_nonce_store.ttl)
     return {"nonce": _nonce_store.issue(draft_id),
             "draft_id": draft_id, "ttl_seconds": _nonce_store.ttl}
@@ -780,6 +812,7 @@ def _pipeline(draft: Draft) -> dict:
     # itself whether an answered "$50 or $500?" covers the amount paid.
     report = validate(plan, resolved, draft.transcript, provider=auditor, audit=_audit,
                       answers=draft.answers)
+    draft.llm_calls = auditor.calls           # the validator's prompts, for CONSOLE_DEBUG
     draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
                         "checks": report.checks, "soft_signals": report.soft_signals,
                         "llm_check": report.llm_check}
@@ -794,8 +827,34 @@ def _pipeline(draft: Draft) -> dict:
     #     bound to THIS payload hash. The code is never in this response: the
     #     point is that it arrives somewhere the overlay cannot touch, with the
     #     transaction described from the server's copy of the plan.
+    # --- scam protection (backend/policy/scam.py): rules over the ledger and the
+    #     raw transcript — never the model. HOLD puts a server-enforced hold on
+    #     this draft; HOLD_STEP_UP also requires the phone code (below).
+    assessment = None
+    hold_release = None
+    if draft.status == "ready":
+        now = int(time.time())
+        assessment = _rescore(draft, resolved, now)
+        # Never lower than before (a clarification re-runs this): the floor.
+        scam_outcome = scam.stricter(draft.scam_floor, assessment.outcome)
+        confirm_name = assessment.confirm_name or (
+            (draft.scam or {}).get("confirm_name") if scam_outcome == scam.HOLD_STEP_UP else None)
+        draft.scam_floor = scam_outcome
+        draft.scam = {**assessment.to_dict(), "outcome": scam_outcome,
+                      "scored": assessment.outcome, "confirm_name": confirm_name}
+        _audit.append(AuditEntryType.SCAM_ASSESSMENT,
+                      {"stage": "draft", "payload_hash": p_hash, **assessment.to_audit()})
+        _traces.event(draft.draft_id, "scam", **draft.scam)
+        logging.info("scam assessment %s: %s (score %d) %s", draft.draft_id,
+                     assessment.outcome, assessment.score,
+                     [f"{x.code}+{x.weight}" for x in assessment.signals])
+        if scam.needs_hold(scam_outcome):
+            hold_release = safety.create_hold(draft.draft_id, draft.user_id,
+                                              seconds=_hold_seconds(), now=now)
+
     needs_step_up = (draft.status == "ready"
-                     and verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION)
+                     and (verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION
+                          or draft.scam_floor == scam.HOLD_STEP_UP))
     if needs_step_up:
         code = _step_up.issue(draft.draft_id, p_hash)
         _traces.event(draft.draft_id, "step_up", sent=True, channel="phone (simulated)",
@@ -823,7 +882,9 @@ def _pipeline(draft: Draft) -> dict:
                 conn.close()
             narration = narrate(plan, resolved, draft.transcript, accounts=accounts,
                                 history=policy_ctx.history, answers=draft.answers,
-                                extra_check=needs_step_up)
+                                extra_check=needs_step_up,
+                                hold_seconds=(max(0, hold_release - int(time.time()))
+                                              if hold_release is not None else None))
         except Exception:
             logging.exception("narration failed for draft %s; showing the plain card",
                               draft.draft_id)
@@ -833,6 +894,7 @@ def _pipeline(draft: Draft) -> dict:
         "draft_id": draft.draft_id,
         "transcript": draft.transcript,       # the SERVER's copy of what was said
         "narration": narration,
+        "scam": _public_scam(assessment, hold_release, draft.scam),
         "resolved_plan": resolved.model_dump(mode="json"),
         "payload_hash": p_hash,
         "policy": draft.policy,
@@ -936,7 +998,58 @@ def create_draft(req: DraftRequest):
         "user_id": req.user_id,
         "kind": draft.kind,
     })
-    return _run(draft)
+    out = _run(draft)
+    # Scam-language warning even when there is no draft to review yet ("who
+    # is the safe account?"): the words alone deserve it. Advisory only.
+    if out.get("status") != "ready" and draft.kind != "contact_add":
+        found = scam.scan_transcript(req.transcript)
+        if scam.strong_codes(found):
+            out["scam_language"] = {"codes": scam.phrase_codes(found),
+                                    "warning": scam.warning_for(found)}
+    return _with_debug(out, draft, provider.calls + getattr(draft, "llm_calls", []))
+
+
+def _hold_seconds() -> int:
+    """SCAM_HOLD_SECONDS, capped so the hold ends with time left to sign: the
+    draft, its signed expires_at and the phone code all last MAX_AUTH_WINDOW_S
+    (5 min). A longer hold needs longer-lived drafts first."""
+    return max(0, min(settings.scam_hold_seconds, MAX_AUTH_WINDOW_S - 60))
+
+
+def _rescore(draft: Draft, plan: ResolvedPlan, now: int):
+    return scam.reassess(plan, draft.user_id, db_path=DB_PATH, now=now,
+                         transcript=draft.transcript,
+                         recent_change_hours=settings.recent_change_hours,
+                         cooling_hours=settings.credential_cooling_hours,
+                         draft_id=draft.draft_id)
+
+
+def _public_scam(assessment, hold_release: int | None, stored: dict | None) -> dict | None:
+    """What the page needs from a scam assessment: the outcome (never below
+    what this draft was shown before), the fixed warnings, the hold's time
+    left, and the name to type for HOLD_STEP_UP."""
+    if assessment is None:
+        return None
+    out = {"outcome": stored["outcome"], "score": assessment.score,
+           "signals": [{"code": s.code, "weight": s.weight, "detail": s.detail}
+                       for s in assessment.signals],
+           "warnings": list(assessment.warnings),
+           "confirm_name": stored["confirm_name"], "hold": None}
+    if hold_release is not None:
+        out["hold"] = {"release_at": hold_release,
+                       "seconds_left": max(0, hold_release - int(time.time()))}
+    return out
+
+
+def _with_debug(out: dict, draft: Draft, llm_calls: list) -> dict:
+    """CONSOLE_DEBUG: the scam score and every prompt sent to the model, for the
+    page to print to the browser console. The /data page shows the same."""
+    if not settings.console_debug:
+        return out
+    out["debug"] = {"scam": getattr(draft, "scam", None),
+                    "scam_language": scam.phrase_codes(scam.scan_transcript(draft.transcript)),
+                    "llm_calls": llm_calls}
+    return out
 
 
 def _run(draft: Draft) -> dict:
@@ -1184,7 +1297,7 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
                                   "status": draft.status})
     draft.answers[answer.field] = answer.choice_id
     _traces.event(draft_id, "answer", field=answer.field, choice_id=answer.choice_id)
-    return _run(draft)
+    return _with_debug(_run(draft), draft, getattr(draft, "llm_calls", []))
 
 
 # --------------------------------------------------------------------------- decline / cancel
@@ -1198,7 +1311,8 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
 FINAL_STATUSES = frozenset({"executed", "declined", "cancelled"})
 
 
-def _close_draft(draft_id: str, outcome: str, entry: AuditEntryType) -> dict:
+def _close_draft(draft_id: str, outcome: str, entry: AuditEntryType, *,
+                 by: str | None = None) -> dict:
     prior = _executor.prior_execution(draft_id)
     if prior is not None and prior["outcome"] in CLOSED_OUTCOMES:
         # Already closed (a double tap): say so, change nothing.
@@ -1222,7 +1336,12 @@ def _close_draft(draft_id: str, outcome: str, entry: AuditEntryType) -> dict:
             "executed_at": exc.prior["executed_at"]})
     was = draft.status
     draft.status = outcome.lower()
-    _audit.append(entry, {"draft_id": draft_id, "payload_hash": p_hash, "prior_status": was})
+    label = {"by": by} if by else {}
+    _audit.append(entry, {"draft_id": draft_id, "payload_hash": p_hash, "prior_status": was,
+                          **label})
+    if safety.cancel_hold(draft_id):                 # a held payment, stopped in its hold
+        _audit.append(AuditEntryType.HOLD_CANCELLED, {"draft_id": draft_id,
+                                                      "payload_hash": p_hash, **label})
     _traces.event(draft_id, outcome.lower(), prior_status=was)
     return {"draft_id": draft_id, "status": outcome.lower(), "sent": False}
 
@@ -1237,6 +1356,114 @@ def decline_draft(draft_id: str):
 def cancel_draft(draft_id: str):
     """The user withdraws a draft that has not run. Nothing is sent, ever."""
     return _close_draft(draft_id, "CANCELLED", AuditEntryType.DRAFT_CANCELLED)
+
+
+# --------------------------------------------------------------------------- kill switch
+# One tap freezes every outgoing payment: no signature, because making things
+# safer should be easy. Unfreezing needs a code sent to the phone, so a
+# scammer steering the page cannot simply undo it.
+class KillSwitchRequest(BaseModel):
+    user_id: str = DEMO_USER_ID
+
+
+class KillSwitchRelease(BaseModel):
+    user_id: str = DEMO_USER_ID
+    code: str
+
+
+def _kill_switch_id(user_id: str) -> str:
+    return f"killswitch:{user_id}"
+
+
+@app.get("/api/killswitch", response_model=None)
+def kill_switch_state(user_id: str = Query(DEMO_USER_ID)):
+    engaged = safety.kill_switch_engaged(user_id)
+    return {"user_id": user_id, "engaged": engaged is not None, "engaged_at": engaged}
+
+
+def _cancel_open_drafts(user_id: str, by: str) -> tuple[list[str], list[str]]:
+    """Cancel every draft of this user that could still be signed, and every
+    pending hold. Returns (cancelled, already_sent): a payment that executed
+    while this ran is reported, never silently skipped."""
+    cancelled, sent = [], []
+    for draft_id in _drafts.open_ids(user_id):
+        try:
+            _close_draft(draft_id, "CANCELLED", AuditEntryType.DRAFT_CANCELLED, by=by)
+            cancelled.append(draft_id)
+        except HTTPException as exc:
+            if isinstance(exc.detail, dict) and exc.detail.get("already_executed"):
+                sent.append(draft_id)
+    # Holds whose drafts have already expired from memory.
+    for draft_id in safety.cancel_user_holds(user_id):
+        _audit.append(AuditEntryType.HOLD_CANCELLED, {"draft_id": draft_id, "by": by})
+    return cancelled, sent
+
+
+_kill_switch_lock = threading.Lock()     # in-memory stores are shared across request threads
+
+
+@app.post("/api/killswitch", response_model=None)
+def engage_kill_switch(req: KillSwitchRequest = KillSwitchRequest()):
+    """Freeze. Everything in flight stops too: every draft that could still be
+    signed is cancelled (its hold with it), and every signing challenge issued
+    to this user is revoked — so unfreezing later cannot revive an old card."""
+    with _kill_switch_lock:
+        newly = safety.engage_kill_switch(req.user_id, now=int(time.time()))
+        revoked = _nonce_store.revoke(lambda draft_id: (
+            (d := _drafts.get(draft_id)) is not None and d.user_id == req.user_id))
+        cancelled, sent = _cancel_open_drafts(req.user_id, by="kill switch")
+    _audit.append(AuditEntryType.KILL_SWITCH_ENGAGED, {
+        "user_id": req.user_id, "newly": newly, "drafts_cancelled": cancelled,
+        "already_sent": sent, "nonces_revoked": revoked})
+    return {"engaged": True, "newly": newly, "drafts_cancelled": len(cancelled),
+            "already_sent": len(sent), "nonces_revoked": revoked}
+
+
+# Unfreeze codes: at most this many per user per hour. Each code allows three
+# guesses, so someone steering the page gets 9 guesses an hour at a 6-digit
+# code, not an unlimited stream of fresh codes. A successful unfreeze clears
+# the count. (The demo has no login, so anyone who can reach the server can
+# also press Freeze for any user — a real deployment authenticates these.)
+UNFREEZE_CODES_PER_HOUR = 3
+_unfreeze_requests: dict[str, list[float]] = {}
+
+
+@app.post("/api/killswitch/release/begin", response_model=None)
+def begin_kill_switch_release(req: KillSwitchRequest = KillSwitchRequest()):
+    if safety.kill_switch_engaged(req.user_id) is None:
+        return {"engaged": False}
+    now = time.time()
+    with _kill_switch_lock:
+        recent = [t for t in _unfreeze_requests.get(req.user_id, []) if now - t < 3600]
+        if len(recent) >= UNFREEZE_CODES_PER_HOUR:
+            wait = int(3600 - (now - recent[0])) + 1
+            raise HTTPException(429, {"error": "too many unfreeze codes — try again later",
+                                      "retry_after_seconds": wait})
+        _unfreeze_requests[req.user_id] = recent + [now]
+    code = _step_up.issue(_kill_switch_id(req.user_id), "release")
+    _phone.deliver(req.user_id, f"DCTA: to unfreeze your payments, enter code {code}. "
+                                f"Valid 5 min. If you didn't ask for this, ignore it — "
+                                f"your payments stay frozen.")
+    return {"engaged": True, "code_sent": True, "channel": "your registered phone"}
+
+
+@app.post("/api/killswitch/release", response_model=None)
+def release_kill_switch(req: KillSwitchRelease):
+    try:
+        _step_up.confirm(_kill_switch_id(req.user_id), req.code)
+    except StepUpError as exc:
+        raise HTTPException(400, {"error": str(exc), "attempts_left": exc.attempts_left})
+    _step_up.consume(_kill_switch_id(req.user_id))
+    with _kill_switch_lock:
+        _unfreeze_requests.pop(req.user_id, None)
+        # Unfreezing starts clean: anything drafted WHILE frozen is cancelled
+        # too — its hold ran out during the freeze, so it would otherwise be
+        # signable at once, with no cooling-off.
+        cancelled, sent = _cancel_open_drafts(req.user_id, by="unfreeze")
+        if safety.release_kill_switch(req.user_id, now=int(time.time())):
+            _audit.append(AuditEntryType.KILL_SWITCH_RELEASED, {
+                "user_id": req.user_id, "drafts_cancelled": cancelled})
+    return {"engaged": False, "drafts_cancelled": len(cancelled)}
 
 
 class ConfirmRequest(BaseModel):

@@ -49,6 +49,8 @@
                   aria-label="Mute the assistant's voice" title="Mute the assistant's voice">
             <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 9.5h3.2L12 5.5v13l-4.8-4H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Z"/><path class="w1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.2 9.2a4 4 0 0 1 0 5.6"/><path class="w2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M17.8 6.8a7.5 7.5 0 0 1 0 10.4"/><path class="x" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.5 9.5l5 5m0-5-5 5"/></svg>
           </button>
+          <!-- The kill switch: one tap freezes every outgoing payment. -->
+          <button id="freeze" class="freeze" type="button" title="Freeze all outgoing payments">Freeze</button>
           <div class="shield" title="Every payment needs your biometric">
             <svg width="20" height="20" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M12 3l7 3v5.5c0 4.3-2.9 7.9-7 9.5-4.1-1.6-7-5.2-7-9.5V6l7-3Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8.8 12.2l2.2 2.2 4.3-4.6"/></svg>
           </div>
@@ -60,6 +62,17 @@
         <section id="balances" class="balances" aria-label="Account balances">
           <div class="bal"><span class="bal-name">Savings</span><span id="bal-savings" class="bal-amt">—</span></div>
           <div class="bal"><span class="bal-name">Spending</span><span id="bal-joint" class="bal-amt">—</span></div>
+        </section>
+
+        <!-- Shown while the kill switch is engaged: every outgoing payment is
+             refused by the server until the user unfreezes with a phone code. -->
+        <section id="frozen" class="frozen" hidden>
+          <p><strong>All outgoing payments are frozen.</strong> Nothing can be sent until you unfreeze.</p>
+          <button id="unfreeze" type="button" class="btn secondary">Unfreeze with a code</button>
+          <form id="unfreeze-form" class="stepup-form" hidden>
+            <input id="unfreeze-code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" maxlength="6" />
+            <button type="submit" class="btn primary">Unfreeze</button>
+          </form>
         </section>
 
         <!-- The drop-down notification after a payment goes through. Built with
