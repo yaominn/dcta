@@ -601,7 +601,7 @@ in a slide.
 | 2 | Two payees called "John" | Asks instead of guessing; an answer naming a non-candidate is refused and re-asked |
 | 3 | $5,000 to a usual-$50 payee | Escalates to an out-of-band code (100x the median); the gateway refuses it signed-but-unconfirmed, executes it once confirmed |
 | 4 | Poisoned `biller_07.reference_text` | Never enters a prompt; never reaches a displayed or signed field |
-| 5 | Injection in the user's own speech | No leg pays the injected account — the LLM schema has no `payee_id` to name one |
+| 5 | Injection in the user's own speech | No leg pays the injected account — the LLM schema has no `payee_id` to name one — and if the injected `123-456` perturbs the amount, the validator (which no longer reads it as money) freezes the draft |
 | 6 | Unsigned call straight to the gateway | Rejected and recorded in the hash chain |
 | 7 | One byte edited in the audit log | `verify_chain()` names the exact entry |
 | 8 | Correctly signed payload, UI skipped | A hand-assembled $20,000.01 gets no nonce (no such draft); swapped into a real draft it is refused `OUTDATED` — only the drafted, policy-cleared payment executes |

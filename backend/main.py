@@ -591,9 +591,14 @@ def validate_draft(req: ValidateRequest):
     existing provider interface; with no credentials it is recorded as
     'unavailable' and never freezes (brief §5)."""
     provider = get_provider(settings)
+    # The user's answers from the SERVER's record of the draft — never from the
+    # request, whose caller could claim any "choice". Same answers as the
+    # pipeline used, so the two validation paths agree.
+    stored = _drafts.get(req.resolved_plan.draft_id)
     report = validate(
         req.intent_plan, req.resolved_plan, req.transcript,
         provider=provider, audit=_audit,
+        answers=stored.answers if stored is not None else None,
     )
     return {
         "verdict": report.verdict,
@@ -757,7 +762,10 @@ def _pipeline(draft: Draft) -> dict:
     # --- validator (M6). A frozen draft keeps its plan for display, but
     #     /api/auth/nonce refuses a nonce, so it is unsignable.
     auditor = RecordingProvider(get_provider(settings))
-    report = validate(plan, resolved, draft.transcript, provider=auditor, audit=_audit)
+    # The PARSER's intent plus the user's own answers: the validator decides for
+    # itself whether an answered "$50 or $500?" covers the amount paid.
+    report = validate(plan, resolved, draft.transcript, provider=auditor, audit=_audit,
+                      answers=draft.answers)
     draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
                         "checks": report.checks, "soft_signals": report.soft_signals,
                         "llm_check": report.llm_check}

@@ -36,6 +36,14 @@ Each plan leg is one of:
   {"id": "t1", "type": "PAY_BILL",   "source_account": MENTION, "target": MENTION, "amount": AMOUNT}
   {"id": "t1", "type": "BUY_EQUITY", "source_account": MENTION, "ticker": MENTION, "amount": AMOUNT}
 
+Choosing the type — the VERB does not decide it, the RECIPIENT does:
+  TRANSFER   money to one of the user's PAYEES (the people in the context's
+             "payees"). "pay mom 50", "send john 20", "pay my landlord" are
+             TRANSFERs when mom / john / landlord is a payee.
+  PAY_BILL   a bill to one of the BILLERS (the companies in the context's
+             "billers"), e.g. "pay the SP Group bill", "pay my electricity".
+  BUY_EQUITY buying shares of a ticker.
+
 where
   MENTION = {"mention": "<the words the user said>"}  — e.g. {"mention": "mom"}
   AMOUNT  = {"literal_cents": <integer>}               — a stated amount, in cents

@@ -47,6 +47,10 @@ from typing import Any, Callable
 from backend.audit.canonical import hash_transcript
 from backend.data.db import connect, get_conn
 from backend.display import account_label, cents_to_display
+# The validator's reading of which numbers are money, so the resolver asks
+# about exactly what the validator will accept. Allowed by the import
+# boundary: the validator reaches data/audit/models only, never the agent.
+from backend.validator import competing_amounts
 from backend.models.schemas import (
     MAX_AUTH_WINDOW_S,
     AmountOp,
@@ -145,7 +149,7 @@ class Clarify:
     """
     question: str
     field: str
-    kind: str                       # payee | biller | account | equity | empty | zero | insufficient | equity_too_small
+    kind: str                       # payee | biller | account | equity | empty | zero | insufficient | equity_too_small | amount | restate
     choices: list[dict]
     resume_state: dict
 
@@ -227,6 +231,41 @@ def resolve(
         }
         leg_source: dict[str, str] = {}          # leg id -> resolved source acct id
         resolved_legs: list[Any] = []
+
+        # Two amounts for one payment ("50 no wait 500"): ask, never pick. The
+        # answer must be one of the amounts the user actually said — an answer
+        # narrows a choice, never widens it (as for payees).
+        competing = competing_amounts(intent_plan.plan, transcript)
+        effective_legs = []
+        for leg in intent_plan.plan:
+            if leg.id in competing and not competing[leg.id]:
+                # Several payments and more amounts than payments: which is
+                # whose can't be told from the words, and offering them would
+                # WIDEN a choice. Ask for it again instead.
+                return Clarify(
+                    question="I heard more amounts than payments — could you say it "
+                             "again, one payment at a time?",
+                    field=f"{leg.id}.amount", kind="restate", choices=[],
+                    resume_state=resume,
+                )
+            if leg.id in competing:
+                field = f"{leg.id}.amount"
+                offered = competing[leg.id]
+                chosen = answers.get(field)
+                # Membership in the offered ids, not int(): "²".isdigit() is
+                # True and int("²") raises — an odd answer must re-ask, not 500.
+                if chosen not in {str(c) for c in offered}:
+                    return Clarify(
+                        question="Did you mean " + " or ".join(
+                            "$" + cents_to_display(c) for c in offered) + "?",
+                        field=field, kind="amount",
+                        choices=[{"id": str(c), "display": "$" + cents_to_display(c)}
+                                 for c in offered],
+                        resume_state=resume,
+                    )
+                leg = leg.model_copy(update={"amount": LiteralAmount(literal_cents=int(chosen))})
+            effective_legs.append(leg)
+        intent_plan = intent_plan.model_copy(update={"plan": effective_legs})
 
         for leg in intent_plan.plan:
             result = _resolve_leg(

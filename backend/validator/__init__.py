@@ -10,8 +10,11 @@ Combines:
     never imports backend.agent (the import-boundary test could forbid it too).
 
 Any discrepancy in beneficiary or amount FREEZES the transaction (no nonce is
-ever issued for that draft_id, so it can never be signed). Source-account and
-asset-class checks are LENIENT tripwires (brief §4.3): recorded as soft signals,
+ever issued for that draft_id, so it can never be signed). So does an account
+the user NAMED ("from my spending account") that the draft does not debit, and
+an amount the user said two ways ("50 no wait 500") that they never chose
+between. Otherwise source-account and asset-class checks are LENIENT tripwires
+(brief §4.3): recorded as soft signals,
 never the sole cause of a freeze, because a false freeze on a correct plan is
 worse than a missed soft signal there — the hard checks in §4.1/§4.2 carry the
 weight.
@@ -55,6 +58,7 @@ from typing import Protocol
 from backend.audit.canonical import payload_hash, hash_transcript
 from backend.audit.log import AuditEntryType, AuditLog
 from backend.data.db import get_conn
+from backend.display import cents_to_display
 from backend.models.schemas import (
     IntentPlan,
     LiteralAmount,
@@ -183,6 +187,7 @@ def validate(
     provider: AuditingProvider | None = None,
     audit: AuditLog | None = None,
     freeze_set: FreezeSet | None = None,
+    answers: dict[str, str] | None = None,
 ) -> ValidationReport:
     """Audit a resolved draft against the raw transcript. Read-only; can freeze.
 
@@ -191,8 +196,15 @@ def validate(
     three matter: the IntentPlan carries the literal-vs-symbolic distinction
     that decides which amount check runs (brief §4.1).
 
-    Hard checks (freeze on mismatch): beneficiary (§4.2), amount (§4.1).
-    Soft checks (record only): source_account (§4.3), asset_class (§4.3).
+    Hard checks (freeze on mismatch): beneficiary (§4.2), amount (§4.1) —
+    including competing amounts the user did not choose between — and
+    source_account WHEN the user named an account.
+    Soft checks (record only): source_account when no account was named
+    (§4.3), asset_class (§4.3).
+
+    `answers` are the user's clarification answers (draft.answers). The
+    validator reads them ITSELF — it is handed the parser's original intent,
+    never the resolver's rewrite — to accept an amount the user chose.
     LLM half: SOFT — a provider disagreement is recorded, never the sole cause
     of a freeze; a provider outage never freezes (brief §5).
     """
@@ -233,20 +245,34 @@ def validate(
             })
         else:
             recomputed = amounts.recompute_symbolic(intent_plan, resolved_plan, conn)
-            leg_clauses = _match_clauses(intent_plan.plan, transcript)
+            matched = _match_clause_ids(intent_plan.plan, transcript)
+            leg_clauses = [transcript if k < 0 else matched[0][k] for k in matched[1]]
+            competing = competing_amounts(intent_plan.plan, transcript, matched)
             resolved_by_id = {leg.id: leg for leg in resolved_plan.plan}
+            single_leg = len(intent_plan.plan) == 1
             for i, ileg in enumerate(intent_plan.plan):
                 rleg = resolved_by_id[ileg.id]
                 clause = leg_clauses[i]
 
                 # --- hard: amount (§4.1) ---
-                checks.append(_check_amount(ileg, rleg, clause, recomputed, conn))
+                if ileg.id in competing:
+                    checks.append(_check_competing(ileg, rleg, transcript, competing[ileg.id],
+                                                   answers or {}, recomputed, conn))
+                else:
+                    checks.append(_check_amount(ileg, rleg, clause, recomputed, conn))
 
                 # --- hard: beneficiary (§4.2) ---
                 checks.append(_check_beneficiary(rleg, transcript, conn))
 
                 # --- soft: source account (§4.3) ---
-                soft.append(_check_source_account(rleg, transcript, conn))
+                # HARD when the user named an account and this is another;
+                # soft (as before) when they named none.
+                # One payment: an account named anywhere is its account ("pay
+                # mom 50 then take it from my spending account" — the second
+                # clause names no recipient or amount and is otherwise dropped).
+                source = _check_source_account(rleg, transcript if single_leg else clause,
+                                               transcript, conn)
+                (checks if source["outcome"] == "fail" else soft).append(source)
 
                 # --- soft: asset class (§4.3) ---
                 soft.append(_check_asset_class(rleg, transcript))
@@ -335,6 +361,31 @@ def _check_amount(ileg, rleg, clause: str, recomputed: dict[str, int], conn) -> 
     return _pass(name, ileg.id, f"literal {lit}c derivable + consistent")
 
 
+def _check_competing(ileg, rleg, transcript: str, offered: list[int], answers: dict,
+                     recomputed: dict[str, int], conn) -> dict:
+    """The user said more than one amount for this payment. It passes only if
+    THEY chose one — their recorded answer is among the amounts they said —
+    and the draft pays exactly that. The validator reads the answer itself;
+    the parser's pick is never enough."""
+    if not offered:
+        return _fail("amount", ileg.id,
+                     "more amounts than payments were said, and which belongs to which "
+                     "payment cannot be told from the words")
+    said = " and ".join("$" + cents_to_display(c) for c in offered)
+    chosen = answers.get(f"{ileg.id}.amount")
+    if chosen not in {str(c) for c in offered}:
+        return _fail("amount", ileg.id,
+                     f"you said {said} and no choice between them was confirmed")
+    confirmed = ileg.model_copy(update={"amount": LiteralAmount(literal_cents=int(chosen))})
+    # The chosen figure is one the user SAID for this payment (it is among
+    # `offered`), possibly in a follow-up clause — so it is checked against the
+    # whole transcript, and the draft must pay exactly it.
+    out = _check_amount(confirmed, rleg, transcript, recomputed, conn)
+    if out["outcome"] == "pass":
+        out["detail"] = f"you said {said} and chose ${cents_to_display(int(chosen))}; " + out["detail"]
+    return out
+
+
 # --------------------------------------------------------------------------- beneficiary (hard, §4.2)
 def _check_beneficiary(rleg, transcript: str, conn) -> dict:
     """The resolved id maps to a nickname/name/ticker in OUR DB. That label (or a
@@ -384,9 +435,43 @@ _ACCOUNT_WORDS = {
 }
 
 
-def _check_source_account(rleg, transcript: str, conn) -> dict:
-    """The resolved source_account's TYPE must be mentioned. Lenient tripwire
-    for gross divergence (the model inventing a leg), not a grammar test."""
+# An account is NAMED AS THE SOURCE only in unmistakable source phrasing —
+# "from my spending", "out of savings", "from the savings account", "use my
+# savings account". Not "to help with savings", not "from the investment club",
+# and a bare "<word> account" is NOT enough for a hard check:
+# "he has a savings account" and "into her savings account" say nothing
+# about where the money comes from, and freezing a correct payment over them
+# is worse than the soft signal they still produce.
+_NAMED_ACCOUNT = re.compile(
+    # "from (my|our) savings" ending the phrase: "from savings to mom", "from my
+    # spending account", "out of savings, please"
+    r"\b(?:from|out of)\s+(?:(?:my|our)\s+)?([a-z]+)"
+    r"(?=\s+account\b|\s+(?:to|and|then|for|please)\b|\s*[,.!?]|\s*$)"
+    # "from the savings account" — with "the", only when "account" says so
+    # ("from the investment club" is not an account)
+    r"|\b(?:from|out of)\s+the\s+([a-z]+)\s+account\b"
+    # "use / using / with my savings account"
+    r"|\b(?:use|using|with)\s+(?:my|our)\s+([a-z]+)\s+account\b", re.I)
+
+
+def _named_account_types(text: str) -> dict[str, str]:
+    """{account type: the word the user used} for every account named AS THE
+    SOURCE in text (see _NAMED_ACCOUNT)."""
+    word_to_type = {w: t for t, words in _ACCOUNT_WORDS.items() for w in words}
+    named: dict[str, str] = {}
+    for m in _NAMED_ACCOUNT.finditer(text):
+        word = (m.group(1) or m.group(2) or m.group(3)).lower()
+        if word in word_to_type:
+            named.setdefault(word_to_type[word], word)
+    return named
+
+
+def _check_source_account(rleg, clause: str, transcript: str, conn) -> dict:
+    """If the user NAMED an account for this leg, the draft must debit THAT one
+    — a HARD check. Before, "from my spending account" debiting savings passed
+    with a soft warning nobody saw. If they named none, the default account is
+    legitimate and this stays the old soft tripwire (the type mentioned
+    anywhere) for gross divergence."""
     name = "source_account"
     row = conn.execute(
         "SELECT type FROM accounts WHERE id=?", (rleg.source_account,)
@@ -395,6 +480,21 @@ def _check_source_account(rleg, transcript: str, conn) -> dict:
         return {"check": name, "leg": rleg.id,
                 "outcome": "warn", "detail": "unknown source account"}
     acct_type = row["type"]
+
+    named = _named_account_types(clause)
+    if len(named) == 1:
+        (said_type, said_word), = named.items()
+        if said_type == acct_type:
+            return {"check": name, "leg": rleg.id, "outcome": "pass",
+                    "detail": f"you said {said_word!r}, and it debits {acct_type!r}"}
+        return _fail(name, rleg.id,
+                     f"you said {said_word!r} ({said_type}), but the draft debits "
+                     f"{acct_type!r}")
+    if len(named) > 1:
+        return {"check": name, "leg": rleg.id, "outcome": "warn",
+                "detail": f"several accounts named ({', '.join(sorted(named.values()))}) "
+                          f"— cannot tell which this leg meant (soft)"}
+
     said = next((w for w in _ACCOUNT_WORDS.get(acct_type, (acct_type,))
                  if _word_in(w, transcript)), None)
     if said:
@@ -494,6 +594,54 @@ def _clauses(transcript: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def competing_amounts(legs, transcript: str, matched=None) -> dict[str, list[int]]:
+    """Literal legs for which the user said MORE amounts than payments —
+    "pay mom 50 no wait 500" — mapped to the amounts to choose from.
+
+    For the resolver to ASK "$50 or $500?", and for the validator to refuse a
+    literal the user never chose: before this, both readings passed and the
+    parser's pick went through silently. Only amounts that READ as money count
+    (amounts.money_occurrences): "for 2 tickets" is a quantity, not a rival.
+
+    Two gates, so ordinary requests never get a pointless question:
+      1. the whole transcript must hold more money amounts (occurrences — "20
+         and 20, wait, 30" is three) than literal legs ("mom 50 and john 20
+         then landlord 100": 3 and 3 — none);
+      2. then, per clause, more amounts than legs paying from it.
+
+    NEVER WIDENS. One leg in the clause: the choices are the amounts said in
+    it. Several legs sharing the clause, or a leg with no clause of its own:
+    which amount belongs to whom is not knowable from the words, so the list
+    is EMPTY — the user is asked to say it again, never offered an amount that
+    was someone else's."""
+    literal = [(i, leg) for i, leg in enumerate(legs) if isinstance(leg.amount, LiteralAmount)]
+    if not literal or len(amounts.money_occurrences(transcript)) <= len(literal):
+        return {}
+    clauses, ids = matched or _match_clause_ids(legs, transcript)
+    groups: dict[int, list] = {}
+    for i, leg in literal:
+        groups.setdefault(ids[i], []).append(leg)
+    # A clause with an amount but no recipient ("pay mom 50 THEN ACTUALLY MAKE
+    # IT 500") is a follow-up about the payment before it: its amounts join
+    # that clause's (or, with none before, the first one after).
+    said_in: dict[int, list[int]] = {k: amounts.money_occurrences(c) for k, c in enumerate(clauses)}
+    owned = sorted(k for k in set(ids) if k >= 0)
+    for k in range(len(clauses)):
+        if k not in owned and said_in[k] and owned:
+            host = max((o for o in owned if o < k), default=owned[0])
+            said_in[host] = said_in[host] + said_in[k]
+    out: dict[str, list[int]] = {}
+    for idx, group in groups.items():
+        said = amounts.money_occurrences(transcript) if idx < 0 else said_in[idx]
+        # More figures than payments AND at least two DIFFERENT ones: "50
+        # dollars, yes 50" repeats a figure and is not a choice to make.
+        if len(said) > len(group) and len(set(said)) > 1:
+            offered = sorted(set(said)) if (idx >= 0 and len(group) == 1) else []
+            for leg in group:
+                out[leg.id] = offered
+    return out
+
+
 def _leg_mention(ileg) -> str:
     """The user's own words for this leg's recipient/ticker ("mom", "apple")."""
     target = getattr(ileg, "target", None) or getattr(ileg, "ticker", None)
@@ -505,8 +653,9 @@ def _mentions(clause: str, mention: str) -> bool:
                                        clause, re.I) is not None
 
 
-def _match_clauses(legs, transcript: str) -> list[str]:
-    """One clause per leg, for the clause-localized literal check.
+def _match_clause_ids(legs, transcript: str) -> tuple[list[str], list[int]]:
+    """(clauses, index of each leg's clause — -1 for the whole transcript), for
+    the clause-localized literal check.
 
     Clauses used to pair with legs by POSITION, so "okay then 2 bucks to
     jonny" paired its one leg with the clause "okay" and froze a correct plan.
@@ -527,16 +676,21 @@ def _match_clauses(legs, transcript: str) -> list[str]:
     clauses = [c for c in clauses
                if amounts.extract_literal_cents(c) or any(_mentions(c, m) for m in mentions)]
 
-    chosen: list[str | None] = [None] * len(legs)
+    chosen: list[int | None] = [None] * len(legs)
     taken: set[int] = set()
     for i, mention in enumerate(mentions):
         hits = [k for k, c in enumerate(clauses) if _mentions(c, mention)]
-        if len(hits) == 1 and hits[0] not in taken:
-            chosen[i] = clauses[hits[0]]
+        if len(hits) == 1:
+            # Two legs may SHARE a clause that names them both ("pay mom 50
+            # and john 20"): each gets that clause. KNOWN LIMIT, not new: within
+            # one clause the amount check cannot tell which amount is whose, so
+            # mom=$20 / john=$50 still passes it — as it did when john fell back
+            # to the whole transcript. Splitting on "then" keeps them apart.
+            chosen[i] = hits[0]
             taken.add(hits[0])
 
-    remaining = iter([c for k, c in enumerate(clauses) if k not in taken])
+    remaining = iter([k for k in range(len(clauses)) if k not in taken])
     for i in range(len(legs)):
         if chosen[i] is None:
-            chosen[i] = next(remaining, transcript)
-    return chosen
+            chosen[i] = next(remaining, -1)
+    return clauses, chosen
