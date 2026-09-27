@@ -90,11 +90,14 @@ def _source_evidence(ileg, text: str, account_type: str | None) -> dict:
 def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
             accounts: dict[str, dict], history: list[dict],
             answers: dict[str, str] | None = None,
-            extra_check: bool = False, hold_seconds: int | None = None) -> dict:
+            extra_check: bool = False, hold_seconds: int | None = None,
+            new_destination_legs: frozenset[str] = frozenset()) -> dict:
     """The assistant's reply and per-leg evidence for a READY payment draft.
 
     accounts: account id -> {"type", "balance"} BEFORE this plan (the ledger).
     history:  the user's past payments ({payee_id, amount}), for "usual".
+    new_destination_legs: legs the scam rules found are a first payment to this
+              destination (a payee paid before, at a NEW number).
     """
     answers = answers or {}
     matched = match_legs(intent.plan, transcript)
@@ -173,6 +176,13 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
         if usual is None:
             notes.append(f"It's your first payment to {who}.")
             check_reason = check_reason or f"it's your first payment to {who}"
+        elif rleg.id in new_destination_legs:
+            # Paid before, but never at this number. "In line with what you
+            # usually send" would vouch for the very payment the scam warning
+            # is about — the new-number scam.
+            notes.append(f"It's your first payment to {who} at this number.")
+            if rleg.amount_cents >= usual * ANOMALY_MULTIPLE:
+                check_reason = check_reason or f"that's far more than you usually send {who}"
         elif usual <= 0:
             pass                                   # no meaningful comparison
         elif rleg.amount_cents >= usual * ANOMALY_MULTIPLE:

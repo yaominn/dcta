@@ -38,7 +38,7 @@ from backend.data import destinations
 from backend.data.db import connect
 from backend.data.seed import seed
 from backend.models.contacts import ResolvedContactChange
-from backend.models.schemas import ResolvedPlan, ResolvedTransfer
+from backend.models.schemas import ResolvedBuyEquity, ResolvedPlan, ResolvedTransfer
 from backend.policy import scam
 from support import dest
 
@@ -150,6 +150,48 @@ def test_unusual_hour_only_for_a_first_payment_at_night():
 def test_each_signal_counts_once_across_legs():
     a = scam.assess(_plan(_mom(1000, leg_id="t1"), _mom(1000, leg_id="t2")), _ctx(history=[]))
     assert a.score == 2
+
+
+def test_a_hold_always_says_why():
+    """First payment + large first payment hold it; neither has a sentence of
+    its own, so the card must not show a countdown with nothing explaining it."""
+    a = scam.assess(_plan(_mom(300000)), _ctx(history=[]))
+    assert (a.outcome, _codes(a)) == ("HOLD", {"FIRST_PAYMENT_TO_DESTINATION", "LARGE_FIRST_PAYMENT"})
+    assert a.warnings and "first payment" in a.warnings[0] and "large" in a.warnings[0]
+
+
+LANDLORD = destinations.Destination("payee_30", 1, "PAYNOW_MOBILE", "+65 6123 ••01",
+                                    dest("payee_30")["destination_hash"], None)
+
+
+def _landlord(cents, leg_id="t2"):
+    return ResolvedTransfer(id=leg_id, type="TRANSFER", source_account="acct_savings",
+                            payee_id="payee_30", payee_display="Landlord ··7001",
+                            amount_cents=cents, destination_version=1,
+                            destination_masked="+65 6123 ••01", destination_hash="h")
+
+
+def test_the_name_to_type_is_the_risky_payee_not_the_first():
+    a = scam.assess(_plan(_mom(5000, leg_id="t1"), _landlord(500000)),
+                    _ctx(extra_dests={"payee_30": LANDLORD},
+                         transcript="the police officer said to pay mom 50 and landlord 5000"))
+    assert a.outcome == "HOLD_STEP_UP" and a.confirm_name == "Landlord"
+
+
+def test_buying_shares_with_the_rest_is_not_a_drain():
+    """The README's headline: money moved to the user's own shares is not a
+    scam pattern; only transfers to other people count."""
+    shares = ResolvedBuyEquity(id="t2", type="BUY_EQUITY", source_account="acct_savings",
+                               ticker="AAPL", amount_cents=772800, estimated_shares=32,
+                               estimated_fill_price_cents=24150)
+    a = scam.assess(_plan(_mom(50000), shares), _ctx(balances={"acct_savings": 842050}))
+    assert "BALANCE_DRAIN" not in _codes(a) and a.outcome == "ALLOW"
+
+
+def test_a_drain_split_across_transfers_still_counts_once():
+    a = scam.assess(_plan(_mom(400000, leg_id="t1"), _landlord(400000)),
+                    _ctx(extra_dests={"payee_30": LANDLORD}, balances={"acct_savings": 842050}))
+    assert [s.code for s in a.signals].count("BALANCE_DRAIN") == 1
 
 
 @pytest.mark.parametrize("score,outcome", [(0, "ALLOW"), (1, "ALLOW"), (2, "WARN"), (3, "WARN"),
@@ -336,6 +378,8 @@ def test_a_draft_for_the_old_number_is_superseded(client):
     d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     _change_moms_number(client)
     before = _balance()
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and nonce.json()["detail"]["rejection"] == "SUPERSEDED"
     out = _execute(client, d)
     assert out["rejection"] == "SUPERSEDED" and _balance() == before
 
@@ -347,6 +391,23 @@ def test_superseded_names_no_one(client):
     out = _execute(client, d)
     assert out["rejection"] == "SUPERSEDED"
     assert not re.search(r"mom|9123|8123|4567", out["reason"], re.I), out["reason"]
+
+
+def test_the_new_number_is_what_the_card_and_the_phone_name(client):
+    """Not the old, trusted "Mom ··3310" next to a changed number."""
+    from backend.main import _phone
+    _change_moms_number(client)
+    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    assert d["resolved_plan"]["plan"][0]["payee_display"] == "Mom ··4567"
+    sms = _phone.messages("u_alice")[0]["text"]
+    assert "··4567" in sms and "3310" not in sms
+
+
+def test_the_reply_does_not_vouch_for_a_new_number(client):
+    """$500 is Mom's usual amount — but never to this number."""
+    _change_moms_number(client)
+    reply = client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()["narration"]["reply"]
+    assert "first payment to Mom at this number" in reply and "in line with" not in reply
 
 
 def test_the_new_number_scam_end_to_end(client):
@@ -479,10 +540,38 @@ def test_a_clarification_does_not_lower_the_safeguards(client):
     assert d2["status"] == "ready" and d2["scam"]["score"] < 7
     assert d2["scam"]["outcome"] == "HOLD_STEP_UP" and d2["scam"]["confirm_name"] == "Mom"
     assert d2["requires_extra_confirmation"] is True
+    assert any("riskier earlier" in w for w in d2["scam"]["warnings"])
     _release_hold_now(d["draft_id"])
     assert _execute(client, d2)["rejection"] == "CONFIRMATION"
     client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
     assert _execute(client, d2)["accepted"] is True
+
+
+def test_a_different_payee_on_the_same_draft_waits_again(client):
+    """The hold covers the payment it was shown for: answering the question
+    again with another payee, after the hold ran out, starts a new wait."""
+    d = client.post("/api/drafts", json={"transcript": "pay john 1000"}).json()
+    held = client.post(f"/api/drafts/{d['draft_id']}/clarify",
+                       json={"field": d["field"], "choice_id": "payee_22"}).json()
+    assert held["scam"]["outcome"] == "HOLD"
+    _release_hold_now(d["draft_id"])
+    other = client.post(f"/api/drafts/{d['draft_id']}/clarify",
+                        json={"field": d["field"], "choice_id": "payee_21"}).json()
+    assert other["resolved_plan"]["plan"][0]["payee_id"] == "payee_21"
+    assert other["scam"]["hold"]["seconds_left"] > 0
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and nonce.json()["detail"]["held"] is True
+    assert _execute(client, other)["rejection"] == "HELD"
+
+
+def test_the_same_payload_keeps_its_release_time(client):
+    from backend.policy import safety
+    now = int(time.time())
+    first = safety.create_hold("d-same", "u_alice", seconds=30, now=now, payload_hash="p1")
+    assert safety.create_hold("d-same", "u_alice", seconds=30, now=now + 20,
+                              payload_hash="p1") == first
+    assert safety.create_hold("d-same", "u_alice", seconds=30, now=now + 20,
+                              payload_hash="p2") == now + 50
 
 
 def test_the_hold_is_capped_so_it_can_still_be_signed(client, monkeypatch):

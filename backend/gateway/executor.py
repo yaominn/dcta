@@ -178,9 +178,13 @@ class MockExecutor:
                     # A new number is a new DESTINATION: bump its version and
                     # record when, in the same savepoint. A transfer drafted for
                     # the old number is now SUPERSEDED, and the scam rules see a
-                    # recent change (backend/data/destinations.py).
+                    # recent change (backend/data/destinations.py). last4 is the
+                    # number's last digits: the card and the phone code name the
+                    # payee "Mom ··4567" now, not the old, trusted "··3310".
                     conn.execute("UPDATE payees SET dest_version = dest_version + 1, "
-                                 "dest_changed_at = ? WHERE id = ?", (int(time.time()), e.payee_id))
+                                 "dest_changed_at = ?, last4 = ? WHERE id = ?",
+                                 (int(time.time()), re.sub(r"\D", "", e.new_value)[-4:],
+                                  e.payee_id))
                 results.append({"payee_display": e.payee_display, "field": e.field,
                                 "old_value": e.old_value, "new_value": e.new_value,
                                 "status": "UPDATED"})

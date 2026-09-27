@@ -12,7 +12,8 @@ pattern and slowing them down. So, before a draft can be signed:
                                     VERSION (a new number is a new destination)
     RECENT_DESTINATION_CHANGE       destination changed/added < 24 h ago         3
     LARGE_FIRST_PAYMENT             first payment AND >= $1,000                  3
-    BALANCE_DRAIN                   >= 80% of the source account's balance       3
+    BALANCE_DRAIN                   transfers >= 80% of the source account's     3
+                                    balance (before this request)
     RAPID_MULTI_DESTINATION         >= 3 new destinations paid within 30 min     4
     RECENT_CREDENTIAL_CHANGE        a passkey added < 12 h ago (not the first)   4
     SOCIAL_ENGINEERING_LANGUAGE     scam wording in the user's own request       2
@@ -190,6 +191,7 @@ class ScamAssessment:
     outcome: str
     warnings: tuple[str, ...]
     phrase_codes: list = field(default_factory=list)   # phrase-rule codes, incl. advisory
+    riskiest_payee: str | None = None                  # the transfer the risk points at
     confirm_name: str | None = None                    # HOLD_STEP_UP: the name to type
 
     def to_dict(self) -> dict:
@@ -252,7 +254,7 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
     """Score a resolved plan. Pure: every input is in `plan` and `ctx`."""
     signals: list[Signal] = []
     warnings: list[str] = []
-    balances = dict(ctx.balances)
+    sent_out: dict[str, int] = {}      # account -> transferred to other people by this plan
 
     def paid_before(payee_id: str, version: int, before: int | None = None) -> bool:
         return any(h.get("payee_id") == payee_id and (h.get("dest_version") or 1) == version
@@ -260,21 +262,25 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
                    for h in ctx.history if (h.get("leg_type") or "TRANSFER") == "TRANSFER")
 
     new_here: set[tuple[str, int]] = set()
-    confirm_name = None
+    names: dict[str, str] = {}         # transfer leg id -> the payee's name
     for leg in plan.plan:
-        balance = balances.get(leg.source_account, 0)
-        if balance > 0 and leg.amount_cents * 100 >= balance * DRAIN_PERCENT:
+        # Only money sent to other people drains an account the way a scam
+        # does: "buy AAPL with the rest" moves the user's money to the user.
+        if leg.type != "TRANSFER":
+            continue
+        balance = ctx.balances.get(leg.source_account, 0)      # before this plan
+        before = sent_out.get(leg.source_account, 0)
+        sent_out[leg.source_account] = before + leg.amount_cents
+        if balance > 0 and before * 100 < balance * DRAIN_PERCENT <= sent_out[leg.source_account] * 100:
             signals.append(Signal("BALANCE_DRAIN", WEIGHTS["BALANCE_DRAIN"],
-                                  f"${cents_to_display(leg.amount_cents)} is "
-                                  f"{leg.amount_cents * 100 // balance}% of your "
+                                  f"${cents_to_display(sent_out[leg.source_account])} is "
+                                  f"{sent_out[leg.source_account] * 100 // balance}% of your "
                                   f"{account_label(leg.source_account)} balance", leg.id))
             warnings.append(f"This would take most of your {account_label(leg.source_account)} "
                             f"balance. Scammers often push people to move everything at once.")
-        balances[leg.source_account] = balance - leg.amount_cents
-        if leg.type != "TRANSFER":
-            continue
 
         who = _name(leg.payee_display)
+        names[leg.id] = who
         dest = ctx.destinations.get(leg.payee_id)
         version = leg.destination_version or (dest.version if dest else 1)
         first = not paid_before(leg.payee_id, version) and (leg.payee_id, version) not in new_here
@@ -304,7 +310,6 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
                 f"{who}'s PayNow number was changed {ago}. Scammers often pretend to be "
                 f"friends or family with a “new number”. Call {who} on a number you "
                 f"already know before continuing."))
-        confirm_name = confirm_name or who
 
     # Rapid fan-out: new destinations paid within the window, plus this plan's.
     window_start = ctx.now - RAPID_WINDOW_S
@@ -340,14 +345,25 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
         by_code[sig.code] = max(by_code.get(sig.code, 0), sig.weight)
     score = sum(by_code.values())
     outcome = outcome_for(score)
-    if outcome == WARN and not warnings and new_here:
-        warnings.append("This is your first payment to this destination. Check the number "
-                        "below is the one you expect.")
+    if outcome != ALLOW and not warnings and new_here:
+        # Every signal without a sentence of its own needs a first payment, so
+        # a hold is never shown without a reason.
+        large = any(s.code == "LARGE_FIRST_PAYMENT" for s in signals)
+        warnings.append(f"This is your first payment to this destination"
+                        f"{', and a large one' if large else ''}. Check the number below is "
+                        f"the one you expect.")
+    # HOLD_STEP_UP: type the name of the payee the risk points at, not simply
+    # the first one in the plan (plan order breaks a tie).
+    leg_risk: dict[str, int] = {}
+    for sig in signals:
+        if sig.leg in names:
+            leg_risk[sig.leg] = leg_risk.get(sig.leg, 0) + sig.weight
+    riskiest = names[max(names, key=lambda k: leg_risk.get(k, 0))] if names else None
     return ScamAssessment(
         draft_id=draft_id or plan.draft_id, signals=tuple(signals), score=score,
         outcome=outcome, warnings=tuple(dict.fromkeys(warnings)) if outcome != ALLOW else (),
         phrase_codes=phrase_codes(found),
-        confirm_name=confirm_name if outcome == HOLD_STEP_UP else None)
+        riskiest_payee=riskiest, confirm_name=riskiest if outcome == HOLD_STEP_UP else None)
 
 
 def reassess(plan, user_id: str, *, db_path=None, now: int, transcript: str = "",

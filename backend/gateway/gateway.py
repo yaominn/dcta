@@ -55,6 +55,30 @@ _FROZEN_CONTACTS = ("your payments are frozen, so contacts can't be added or cha
                     "nothing was saved. Unfreeze them with a code on your phone first")
 
 
+def destination_refusal(plan: ResolvedPlan, db_path) -> tuple[str, str] | None:
+    """(rejection, reason) for a transfer that must not run, else None. A
+    transfer signs WHERE its money goes: unbound, or no longer the payee's
+    current destination (a new number since the draft), and it does not run.
+    The signing-challenge endpoint asks the same question, so the page never
+    asks for a fingerprint this would refuse."""
+    conn = connect(db_path)
+    try:
+        for leg in plan.plan:
+            if leg.type != "TRANSFER":
+                continue
+            if leg.destination_version is None or leg.destination_hash is None:
+                return ("DESTINATION", "this transfer is not bound to a destination — "
+                                       "nothing was sent")
+            cur = destinations.current(conn, leg.payee_id)
+            if (cur is None or cur.version != leg.destination_version
+                    or cur.routing_hash != leg.destination_hash):
+                return ("SUPERSEDED", "the payee's payment details changed after this "
+                                      "was drafted — nothing was sent")
+    finally:
+        conn.close()
+    return None
+
+
 class Gateway:
     def __init__(
         self,
@@ -366,24 +390,9 @@ class Gateway:
             return ("KILL_SWITCH", "your payments are frozen — nothing was sent. Unfreeze "
                                    "them with a code on your phone first")
 
-        # The destination: a transfer signs WHERE its money goes. Unbound, or no
-        # longer the payee's current destination (a new number since the draft),
-        # and it does not run.
-        conn = connect(db)
-        try:
-            for leg in plan.plan:
-                if leg.type != "TRANSFER":
-                    continue
-                if leg.destination_version is None or leg.destination_hash is None:
-                    return ("DESTINATION", "this transfer is not bound to a destination — "
-                                           "nothing was sent")
-                cur = destinations.current(conn, leg.payee_id)
-                if (cur is None or cur.version != leg.destination_version
-                        or cur.routing_hash != leg.destination_hash):
-                    return ("SUPERSEDED", "the payee's payment details changed after this "
-                                          "was drafted — nothing was sent")
-        finally:
-            conn.close()
+        refused = destination_refusal(plan, db)
+        if refused is not None:
+            return refused
 
         # The scam score, re-run like policy. The draft's own outcome still
         # binds (a lower score now does not lift the hold the user was shown),

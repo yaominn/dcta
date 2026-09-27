@@ -26,7 +26,7 @@ from backend.data.db import DB_PATH, get_conn, migrate
 from backend.audit import AuditLog
 from backend.audit.log import AuditEntryType
 from backend.audit.canonical import payload_hash, challenge_hash, hash_transcript
-from backend.gateway.gateway import CLOSED_OUTCOMES
+from backend.gateway.gateway import CLOSED_OUTCOMES, destination_refusal
 from backend.gateway.executor import AlreadyExecuted
 from backend.gateway import (Gateway, NonceStore, MockSigner, MockExecutor, WebAuthnVerifier,
                              SimulatedPhone, StepUpError, StepUpStore)
@@ -346,6 +346,13 @@ def issue_nonce(draft_id: str = Query(...)):
         raise HTTPException(status_code=409, detail={
             "error": f"on a safety hold for {left} more seconds", "draft_id": draft_id,
             "held": True, "seconds_left": left})
+    if draft.kind == "payment" and draft.resolved_plan is not None:
+        stale = destination_refusal(draft.resolved_plan, DB_PATH)
+        if stale is not None:                  # a new number since this was drafted
+            _traces.event(draft_id, "nonce", issued=False, reason=stale[0])
+            raise HTTPException(status_code=409, detail={
+                "error": _STALE_DESTINATION[stale[0]], "draft_id": draft_id,
+                "rejection": stale[0]})
     if draft.kind == "payment" and draft.resolved_plan is not None and draft.scam_floor:
         fresh = _rescore(draft, draft.resolved_plan, int(time.time()))
         if scam.rose_past_drafted(draft.scam_floor, fresh.outcome):
@@ -837,11 +844,16 @@ def _pipeline(draft: Draft) -> dict:
         assessment = _rescore(draft, resolved, now)
         # Never lower than before (a clarification re-runs this): the floor.
         scam_outcome = scam.stricter(draft.scam_floor, assessment.outcome)
-        confirm_name = assessment.confirm_name or (
-            (draft.scam or {}).get("confirm_name") if scam_outcome == scam.HOLD_STEP_UP else None)
+        warnings = list(assessment.warnings)
+        if scam_outcome != assessment.outcome:
+            # The floor, not today's score, sets the safeguards: say so, or
+            # the card shows a hold with nothing explaining it.
+            warnings.append(_FLOOR_WARNING)
         draft.scam_floor = scam_outcome
         draft.scam = {**assessment.to_dict(), "outcome": scam_outcome,
-                      "scored": assessment.outcome, "confirm_name": confirm_name}
+                      "scored": assessment.outcome, "warnings": warnings,
+                      "confirm_name": (assessment.riskiest_payee
+                                       if scam_outcome == scam.HOLD_STEP_UP else None)}
         _audit.append(AuditEntryType.SCAM_ASSESSMENT,
                       {"stage": "draft", "payload_hash": p_hash, **assessment.to_audit()})
         _traces.event(draft.draft_id, "scam", **draft.scam)
@@ -850,7 +862,8 @@ def _pipeline(draft: Draft) -> dict:
                      [f"{x.code}+{x.weight}" for x in assessment.signals])
         if scam.needs_hold(scam_outcome):
             hold_release = safety.create_hold(draft.draft_id, draft.user_id,
-                                              seconds=_hold_seconds(), now=now)
+                                              seconds=_hold_seconds(), now=now,
+                                              payload_hash=p_hash)
 
     needs_step_up = (draft.status == "ready"
                      and (verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION
@@ -884,7 +897,10 @@ def _pipeline(draft: Draft) -> dict:
                                 history=policy_ctx.history, answers=draft.answers,
                                 extra_check=needs_step_up,
                                 hold_seconds=(max(0, hold_release - int(time.time()))
-                                              if hold_release is not None else None))
+                                              if hold_release is not None else None),
+                                new_destination_legs=frozenset(
+                                    s.leg for s in assessment.signals
+                                    if s.code == "FIRST_PAYMENT_TO_DESTINATION"))
         except Exception:
             logging.exception("narration failed for draft %s; showing the plain card",
                               draft.draft_id)
@@ -1009,6 +1025,16 @@ def create_draft(req: DraftRequest):
     return _with_debug(out, draft, provider.calls + getattr(draft, "llm_calls", []))
 
 
+# The page adds "Nothing was sent." to a refused signing challenge itself.
+_STALE_DESTINATION = {
+    "SUPERSEDED": "the payee's payment details changed after this was drafted — ask again",
+    "DESTINATION": "this transfer is not bound to a destination",
+}
+
+_FLOOR_WARNING = ("This payment looked riskier earlier in this request, so the extra "
+                  "checks you were shown still apply.")
+
+
 def _hold_seconds() -> int:
     """SCAM_HOLD_SECONDS, capped so the hold ends with time left to sign: the
     draft, its signed expires_at and the phone code all last MAX_AUTH_WINDOW_S
@@ -1033,7 +1059,7 @@ def _public_scam(assessment, hold_release: int | None, stored: dict | None) -> d
     out = {"outcome": stored["outcome"], "score": assessment.score,
            "signals": [{"code": s.code, "weight": s.weight, "detail": s.detail}
                        for s in assessment.signals],
-           "warnings": list(assessment.warnings),
+           "warnings": stored["warnings"],
            "confirm_name": stored["confirm_name"], "hold": None}
     if hold_release is not None:
         out["hold"] = {"release_at": hold_release,

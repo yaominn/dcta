@@ -207,7 +207,10 @@ destination (its PayNow mobile, in the demo) is versioned: a new number bumps
 the version and records when. A transfer **signs** the version, the masked
 number the user saw (`+65 9123 ••10`, shown on the card) and a hash of the full
 routing value. A transfer drafted for the old number is refused as
-`SUPERSEDED`; an unbound transfer never runs.
+`SUPERSEDED` (before the fingerprint is even asked for); an unbound transfer
+never runs. After a number change the card, the phone code and the assistant's
+reply all name the new number ("Mom ··4567", "your first payment to Mom at this
+number"), never the old, trusted one.
 
 **A scam score** (`backend/policy/scam.py`) — rules only, never the model:
 
@@ -216,7 +219,7 @@ routing value. A transfer drafted for the old number is refused as
 | `FIRST_PAYMENT_TO_DESTINATION` | no earlier transfer to this destination *version* | 2 |
 | `RECENT_DESTINATION_CHANGE` | changed or added < 24 h ago | 3 |
 | `LARGE_FIRST_PAYMENT` | first payment and ≥ $1,000 | 3 |
-| `BALANCE_DRAIN` | ≥ 80% of the source account | 3 |
+| `BALANCE_DRAIN` | transfers ≥ 80% of the source account (buying your own shares doesn't count) | 3 |
 | `RAPID_MULTI_DESTINATION` | ≥ 3 new destinations in 30 min | 4 |
 | `RECENT_CREDENTIAL_CHANGE` | a passkey added < 12 h ago (not the first) | 4 |
 | `SOCIAL_ENGINEERING_LANGUAGE` | phrase rules on the raw transcript ("safe account" or an official's orders: 4) | 2 |
@@ -234,7 +237,8 @@ the drafted outcome still binds (a lower score later doesn't lift the hold or
 the phone code), and a *higher* one the user was never shown refuses the
 payment (`RESCORED` — cancel and ask again). The hour is judged when the user
 asked, so a hold that runs past midnight doesn't make the payment a "night-time"
-one. `SCAM_HOLD_SECONDS` sets the length (30 s by default), **capped at 240 s**:
+one. A hold covers the payment it was shown for: if an answer changes the payee, the
+wait starts again. `SCAM_HOLD_SECONDS` sets the length (30 s by default), **capped at 240 s**:
 a draft lasts 5 minutes, and a held one must still be signable when the hold ends.
 
 **Phrase flags** on the user's own words — one list, shared with the

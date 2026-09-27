@@ -1119,7 +1119,7 @@ async function onDecline() {
   } else {
     showErr("Couldn't cancel: " + (d.error || res.status) + ". Nothing has been sent.");
     btn.disabled = false;
-    if (sign) sign.disabled = false;
+    updateSignGate();                     // back to what the hold, name and code allow
     return;
   }
   retireLiveCard();
@@ -1325,7 +1325,20 @@ function wireKillSwitch() {
   btn.onclick = async () => {
     if (btn.classList.contains("on")) return;
     if (!confirm("Freeze all outgoing payments? Unfreezing needs a code sent to your phone.")) return;
-    const r = await jpost(API + "/api/killswitch", { user_id: DEMO_USER });
+    let r;
+    try {
+      r = await jpost(API + "/api/killswitch", { user_id: DEMO_USER });
+    } catch (_) {
+      r = { status: 0, json: {} };
+    }
+    if (r.status !== 200) {
+      // Never "frozen" unless the server says so: false assurance on a safety
+      // control is worse than an error.
+      refreshKillSwitch();
+      showErr("Couldn't freeze your payments (" + (((r.json.detail || {}).error) || r.status
+        || "no connection") + "). Try again.");
+      return;
+    }
     paintFreeze(true);
     retireLiveCard();
     botSay("Done — all outgoing payments are frozen. " + (r.json.drafts_cancelled

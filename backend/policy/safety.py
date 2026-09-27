@@ -16,18 +16,27 @@ from __future__ import annotations
 from backend.data.db import DB_PATH, connect
 
 
-def create_hold(draft_id: str, user_id: str, *, seconds: int, now: int, db_path=None) -> int:
-    """Hold this draft until now + seconds. Idempotent: an existing hold keeps
-    its original release time (re-running the pipeline cannot restart it)."""
+def create_hold(draft_id: str, user_id: str, *, seconds: int, now: int, payload_hash: str,
+                db_path=None) -> int:
+    """Hold this draft until now + seconds; returns the release time.
+
+    A hold covers the payload it was created for. The same payload again keeps
+    its release time. A DIFFERENT payload on the same draft (an answer that
+    changed the payee after the hold ran out) is a payment the user hasn't
+    waited on yet, so its wait starts again — never shorter than before.
+    Two requests at once can't both create it: one INSERT OR IGNORE."""
     conn = connect(db_path or DB_PATH)
     try:
-        row = conn.execute("SELECT release_at FROM holds WHERE draft_id=?", (draft_id,)).fetchone()
-        if row is not None:
-            return int(row["release_at"])
-        conn.execute("INSERT INTO holds VALUES (?,?,?,?,'PENDING')",
-                     (draft_id, user_id, now, now + seconds))
+        conn.execute("INSERT OR IGNORE INTO holds (draft_id, user_id, created_at, release_at, "
+                     "status, payload_hash) VALUES (?,?,?,?,'PENDING',?)",
+                     (draft_id, user_id, now, now + seconds, payload_hash))
+        conn.execute("UPDATE holds SET release_at = MAX(release_at, ?), payload_hash = ? "
+                     "WHERE draft_id = ? AND status = 'PENDING' "
+                     "AND COALESCE(payload_hash, '') != ?",
+                     (now + seconds, payload_hash, draft_id, payload_hash))
         conn.commit()
-        return now + seconds
+        return int(conn.execute("SELECT release_at FROM holds WHERE draft_id=?",
+                                (draft_id,)).fetchone()["release_at"])
     finally:
         conn.close()
 

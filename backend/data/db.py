@@ -56,7 +56,8 @@ CREATE TABLE IF NOT EXISTS holds (
     user_id     TEXT NOT NULL,
     created_at  INTEGER NOT NULL,
     release_at  INTEGER NOT NULL,
-    status      TEXT NOT NULL CHECK (status IN ('PENDING','CANCELLED','RELEASED'))
+    status      TEXT NOT NULL CHECK (status IN ('PENDING','CANCELLED','RELEASED')),
+    payload_hash TEXT                   -- the payload this wait was for
 );
 CREATE TABLE IF NOT EXISTS kill_switch (
     user_id     TEXT PRIMARY KEY,
@@ -82,6 +83,9 @@ def migrate(conn: sqlite3.Connection) -> None:
         conn.commit()
     conn.executescript(EXECUTIONS_DDL)
     conn.executescript(SAFETY_DDL)
+    if "payload_hash" not in {r["name"] for r in conn.execute("PRAGMA table_info(holds)")}:
+        conn.execute("ALTER TABLE holds ADD COLUMN payload_hash TEXT")
+        conn.commit()
 
 
 def init_schema(conn: sqlite3.Connection) -> None:
