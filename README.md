@@ -239,10 +239,12 @@ the phone code), and a *higher* one the user was never shown refuses the
 payment (`RESCORED` — cancel and ask again). The hour is judged when the user
 asked, so a hold that runs past midnight doesn't make the payment a "night-time"
 one. A hold covers the payment it was shown for: if an answer changes the payee, the
-wait starts again. `SCAM_HOLD_SECONDS` sets the length (30 s by default), **capped at 240 s**:
+wait starts again. `SCAM_HOLD_SECONDS` sets the length (30 s by default), **capped at 210 s**:
 a payment is signable for 5 minutes from when it's drafted (or from the answer
-that completed it — the draft lives as long as its payload), and a held one
-must still be signable when the hold ends.
+that completed it — the draft lives as long as its payload), the hold starts
+only after the validator (up to `LLM_TIMEOUT_S`, 30 s), and a held one must
+still have a minute left to sign when the hold ends. A hold is never shortened
+to fit.
 
 **Phrase flags** on the user's own words — one list, shared with the
 add-a-contact flow (`backend/policy/new_contact.py`): a "safe account", an

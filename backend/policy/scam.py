@@ -193,6 +193,10 @@ class ScamAssessment:
     phrase_codes: list = field(default_factory=list)   # phrase-rule codes, incl. advisory
     riskiest_payee: str | None = None                  # the transfer the risk points at
     confirm_name: str | None = None                    # HOLD_STEP_UP: the name to type
+    # Every transfer leg to a destination never paid before: not only the first
+    # leg per destination (that one alone carries the signal), so the reply
+    # vouches for none of them.
+    new_destination_legs: frozenset = frozenset()
 
     def to_dict(self) -> dict:
         return {"draft_id": self.draft_id, "score": self.score, "outcome": self.outcome,
@@ -262,6 +266,7 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
                    for h in ctx.history if (h.get("leg_type") or "TRANSFER") == "TRANSFER")
 
     new_here: set[tuple[str, int]] = set()
+    new_legs: set[str] = set()         # every transfer leg to a never-paid destination
     names: dict[str, str] = {}         # transfer leg id -> the payee's name
     for leg in plan.plan:
         # Only money sent to other people drains an account the way a scam
@@ -283,7 +288,10 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
         names[leg.id] = who
         dest = ctx.destinations.get(leg.payee_id)
         version = leg.destination_version or (dest.version if dest else 1)
-        first = not paid_before(leg.payee_id, version) and (leg.payee_id, version) not in new_here
+        never_paid = not paid_before(leg.payee_id, version)
+        if never_paid:
+            new_legs.add(leg.id)
+        first = never_paid and (leg.payee_id, version) not in new_here
         if first:
             new_here.add((leg.payee_id, version))
             signals.append(Signal("FIRST_PAYMENT_TO_DESTINATION",
@@ -363,7 +371,8 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
         draft_id=draft_id or plan.draft_id, signals=tuple(signals), score=score,
         outcome=outcome, warnings=tuple(dict.fromkeys(warnings)) if outcome != ALLOW else (),
         phrase_codes=phrase_codes(found),
-        riskiest_payee=riskiest, confirm_name=riskiest if outcome == HOLD_STEP_UP else None)
+        riskiest_payee=riskiest, confirm_name=riskiest if outcome == HOLD_STEP_UP else None,
+        new_destination_legs=frozenset(new_legs))
 
 
 def reassess(plan, user_id: str, *, db_path=None, now: int, transcript: str = "",

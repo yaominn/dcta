@@ -312,3 +312,29 @@ def test_an_existing_demo_db_gains_the_table_without_a_reseed(ledger):
         conn.close()
     assert "executions" in tables
     assert kept == 1
+
+
+def test_an_existing_holds_table_gains_its_payload_column(ledger):
+    """Holds made before a hold recorded its payload: startup adds the column
+    without a re-seed, and a leftover hold (payload_hash NULL) still works."""
+    from backend.policy import safety
+    conn = connect(ledger)
+    try:
+        conn.execute("DROP TABLE holds")
+        conn.execute("CREATE TABLE holds (draft_id TEXT PRIMARY KEY, user_id TEXT NOT NULL, "
+                     "created_at INTEGER NOT NULL, release_at INTEGER NOT NULL, "
+                     "status TEXT NOT NULL CHECK (status IN ('PENDING','CANCELLED','RELEASED')))")
+        conn.execute("INSERT INTO holds VALUES ('d-old', 'u_alice', 0, 10, 'PENDING')")
+        conn.commit()
+        migrate(conn)
+        columns = {r["name"] for r in conn.execute("PRAGMA table_info(holds)")}
+    finally:
+        conn.close()
+    assert "payload_hash" in columns
+    assert safety.create_hold("d-new", "u_alice", seconds=30, now=100, payload_hash="p",
+                              db_path=ledger) == 130
+    old = safety.get_hold("d-old", db_path=ledger)
+    assert old["payload_hash"] is None and safety.hold_covers(old, "any payload")
+    # A payload on the leftover hold is one it wasn't for: the wait starts again.
+    assert safety.create_hold("d-old", "u_alice", seconds=30, now=100, payload_hash="p",
+                              db_path=ledger) == 130

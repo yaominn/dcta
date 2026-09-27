@@ -96,8 +96,8 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
 
     accounts: account id -> {"type", "balance"} BEFORE this plan (the ledger).
     history:  the user's past payments ({payee_id, amount}), for "usual".
-    new_destination_legs: legs the scam rules found are a first payment to this
-              destination (a payee paid before, at a NEW number).
+    new_destination_legs: every transfer leg to a destination never paid before
+              (a new payee, or one paid before at a different number).
     """
     answers = answers or {}
     matched = match_legs(intent.plan, transcript)
@@ -181,7 +181,7 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
             # usually send" would vouch for the very payment the scam warning
             # is about — the new-number scam.
             notes.append(f"It's your first payment to {who} at this number.")
-            if rleg.amount_cents >= usual * ANOMALY_MULTIPLE:
+            if usual > 0 and rleg.amount_cents >= usual * ANOMALY_MULTIPLE:
                 check_reason = check_reason or f"that's far more than you usually send {who}"
         elif usual <= 0:
             pass                                   # no meaningful comparison

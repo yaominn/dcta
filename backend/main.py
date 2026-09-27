@@ -340,6 +340,12 @@ def issue_nonce(draft_id: str = Query(...)):
         _traces.event(draft_id, "nonce", issued=False, reason="hold cancelled")
         raise HTTPException(status_code=409, detail={
             "error": "this payment's hold was cancelled", "draft_id": draft_id})
+    if (hold and draft.payload is not None
+            and not safety.hold_covers(hold, payload_hash(draft.payload))):
+        _traces.event(draft_id, "nonce", issued=False, reason="hold is for another payload")
+        raise HTTPException(status_code=409, detail={
+            "error": "this payment's safety hold was for a different payment — cancel it "
+                     "and ask again", "draft_id": draft_id, "rejection": "HOLD_REQUIRED"})
     if hold and hold["status"] == "PENDING" and time.time() < hold["release_at"]:
         left = int(hold["release_at"] - time.time())
         _traces.event(draft_id, "nonce", issued=False, reason="on hold", seconds_left=left)
@@ -823,8 +829,10 @@ def _pipeline(draft: Draft) -> dict:
     draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
                         "checks": report.checks, "soft_signals": report.soft_signals,
                         "llm_check": report.llm_check}
-    draft.resolved_plan = resolved
-    draft.status = "frozen" if report.frozen else "ready"
+    # The draft takes this payload (and becomes signable) only once its hold and
+    # phone code are recorded, below: if anything in between fails, it keeps
+    # its previous payload, never a new one behind an old, finished hold.
+    status = "frozen" if report.frozen else "ready"
     p_hash = payload_hash(resolved)
     _traces.event(draft.draft_id, "validate", verdict=report.verdict, frozen=report.frozen,
                   checks=report.checks, soft_signals=report.soft_signals,
@@ -839,7 +847,7 @@ def _pipeline(draft: Draft) -> dict:
     #     this draft; HOLD_STEP_UP also requires the phone code (below).
     assessment = None
     hold_release = None
-    if draft.status == "ready":
+    if status == "ready":
         now = int(time.time())
         assessment = _rescore(draft, resolved, now)
         # Never lower than before (a clarification re-runs this): the floor.
@@ -865,7 +873,7 @@ def _pipeline(draft: Draft) -> dict:
                                               seconds=_hold_seconds(), now=now,
                                               payload_hash=p_hash)
 
-    needs_step_up = (draft.status == "ready"
+    needs_step_up = (status == "ready"
                      and (verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION
                           or draft.scam_floor == scam.HOLD_STEP_UP))
     if needs_step_up:
@@ -876,6 +884,8 @@ def _pipeline(draft: Draft) -> dict:
                        f"DCTA: to {plan_summary(resolved)}, enter code {code}. "
                        f"Valid 5 min. Never share this code. If this wasn't "
                        f"you, ignore this message.")
+    draft.resolved_plan = resolved
+    draft.status = status
 
     # --- what the assistant says about it (backend/narrate.py): built from the
     #     same checked data as the card — never LLM text — so the reply and the
@@ -898,9 +908,7 @@ def _pipeline(draft: Draft) -> dict:
                                 extra_check=needs_step_up,
                                 hold_seconds=(max(0, hold_release - int(time.time()))
                                               if hold_release is not None else None),
-                                new_destination_legs=frozenset(
-                                    s.leg for s in assessment.signals
-                                    if s.code == "FIRST_PAYMENT_TO_DESTINATION"))
+                                new_destination_legs=assessment.new_destination_legs)
         except Exception:
             logging.exception("narration failed for draft %s; showing the plain card",
                               draft.draft_id)
@@ -1017,7 +1025,9 @@ def create_draft(req: DraftRequest):
     out = _run(draft)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
-    if out.get("status") != "ready" and draft.kind != "contact_add":
+    # A refused new contact already carries its own warning: no second one.
+    if out.get("status") != "ready" and not (draft.kind == "contact_add"
+                                             and out.get("status") == "blocked"):
         found = scam.scan_transcript(req.transcript)
         if scam.strong_codes(found):
             out["scam_language"] = {"codes": scam.phrase_codes(found),
@@ -1035,13 +1045,19 @@ _FLOOR_WARNING = ("This payment looked riskier earlier in this request, so the e
                   "checks you were shown still apply.")
 
 
+_SIGN_MARGIN_S = 60        # a hold ends at least this long before its payload expires
+
+
 def _hold_seconds() -> int:
     """SCAM_HOLD_SECONDS, capped so the hold ends with time left to sign: the
-    hold starts with the payload it holds, and that payload's signed
-    expires_at and the phone code both last MAX_AUTH_WINDOW_S (5 min) from
-    then (the draft lives as long as its payload). A longer hold needs
-    longer-lived payloads first."""
-    return max(0, min(settings.scam_hold_seconds, MAX_AUTH_WINDOW_S - 60))
+    payload's signed expires_at and the phone code both last MAX_AUTH_WINDOW_S
+    (5 min) from when the payload was resolved (the draft lives as long as its
+    payload), but the hold only starts after the validator, which may take up
+    to LLM_TIMEOUT_S. A hold is never shortened to fit: a payload that runs out
+    first just expires (ask again). A longer hold needs longer-lived payloads
+    first."""
+    return max(0, min(settings.scam_hold_seconds,
+                      int(MAX_AUTH_WINDOW_S - _SIGN_MARGIN_S - settings.llm_timeout_s)))
 
 
 def _rescore(draft: Draft, plan: ResolvedPlan, now: int):

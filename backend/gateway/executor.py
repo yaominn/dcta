@@ -112,7 +112,9 @@ class MockExecutor:
 
     # ------------------------------------------------------------ execution
     def execute(self, plan: ResolvedPlan, *, payload_hash: str) -> dict:
-        """Run the plan at most once per draft_id. Raises AlreadyExecuted."""
+        """Run the plan at most once per draft_id. Raises AlreadyExecuted, or
+        DestinationChanged when a transfer's payee got a new destination since
+        the gateway checked (nothing ran, and the claim was rolled back)."""
         conn = connect(self.db_path)
         results = []
         aborted = False

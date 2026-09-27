@@ -421,6 +421,11 @@ class Gateway:
         if hold is not None:
             if hold["status"] == "CANCELLED":
                 return ("STATE", "this payment's hold was cancelled — nothing was sent")
+            if not safety.hold_covers(hold, p_hash):
+                # The hold was for another payload on this draft (an answer
+                # changed it) and this one's wait was never recorded.
+                return ("HOLD_REQUIRED", "this payment's safety hold was for a different "
+                                         "payment — cancel it and ask again; nothing was sent")
             if now < int(hold["release_at"]):
                 return ("HELD", f"this payment is on a safety hold for "
                                 f"{int(hold['release_at']) - now} more seconds — nothing was sent")

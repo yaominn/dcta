@@ -26,8 +26,12 @@ import contextlib
 import io
 import json
 import re
+import shutil
+import sqlite3
+import subprocess
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -618,6 +622,148 @@ def test_a_different_payee_on_the_same_draft_waits_again(client):
     assert _execute(client, other)["rejection"] == "HELD"
 
 
+def _held_john(client):
+    """A draft to John on hold, its question answered, its wait already over."""
+    d = client.post("/api/drafts", json={"transcript": "pay john 1000"}).json()
+    held = client.post(f"/api/drafts/{d['draft_id']}/clarify",
+                       json={"field": d["field"], "choice_id": "payee_22"}).json()
+    assert held["scam"]["outcome"] == "HOLD"
+    _release_hold_now(d["draft_id"])
+    return d, held
+
+
+def test_a_hold_only_covers_the_payment_it_was_for(client):
+    """The hold records which payload it held. A payload it wasn't for has had
+    no wait of its own: neither the signing challenge nor the gateway counts
+    the old, finished wait for it."""
+    d, held = _held_john(client)
+    conn = connect()
+    try:
+        conn.execute("UPDATE holds SET payload_hash='another payment' WHERE draft_id=?",
+                     (d["draft_id"],))
+        conn.commit()
+    finally:
+        conn.close()
+    before = _balance()
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and nonce.json()["detail"]["rejection"] == "HOLD_REQUIRED"
+    if held["requires_extra_confirmation"]:
+        client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
+    assert _execute(client, held)["rejection"] == "HOLD_REQUIRED"
+    assert _balance() == before
+
+
+def test_a_hold_from_before_payload_binding_still_counts():
+    from backend.policy import safety
+    assert safety.hold_covers({"payload_hash": None}, "p1")
+    assert safety.hold_covers({"payload_hash": "p1"}, "p1")
+    assert not safety.hold_covers({"payload_hash": "p1"}, "p2")
+
+
+def test_a_failed_answer_leaves_the_previous_payment_in_place(client, monkeypatch):
+    """The draft takes a new payload only once its hold is recorded. If the
+    pipeline fails on the way (here the audit log is locked), the draft keeps
+    the payment it had, never a new payee behind the old, finished wait."""
+    from backend import main
+    from backend.audit.log import AuditEntryType
+    d, held = _held_john(client)
+    real = main._audit.append
+
+    def locked(entry_type, payload):
+        if entry_type == AuditEntryType.SCAM_ASSESSMENT and payload.get("stage") == "draft":
+            raise sqlite3.OperationalError("database is locked")
+        return real(entry_type, payload)
+    monkeypatch.setattr(main._audit, "append", locked)
+    with pytest.raises(sqlite3.OperationalError):
+        client.post(f"/api/drafts/{d['draft_id']}/clarify",
+                    json={"field": d["field"], "choice_id": "payee_21"})
+    draft = main._drafts.get(d["draft_id"])
+    assert draft.resolved_plan.plan[0].payee_id == "payee_22"
+    assert payload_hash(draft.resolved_plan) == held["payload_hash"]
+
+
+def test_a_slow_validator_still_leaves_time_to_sign(client, monkeypatch):
+    """The payload's 5 minutes start at resolve; the hold starts after the
+    validator, which may take its whole timeout. The capped hold still ends a
+    minute before the payload expires, and it is never trimmed to fit."""
+    from backend import main
+    monkeypatch.setattr(settings, "scam_hold_seconds", 600)
+    _change_moms_number(client)
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    real = main.validate
+
+    def slow(*args, **kwargs):
+        clock[0] += settings.llm_timeout_s
+        return real(*args, **kwargs)
+    monkeypatch.setattr(main, "validate", slow)
+    d = client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()
+    hold = d["scam"]["hold"]
+    assert hold["release_at"] <= d["resolved_plan"]["expires_at"] - 60
+    assert hold["release_at"] - int(clock[0]) == main._hold_seconds()     # the whole hold
+
+
+def test_every_payment_to_a_new_number_is_marked_new():
+    """Only the first leg to a new number carries the signal, but every leg to
+    it is new: the reply must vouch for none of them."""
+    mom2 = destinations.Destination("payee_17", 2, "PAYNOW_MOBILE", "+65 8123 ••67", "h2", None)
+    a = scam.assess(_plan(_mom(5000, version=2), _mom(6000, version=2, leg_id="t2")),
+                    _ctx(mom=mom2))
+    assert a.new_destination_legs == {"t1", "t2"}
+    assert [s.leg for s in a.signals if s.code == "FIRST_PAYMENT_TO_DESTINATION"] == ["t1"]
+    assert not scam.assess(_plan(_mom(5000)), _ctx()).new_destination_legs   # paid there before
+
+
+def test_no_signing_challenge_for_an_unbound_transfer(client):
+    from backend.main import _drafts
+    d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    draft = _drafts.get(d["draft_id"])
+    leg = draft.resolved_plan.plan[0].model_copy(update={"destination_version": None,
+                                                          "destination_hash": None})
+    draft.resolved_plan = draft.resolved_plan.model_copy(update={"plan": [leg]})
+    r = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert r.status_code == 409 and r.json()["detail"]["rejection"] == "DESTINATION"
+
+
+def test_a_new_number_without_a_version_bump_is_still_superseded(client):
+    """The version is the quick check; the routing hash is the real one."""
+    d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    conn = connect()
+    try:
+        conn.execute("UPDATE payees SET phone='+65 8123 4567' WHERE id='payee_17'")
+        conn.commit()
+    finally:
+        conn.close()
+    before = _balance()
+    assert _execute(client, d)["rejection"] == "SUPERSEDED" and _balance() == before
+
+
+def test_a_payee_that_is_gone_is_superseded(client):
+    bound = _mom(5000).model_copy(update={"destination_hash": dest("payee_17")["destination_hash"]})
+    conn = connect()
+    try:
+        assert not destinations.superseded(conn, _plan(bound))
+        assert destinations.superseded(conn, _plan(bound.model_copy(update={"payee_id": "payee_gone"})))
+    finally:
+        conn.close()
+
+
+def test_the_page_never_claims_a_freeze_or_unlocks_confirm_on_a_failure():
+    """Freeze and Cancel when the server can't be reached or refuses: the page
+    never shows "Frozen" unless the server says so, and a failed Cancel leaves
+    Confirm as locked as the hold has it."""
+    if not shutil.which("node"):
+        pytest.skip("node is not installed")
+    runner = Path(__file__).resolve().parent / "js" / "safety_runner.js"
+    out = json.loads(subprocess.run(["node", str(runner)], capture_output=True, text=True,
+                                    timeout=60, check=True).stdout)
+    assert out["freezeOffline"]["on"] is False and "no connection" in out["freezeOffline"]["error"]
+    assert out["freezeRefused"]["on"] is False and "boom" in out["freezeRefused"]["error"]
+    assert out["cancelOffline"]["cancelDisabled"] is False        # they can try again
+    assert out["cancelOffline"]["signDisabled"] is True           # the hold still locks Confirm
+    assert "no connection" in out["cancelOffline"]["error"]
+
+
 def test_the_same_payload_keeps_its_release_time(client):
     from backend.policy import safety
     now = int(time.time())
@@ -658,7 +804,8 @@ def test_a_draft_still_waiting_on_a_question_expires_on_time():
 
 
 def test_the_hold_is_capped_so_it_can_still_be_signed(client, monkeypatch):
-    """A draft lasts 5 minutes: a longer hold would outlive it."""
+    """A payload is signable for 5 minutes from when it's resolved: a longer
+    hold would outlive it."""
     monkeypatch.setattr(settings, "scam_hold_seconds", 600)
     _change_moms_number(client)
     d = client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()
@@ -863,6 +1010,16 @@ def test_a_refused_contact_add_gets_one_warning_not_two(client):
                       "to move my money to a safe account"}).json()
     assert d["status"] == "blocked" and d["kind"] == "contact_add"
     assert "scam_language" not in d
+
+
+def test_a_contact_add_waiting_for_a_number_still_gets_the_warning(client):
+    """Only a REFUSED contact add carries its own warning. One still asking
+    for the number gets the scam-words warning like any other request."""
+    d = client.post("/api/drafts", json={
+        "transcript": "add Officer Tan as a contact, the police told me to move my "
+                      "money to a safe account"}).json()
+    assert d["status"] == "clarify" and d["kind"] == "need_phone"     # the contact add's question
+    assert "safe account" in d["scam_language"]["warning"]
 
 
 def test_console_debug_carries_the_score_and_the_prompts(client):

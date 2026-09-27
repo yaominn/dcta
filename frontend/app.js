@@ -1108,7 +1108,12 @@ async function onDecline() {
   const sign = document.getElementById("sign");
   btn.disabled = true;
   if (sign) sign.disabled = true;
-  const res = await jpost(API + "/api/drafts/" + encodeURIComponent(CURRENT.draftId) + "/decline", {});
+  let res;
+  try {
+    res = await jpost(API + "/api/drafts/" + encodeURIComponent(CURRENT.draftId) + "/decline", {});
+  } catch (_) {
+    res = { status: 0, json: {} };      // no connection: say so, and let them retry
+  }
   const d = res.json.detail || {};
   if (res.status === 200) {
     showCancelled();
@@ -1117,7 +1122,8 @@ async function onDecline() {
     showAlreadySent({ json: { rejection: "DUPLICATE", execution: d.execution,
                               executed_at: d.executed_at } });
   } else {
-    showErr("Couldn't cancel: " + (d.error || res.status) + ". Nothing has been sent.");
+    showErr("Couldn't cancel: " + (d.error || res.status || "no connection")
+      + ". Nothing has been sent.");
     btn.disabled = false;
     updateSignGate();                     // back to what the hold, name and code allow
     return;

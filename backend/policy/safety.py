@@ -20,10 +20,12 @@ def create_hold(draft_id: str, user_id: str, *, seconds: int, now: int, payload_
                 db_path=None) -> int:
     """Hold this draft until now + seconds; returns the release time.
 
-    A hold covers the payload it was created for. The same payload again keeps
-    its release time. A DIFFERENT payload on the same draft (an answer that
-    changed the payee after the hold ran out) is a payment the user hasn't
-    waited on yet, so its wait starts again — never shorter than before.
+    A hold covers the payload it was created for (hold_covers). The same
+    payload again keeps its release time. A DIFFERENT payload on the same draft
+    is a payment the user hasn't waited on yet, so its wait starts again —
+    never shorter than before. Every re-resolve is a different payload (its
+    signed created_at / expires_at are new), so in practice any answered
+    question restarts the wait, not only one that changed the payee.
     Two requests at once can't both create it: one INSERT OR IGNORE."""
     conn = connect(db_path or DB_PATH)
     try:
@@ -39,6 +41,13 @@ def create_hold(draft_id: str, user_id: str, *, seconds: int, now: int, payload_
                                 (draft_id,)).fetchone()["release_at"])
     finally:
         conn.close()
+
+
+def hold_covers(hold: dict, payload_hash: str) -> bool:
+    """Whether this hold was for this payload. A payment the hold wasn't for
+    has had no wait of its own, however long ago this hold ran out. (A hold
+    from before holds recorded their payload covers any.)"""
+    return not hold.get("payload_hash") or hold["payload_hash"] == payload_hash
 
 
 def get_hold(draft_id: str, *, db_path=None) -> dict | None:

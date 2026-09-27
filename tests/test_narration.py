@@ -46,7 +46,8 @@ ACCT = {"savings": "acct_savings", "spending": "acct_joint"}
 
 def _transfer(transcript, cents, *, mention="mom", source_mention="default",
               acct="acct_savings", payee=("payee_17", "Mom ··3310"), history=MOM_HISTORY,
-              answers=None, extra_check=False, draft_id="d-narrate"):
+              answers=None, extra_check=False, draft_id="d-narrate",
+              new_destination_legs=frozenset()):
     intent = IntentPlan(plan=[TransferIntent(
         id="t1", type="TRANSFER", source_account=MentionTarget(mention=source_mention),
         target=MentionTarget(mention=mention), amount=LiteralAmount(literal_cents=cents))])
@@ -58,7 +59,8 @@ def _transfer(transcript, cents, *, mention="mom", source_mention="default",
                                payee_id=payee[0], payee_display=payee[1],
                                amount_cents=cents if not answers else int(answers["t1.amount"]))])
     return narrate(intent, plan, transcript, accounts=ACCOUNTS, history=history,
-                   answers=answers, extra_check=extra_check)
+                   answers=answers, extra_check=extra_check,
+                   new_destination_legs=new_destination_legs)
 
 
 # --------------------------------------------------------------------------- the reply
@@ -234,6 +236,20 @@ def test_the_quoted_account_is_the_one_debited():
 def test_a_zero_in_the_history_does_not_crash():
     out = _transfer("pay mom 50", 5000, history=[{"payee_id": "payee_17", "amount": 0}])
     assert "$50.00 to Mom" in out["reply"]
+
+
+def test_a_new_number_is_never_in_line_with_the_usual():
+    """Paid before, but not at this number: the usual amount vouches for nothing."""
+    out = _transfer("pay mom 500", 50000, new_destination_legs=frozenset({"t1"}))
+    assert "first payment to Mom at this number" in out["reply"]
+    assert "in line with" not in out["reply"]
+
+
+def test_a_new_number_with_a_zero_history_is_not_far_more_than_usual():
+    out = _transfer("pay mom 50", 5000, history=[{"payee_id": "payee_17", "amount": 0}],
+                    extra_check=True, new_destination_legs=frozenset({"t1"}))
+    assert "first payment to Mom at this number" in out["reply"]
+    assert "far more than you usually send" not in out["reply"]
 
 
 def test_the_threshold_is_the_policy_engines(monkeypatch):
