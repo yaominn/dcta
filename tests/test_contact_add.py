@@ -319,6 +319,45 @@ def test_paying_an_unknown_name_offers_to_add_them(client):
     assert again["status"] == "ready"
 
 
+def test_the_question_leads_with_adding_them(client):
+    pay = client.post("/api/drafts", json={"transcript": "send 200 dollars to uncle bob"}).json()
+    assert pay["question"].startswith("Uncle Bob isn't in your contacts yet. "
+                                      "Do you want to add them?")
+
+
+class _DropsUnknownPayees:
+    """What GPT did with "Send 200 to Uncle Bob": no leg at all, the recipient
+    listed as unresolved (Uncle Bob isn't among the context's payees)."""
+    name = "drops-unknown-payees"
+
+    def complete(self, *, system, user):
+        return '{"plan": [], "unresolved": ["recipient for t1"]}'
+
+
+def test_a_model_that_drops_an_unknown_payee_still_offers_to_add_them(client, monkeypatch):
+    from backend import main
+    monkeypatch.setattr(main, "get_provider", lambda _settings: _DropsUnknownPayees())
+    pay = client.post("/api/drafts", json={"transcript": "Send 200 to Uncle Bob"}).json()
+    assert pay["status"] == "clarify" and pay["kind"] == "payee"
+    assert pay["new_contact"] == {"name": "Uncle Bob", "awaiting": "phone"}
+
+
+def test_the_rules_never_draft_a_payment_the_model_did_not(client, monkeypatch):
+    """Only a payee who isn't a contact brings the rules in: the model's empty
+    reading of a payment to an existing contact stands."""
+    from backend import main
+    monkeypatch.setattr(main, "get_provider", lambda _settings: _DropsUnknownPayees())
+    pay = client.post("/api/drafts", json={"transcript": "send 50 dollars to mom"}).json()
+    assert pay["status"] == "clarify" and pay["kind"] == "empty"
+
+
+def test_the_parser_is_told_to_keep_a_payee_who_isnt_a_contact():
+    from backend.agent import prompts
+    system = " ".join(prompts.system_prompt().split())
+    assert "someone who isn't a payee yet" in system
+    assert "A recipient who is not in the context is NOT a gap" in system
+
+
 def test_a_large_waiting_payment_puts_the_new_contact_on_hold(client):
     pay = client.post("/api/drafts", json={"transcript": "send 3000 dollars to uncle bob"}).json()
     add = client.post("/api/drafts", json={"transcript": "9123 4567",

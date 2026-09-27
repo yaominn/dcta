@@ -39,7 +39,8 @@ from backend.auth import (
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, assess_scam_risk,
                            build_context, classify_request, get_provider,
-                           parse_contact_add, parse_contact_edit, parse_transcript)
+                           parse_contact_add, parse_contact_edit, parse_transcript,
+                           unknown_payee_fallback)
 from backend.models.contacts import (ContactAddPlan, ContactEditPlan, ResolvedContactAdd,
                                      ResolvedContactChange)
 from backend.models.schemas import MAX_AUTH_WINDOW_S
@@ -794,6 +795,10 @@ def _pipeline(draft: Draft) -> dict:
         offer = _new_contact_offer(plan, outcome)
         if offer:
             draft.question["new_contact"] = offer
+            # Lead with the likely answer: someone new, not a typo for a contact.
+            draft.question["question"] = (
+                f"{offer['name']} isn't in your contacts yet. Do you want to add them?"
+                + (" If you meant someone else, pick them below." if outcome.choices else ""))
         _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
         return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
 
@@ -963,6 +968,7 @@ def create_draft(req: DraftRequest):
         return view
 
     provider = RecordingProvider(get_provider(settings))
+    fallback = None
     try:
         if route == "contact_edit":
             plan = parse_contact_edit(req.transcript, provider=provider, context=context)
@@ -973,6 +979,10 @@ def create_draft(req: DraftRequest):
                 plan.contact.nickname = origin["name"]
         else:
             plan = parse_transcript(req.transcript, provider=provider, context=context)
+            # The model dropped everything: a payment to someone who isn't a
+            # contact yet still reaches "add them?" (the rules' reading).
+            if not plan.plan and (rules := unknown_payee_fallback(req.transcript, context)):
+                plan, fallback = rules, "rules: a payee who isn't a contact yet"
     except (ProviderUnavailable, ParseFailure) as exc:
         tid = "failed-" + DraftStore.new_id()
         _traces.start(tid, transcript=req.transcript, route=route, user_id=req.user_id)
@@ -1000,7 +1010,8 @@ def create_draft(req: DraftRequest):
     ))
     _traces.start(draft.draft_id, transcript=req.transcript, route=route, user_id=req.user_id)
     _traces.event(draft.draft_id, "parse", provider=provider.name, llm_calls=provider.calls,
-                  context=context.to_prompt_json(), result=plan.model_dump(mode="json"))
+                  context=context.to_prompt_json(), result=plan.model_dump(mode="json"),
+                  **({"fallback": fallback} if fallback else {}))
 
     # AuditEntryType.TRANSCRIPT exists and was reserved for M7 ("every step" —
     # brief 4.5 / docs/ARCHITECTURE.md), but nothing emitted it: the chain went

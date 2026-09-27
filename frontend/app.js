@@ -1067,6 +1067,7 @@ function renderClarify(body) {
     // resolver re-validates the chosen id against a fresh deterministic match,
     // so a tampered choice cannot inject a payee the mention never justified.
     const chips = el("div", "chips live");
+    const choices = [];
     for (const c of body.choices) {
       const b = el("button", "chip choice", c.display);  // textContent: DB-sourced
       b.type = "button";
@@ -1078,7 +1079,7 @@ function renderClarify(body) {
         userSay(c.display);
         answerClarification(body.field, c.id);
       };
-      chips.append(b);
+      choices.push(b);
     }
     if (nc) {
       // Someone who isn't a contact yet. Adding them is its own signed draft,
@@ -1097,8 +1098,9 @@ function renderClarify(body) {
         Voice.speak(ask);
         awaitNumber(body.draft_id, nc.name);
       };
-      chips.append(b);
+      chips.append(b);            // first: the question asks about adding them
     }
+    chips.append(...choices);
     m.append(chips);
   } else {
     // 0-match / empty / insufficient: no candidate list to choose from, so the

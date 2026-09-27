@@ -63,6 +63,26 @@ def parse_transcript(transcript: str, *, provider: LLMProvider,
         footer=prompts.OUTPUT_FOOTER, provider=provider, max_attempts=max_attempts)
 
 
+def unknown_payee_fallback(transcript: str, context: PromptContext) -> IntentPlan | None:
+    """For the model's EMPTY plan: the rules' reading, when it is a payment to
+    someone who isn't a contact yet ("send 200 to uncle bob").
+
+    The model tends to drop such a leg (its payee isn't in the context), and
+    the user heard "I didn't catch a payment". The rules keep it, so the
+    resolver asks whether to add them. Used only for that: when every
+    transfer the rules read goes to an existing payee, this returns None and
+    the model's reading stands — the rules never draft a payment it didn't."""
+    from backend.agent.stub import rules_plan
+    from backend.resolver import names_a_payee
+    rules = rules_plan(transcript, context.to_prompt_json())
+    nicknames = [p["nickname"] for p in context.payees]
+    if not any(leg["type"] == "TRANSFER"
+               and not names_a_payee(leg["target"]["mention"], nicknames)
+               for leg in rules["plan"]):
+        return None
+    return IntentPlan.model_validate(rules)
+
+
 def parse_contact_edit(transcript: str, *, provider: LLMProvider,
                        context: PromptContext,
                        max_attempts: int = MAX_ATTEMPTS) -> ContactEditPlan:

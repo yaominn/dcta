@@ -532,6 +532,13 @@ def _pick(
     )
 
 
+def names_a_payee(mention: str, nicknames: list[str]) -> bool:
+    """Whether `mention` names one of these payees, by the same rule the
+    resolver matches payees with (_match on nickname, no synonyms)."""
+    norm = _normalize(mention)
+    return any(_normalize(n) == norm for n in nicknames)
+
+
 def _match(rows: list, mention: str, key: str, synonyms: dict[str, str] | None = None) -> list:
     """Rows whose `key` normalises equal to the normalised mention. Both sides go
     through _normalize, so whitespace, punctuation, case and filler words cannot

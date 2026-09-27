@@ -143,14 +143,17 @@ def _extract_amount(clause: str) -> tuple[dict | None, str]:
     """Find the amount in a clause. Returns (amount_dict|None, clause_with_span_removed).
     A symbolic amount is returned as {"after_leg": None, "op": ...} — the caller
     fills in the previous leg id (or routes to unresolved if there is none)."""
+    # The removed span leaves a space: the pattern takes the whitespace on both
+    # sides, and "Send 200 to Bob" must not become "Sendto Bob".
     for pat, op in _SYMBOLIC:
         m = pat.search(clause)
         if m:
-            return {"after_leg": None, "op": op}, (clause[:m.start()] + clause[m.end():])
+            return {"after_leg": None, "op": op}, (clause[:m.start()] + " " + clause[m.end():])
 
     m = _DIGIT_AMOUNT.search(clause)
     if m:
-        return {"literal_cents": _digit_to_cents(m)}, (clause[:m.start()] + clause[m.end():])
+        return ({"literal_cents": _digit_to_cents(m)},
+                clause[:m.start()] + " " + clause[m.end():])
 
     # number words — token scan over the ORIGINAL clause (offsets kept) so the
     # span removal preserves the casing the mention extraction relies on.
@@ -219,6 +222,16 @@ def _find_source_account(clause: str, account_types: list[str]) -> str:
     return "default"
 
 
+def _unknown_name(rest: str) -> str | None:
+    """Who a transfer goes to when it's nobody in the context: "... to uncle
+    bob", "... to uncle bob from savings", "pay uncle bob". The resolver then
+    asks, and offers to add them as a contact."""
+    words = re.sub(r"\s+(?:from|out of)\s+.*$", "", rest.strip(), flags=re.I)
+    m = (re.search(r"\bto\s+([\w\- ]+)$", words, re.I)
+         or re.search(r"\b(?:pay|send|give|transfer)\s+([\w\- ]+)$", words, re.I))
+    return " ".join(m.group(1).split()) if m else None
+
+
 # --------------------------------------------------------------------------- the rule engine
 def _rules_plan(transcript: str, context: dict) -> dict:
     clauses = [c.strip() for c in re.split(r"\bthen\b", transcript, flags=re.I) if c.strip()]
@@ -250,8 +263,7 @@ def _rules_plan(transcript: str, context: dict) -> dict:
         elif payee or re.search(r"\b(pay|send|transfer|give)\b", rest, re.I):
             kind, target = "TRANSFER", payee
             if target is None:  # user named someone/something unknown -> resolver clarifies (4.4)
-                m = re.search(r"\bto\s+([\w\- ]+)$", rest.strip(), re.I)
-                target = m.group(1).strip() if m else None
+                target = _unknown_name(rest)
         else:
             unresolved.append(f"could not understand: {clause!r}")
             continue
@@ -284,6 +296,13 @@ def _rules_plan(transcript: str, context: dict) -> dict:
     if not legs and not unresolved:
         unresolved.append(f"could not understand: {transcript!r}")
     return {"plan": legs, "unresolved": unresolved}
+
+
+def rules_plan(transcript: str, context: dict) -> dict:
+    """The rule engine's reading of a payment request, outside the stub
+    provider: the parser's fallback for a payee who isn't a contact yet
+    (backend/agent/parser.py unknown_payee_fallback)."""
+    return _rules_plan(transcript, context)
 
 
 # --------------------------------------------------------------------------- contact edits
