@@ -266,8 +266,10 @@ const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "
 /* ---------- scam protection: the sign gate, the hold, the name check ---------- */
 const SIGN_LABEL = "Confirm with biometric";
 
-function updateSignGate() {
-  const btn = document.getElementById("sign");
+// A card calls this with its own button while it is being built: the card
+// isn't on the page yet, so looking "#sign" up would find nothing and leave
+// Confirm enabled through a hold or before the phone code.
+function updateSignGate(btn = document.getElementById("sign")) {
   if (!btn) return;
   const g = CURRENT.gate || {};
   btn.disabled = !!(g.code || g.name || g.hold);
@@ -275,11 +277,11 @@ function updateSignGate() {
 
 // A server-enforced hold, shown as a countdown. When it ends NOTHING is sent:
 // Confirm simply becomes available, and the user still decides.
-function startHoldCountdown(seconds) {
+function startHoldCountdown(seconds, cardBtn) {
   clearInterval(CURRENT.holdTimer);
   let left = Math.max(0, Math.ceil(seconds));
   const paint = () => {
-    const btn = document.getElementById("sign");
+    const btn = cardBtn || document.getElementById("sign");
     if (!btn) { clearInterval(CURRENT.holdTimer); return; }
     if (left > 0) {
       btn.textContent = "\u23f3 Confirm available in " + Math.floor(left / 60) + ":"
@@ -288,7 +290,7 @@ function startHoldCountdown(seconds) {
       clearInterval(CURRENT.holdTimer);
       btn.textContent = SIGN_LABEL;
       CURRENT.gate.hold = false;
-      updateSignGate();
+      updateSignGate(btn);
     }
     left -= 1;
   };
@@ -405,8 +407,8 @@ function buildPlanCard(plan, confirmation, narration, transcript, risk) {
   CURRENT.gate = { code: !!confirmation, name: !!(risk && risk.confirm_name),
                    hold: !!(risk && risk.hold && risk.hold.seconds_left > 0) };
   card.append(btn, declineButton());
-  if (CURRENT.gate.hold) startHoldCountdown(risk.hold.seconds_left);
-  updateSignGate();
+  if (CURRENT.gate.hold) startHoldCountdown(risk.hold.seconds_left, btn);
+  updateSignGate(btn);
   card.append(el("p", "hint",
     "Your device signs a hash of exactly this payment, recomputed in your browser."));
   return card;
@@ -452,7 +454,10 @@ function buildChangeCard(change, confirmation) {
   if (confirmation) card.append(buildStepUp(confirmation));
   const btn = el("button", "btn primary", "Confirm with biometric");
   btn.id = "sign";
-  btn.disabled = !!confirmation;
+  // The same gate as a payment's, so a failed Cancel can't unlock Confirm
+  // before the phone code (updateSignGate reads CURRENT.gate).
+  CURRENT.gate = { code: !!confirmation };
+  updateSignGate(btn);
   btn.onclick = onSign;
   card.append(btn, declineButton());
   card.append(el("p", "hint",
@@ -550,7 +555,8 @@ function buildAddCard(add, risk, confirmation) {
   if (confirmation) card.append(buildStepUp(confirmation));
   const btn = el("button", "btn primary", "Save contact with biometric");
   btn.id = "sign";
-  btn.disabled = !!confirmation;
+  CURRENT.gate = { code: !!confirmation };        // as in buildChangeCard
+  updateSignGate(btn);
   btn.onclick = onSign;
   card.append(btn, declineButton());
   card.append(el("p", "hint", "Nothing is saved until you confirm. Your device signs exactly "
@@ -932,7 +938,11 @@ function handleDraft(res) {
   }
   const body = res.json;
   logDebug(body);
-  CURRENT.draftId = body.draft_id;
+  // CURRENT.draftId is the draft on screen: the live card's Cancel and Verify
+  // post to it. Only a reply that shows its own card or question takes it
+  // over; a contacts list or a refusal leaves the live card's draft in place
+  // (it used to re-point a held payment's Cancel at another draft, or none).
+
   // Scam phrases in the user's own words, even with no draft to review yet.
   if (body.scam_language && body.scam_language.warning) {
     botSay("\u26a0\ufe0f " + body.scam_language.warning);
@@ -946,6 +956,7 @@ function handleDraft(res) {
   // 200: needing to ask is a normal conversational result, and a refusal is a
   // successful request whose answer is "no".
   if (body.status === "clarify") {
+    CURRENT.draftId = body.draft_id;               // the question's answer goes to it
     renderClarify(body);
     Voice.speak(body.question);
     return;
@@ -970,6 +981,7 @@ function handleDraft(res) {
   }
   const conf = body.requires_extra_confirmation ? (body.confirmation || {}) : null;
   if (body.kind === "contact_add") {
+    CURRENT.draftId = body.draft_id;
     CURRENT.plan = body.contact_add;
     CURRENT.kind = "contact_add";
     const rung = (body.risk && body.risk.rung) || "STANDARD";
@@ -983,6 +995,7 @@ function handleDraft(res) {
     return;
   }
   if (body.kind === "contact_edit") {
+    CURRENT.draftId = body.draft_id;
     CURRENT.plan = body.contact_change;
     CURRENT.kind = "contact_edit";
     const intro = el("div", "bubble",
@@ -993,6 +1006,7 @@ function handleDraft(res) {
     return;
   }
 
+  CURRENT.draftId = body.draft_id;
   CURRENT.plan = body.resolved_plan;
   CURRENT.kind = "payment";
   // The assistant's reply: what it worked out, built by the server from the
@@ -1315,10 +1329,15 @@ function paintFreeze(engaged) {
   if (btn) { btn.classList.toggle("on", engaged); btn.textContent = engaged ? "Frozen" : "Freeze"; }
 }
 
+// Paints the server's freeze state and returns it (null if it can't be read).
 async function refreshKillSwitch() {
   try {
-    paintFreeze(!!(await jget(API + "/api/killswitch?user_id=" + DEMO_USER)).engaged);
-  } catch (_) { /* the banner is a convenience; the server enforces the freeze */ }
+    const engaged = !!(await jget(API + "/api/killswitch?user_id=" + DEMO_USER)).engaged;
+    paintFreeze(engaged);
+    return engaged;
+  } catch (_) {       /* the banner is a convenience; the server enforces the freeze */
+    return null;
+  }
 }
 
 function wireKillSwitch() {
@@ -1339,8 +1358,14 @@ function wireKillSwitch() {
     }
     if (r.status !== 200) {
       // Never "frozen" unless the server says so: false assurance on a safety
-      // control is worse than an error.
-      refreshKillSwitch();
+      // control is worse than an error. And never "couldn't freeze" when it
+      // did (the freeze is recorded first, then the cleanup can fail): ask.
+      if (await refreshKillSwitch()) {
+        retireLiveCard();
+        botSay("Your payments are frozen. Something went wrong while cancelling requests "
+          + "waiting for approval, but none of them can be sent while you're frozen.");
+        return;
+      }
       showErr("Couldn't freeze your payments (" + (((r.json.detail || {}).error) || r.status
         || "no connection") + "). Try again.");
       return;

@@ -1425,11 +1425,13 @@ def kill_switch_state(user_id: str = Query(DEMO_USER_ID)):
     return {"user_id": user_id, "engaged": engaged is not None, "engaged_at": engaged}
 
 
-def _cancel_open_drafts(user_id: str, by: str) -> tuple[list[str], list[str]]:
+def _cancel_open_drafts(user_id: str, by: str) -> tuple[list[str], list[str], list[str]]:
     """Cancel every draft of this user that could still be signed, and every
-    pending hold. Returns (cancelled, already_sent): a payment that executed
-    while this ran is reported, never silently skipped."""
-    cancelled, sent = [], []
+    pending hold. Returns (cancelled, already_sent, failed): a payment that
+    executed while this ran is reported, never silently skipped, and so is a
+    draft that couldn't be cancelled (e.g. the ledger was locked) — one draft
+    failing doesn't stop the others, or turn the whole request into a 500."""
+    cancelled, sent, failed = [], [], []
     for draft_id in _drafts.open_ids(user_id):
         try:
             _close_draft(draft_id, "CANCELLED", AuditEntryType.DRAFT_CANCELLED, by=by)
@@ -1437,10 +1439,13 @@ def _cancel_open_drafts(user_id: str, by: str) -> tuple[list[str], list[str]]:
         except HTTPException as exc:
             if isinstance(exc.detail, dict) and exc.detail.get("already_executed"):
                 sent.append(draft_id)
+        except Exception:
+            logging.exception("could not cancel draft %s (%s)", draft_id, by)
+            failed.append(draft_id)
     # Holds whose drafts have already expired from memory.
     for draft_id in safety.cancel_user_holds(user_id):
         _audit.append(AuditEntryType.HOLD_CANCELLED, {"draft_id": draft_id, "by": by})
-    return cancelled, sent
+    return cancelled, sent, failed
 
 
 _kill_switch_lock = threading.Lock()     # in-memory stores are shared across request threads
@@ -1450,17 +1455,23 @@ _kill_switch_lock = threading.Lock()     # in-memory stores are shared across re
 def engage_kill_switch(req: KillSwitchRequest = KillSwitchRequest()):
     """Freeze. Everything in flight stops too: every draft that could still be
     signed is cancelled (its hold with it), and every signing challenge issued
-    to this user is revoked — so unfreezing later cannot revive an old card."""
+    to this user is revoked — so unfreezing later cannot revive an old card.
+
+    The freeze is on from its first line. A draft that then can't be cancelled
+    is reported (cancel_failed), not a 500: the frozen gateway refuses it
+    anyway, and the page mustn't say "couldn't freeze" about a freeze that
+    happened."""
     with _kill_switch_lock:
         newly = safety.engage_kill_switch(req.user_id, now=int(time.time()))
         revoked = _nonce_store.revoke(lambda draft_id: (
             (d := _drafts.get(draft_id)) is not None and d.user_id == req.user_id))
-        cancelled, sent = _cancel_open_drafts(req.user_id, by="kill switch")
+        cancelled, sent, failed = _cancel_open_drafts(req.user_id, by="kill switch")
     _audit.append(AuditEntryType.KILL_SWITCH_ENGAGED, {
         "user_id": req.user_id, "newly": newly, "drafts_cancelled": cancelled,
-        "already_sent": sent, "nonces_revoked": revoked})
+        "already_sent": sent, "cancel_failed": failed, "nonces_revoked": revoked})
     return {"engaged": True, "newly": newly, "drafts_cancelled": len(cancelled),
-            "already_sent": len(sent), "nonces_revoked": revoked}
+            "already_sent": len(sent), "cancel_failed": len(failed),
+            "nonces_revoked": revoked}
 
 
 # Unfreeze codes: at most this many per user per hour. Each code allows three
@@ -1503,7 +1514,12 @@ def release_kill_switch(req: KillSwitchRelease):
         # Unfreezing starts clean: anything drafted WHILE frozen is cancelled
         # too — its hold ran out during the freeze, so it would otherwise be
         # signable at once, with no cooling-off.
-        cancelled, sent = _cancel_open_drafts(req.user_id, by="unfreeze")
+        cancelled, sent, failed = _cancel_open_drafts(req.user_id, by="unfreeze")
+        if failed:
+            # One of them is still signable, with no cooling-off: stay frozen.
+            raise HTTPException(503, {
+                "error": "couldn't cancel what was asked for while frozen, so your "
+                         "payments are still frozen — try again", "engaged": True})
         if safety.release_kill_switch(req.user_id, now=int(time.time())):
             _audit.append(AuditEntryType.KILL_SWITCH_RELEASED, {
                 "user_id": req.user_id, "drafts_cancelled": cancelled})

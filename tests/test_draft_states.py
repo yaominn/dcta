@@ -306,3 +306,45 @@ def test_a_contact_edit_can_be_declined(client):
     d = _rename(client)
     assert client.post(f"/api/drafts/{d['draft_id']}/decline").status_code == 200
     assert _nonce(client, d["draft_id"]).status_code == 409
+
+
+def test_the_draft_store_survives_concurrent_requests(monkeypatch):
+    """Request threads share the store, and every access sweeps it. A put()
+    landing mid-sweep used to raise "dictionary changed size during
+    iteration": a 500, the kill switch's included."""
+    from backend.drafts import Draft, DraftStore
+    store = DraftStore(ttl_seconds=300)
+    now = time.time()
+    for draft_id, age in (("old", 301), ("live", 0)):
+        store._drafts[draft_id] = Draft(draft_id=draft_id, user_id="u_alice", transcript="",
+                                        intent_plan={}, created_at=now - age)
+    in_sweep, go = threading.Event(), threading.Event()
+    real = Draft.is_expired
+    paused = []
+
+    def slow(self, when, ttl):
+        if self.draft_id == "old" and not paused:     # the first sweep stops here
+            paused.append(True)
+            in_sweep.set()
+            go.wait(2)
+        return real(self, when, ttl)
+    monkeypatch.setattr(Draft, "is_expired", slow)
+    errors = []
+
+    def run(action):
+        try:
+            action()
+        except Exception as exc:
+            errors.append(exc)
+    sweeping = threading.Thread(target=run, args=(lambda: store.get("live"),))
+    sweeping.start()
+    assert in_sweep.wait(2)
+    adding = threading.Thread(target=run, args=(lambda: store.put(Draft(
+        draft_id="new", user_id="u_alice", transcript="", intent_plan={}, created_at=now)),))
+    adding.start()
+    adding.join(0.2)          # with the lock it waits for the sweep; without, it runs now
+    go.set()
+    sweeping.join(2)
+    adding.join(2)
+    assert errors == []
+    assert store.get("new") is not None and store.get("old") is None

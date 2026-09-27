@@ -748,20 +748,44 @@ def test_a_payee_that_is_gone_is_superseded(client):
         conn.close()
 
 
-def test_the_page_never_claims_a_freeze_or_unlocks_confirm_on_a_failure():
-    """Freeze and Cancel when the server can't be reached or refuses: the page
-    never shows "Frozen" unless the server says so, and a failed Cancel leaves
-    Confirm as locked as the hold has it."""
+@pytest.fixture(scope="module")
+def page():
+    """frontend/app.js under Node, driven through its safety controls
+    (tests/js/safety_runner.js)."""
     if not shutil.which("node"):
         pytest.skip("node is not installed")
     runner = Path(__file__).resolve().parent / "js" / "safety_runner.js"
-    out = json.loads(subprocess.run(["node", str(runner)], capture_output=True, text=True,
-                                    timeout=60, check=True).stdout)
-    assert out["freezeOffline"]["on"] is False and "no connection" in out["freezeOffline"]["error"]
-    assert out["freezeRefused"]["on"] is False and "boom" in out["freezeRefused"]["error"]
-    assert out["cancelOffline"]["cancelDisabled"] is False        # they can try again
-    assert out["cancelOffline"]["signDisabled"] is True           # the hold still locks Confirm
-    assert "no connection" in out["cancelOffline"]["error"]
+    return json.loads(subprocess.run(["node", str(runner)], capture_output=True, text=True,
+                                     timeout=60, check=True).stdout)
+
+
+def test_a_card_locks_confirm_from_the_moment_it_is_shown(page):
+    """The gate used to be applied while the card was being built, before it
+    was on the page, where "#sign" doesn't exist yet: Confirm started enabled
+    through a hold. Contact cards had no gate at all, so a failed Cancel
+    unlocked Confirm before the phone code."""
+    assert page["heldCard"]["signDisabled"] is True
+    assert page["contactCard"] == {"atRender": True, "afterFailedCancel": True, "afterCode": False}
+
+
+def test_cancel_acts_on_the_card_it_is_on(page):
+    """A contacts list or a refusal in between used to re-point the held
+    payment's Cancel at another draft (or none)."""
+    assert page["cancelTarget"]["draftId"] == "d-held"
+    assert page["cancelTarget"]["url"].endswith("/api/drafts/d-held/decline")
+
+
+def test_the_page_never_claims_a_freeze_or_unlocks_confirm_on_a_failure(page):
+    """Freeze and Cancel when the server can't be reached or refuses: the page
+    shows "Frozen" exactly when the server says so, and a failed Cancel leaves
+    Confirm as locked as the hold has it."""
+    assert page["freezeOffline"]["on"] is False and "no connection" in page["freezeOffline"]["error"]
+    assert page["freezeRefused"]["on"] is False and "boom" in page["freezeRefused"]["error"]
+    half = page["freezeHalfDone"]                       # recorded, but its cleanup failed
+    assert half["on"] is True and half["error"] is None and "are frozen" in half["said"]
+    assert page["cancelOffline"]["cancelDisabled"] is False       # they can try again
+    assert page["cancelOffline"]["signDisabled"] is True          # the hold still locks Confirm
+    assert "no connection" in page["cancelOffline"]["error"]
 
 
 def test_the_same_payload_keeps_its_release_time(client):
@@ -949,6 +973,39 @@ def test_unfreezing_cancels_drafts_made_while_frozen(client):
                for e in _audit_entries("DRAFT_CANCELLED"))
     before = _balance()
     assert _execute(client, d)["accepted"] is False and _balance() == before
+
+
+def _ledger_locked(*args, **kwargs):
+    raise sqlite3.OperationalError("database is locked")
+
+
+def test_a_freeze_that_cannot_cancel_a_draft_is_still_a_freeze(client, monkeypatch):
+    """The freeze is recorded first. A draft that then can't be cancelled (the
+    ledger is locked) is reported, not a 500: the frozen gateway refuses it
+    anyway, and the freeze is audited."""
+    from backend import main
+    d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    monkeypatch.setattr(main, "_close_draft", _ledger_locked)
+    r = client.post("/api/killswitch")
+    assert r.status_code == 200
+    assert r.json()["engaged"] is True and r.json()["cancel_failed"] == 1
+    assert any(e.get("cancel_failed") == [d["draft_id"]]
+               for e in _audit_entries("KILL_SWITCH_ENGAGED"))
+    before = _balance()
+    assert _execute(client, d)["rejection"] == "KILL_SWITCH" and _balance() == before
+
+
+def test_unfreezing_stays_frozen_if_a_draft_made_while_frozen_cannot_be_cancelled(
+        client, monkeypatch):
+    """Left open, that draft would be signable at once, with no cooling-off."""
+    from backend import main
+    client.post("/api/killswitch")
+    client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"})
+    client.post("/api/killswitch/release/begin")
+    monkeypatch.setattr(main, "_close_draft", _ledger_locked)
+    r = client.post("/api/killswitch/release", json={"code": _newest_code()})
+    assert r.status_code == 503 and r.json()["detail"]["engaged"] is True
+    assert client.get("/api/killswitch").json()["engaged"] is True
 
 
 def test_the_kill_switch_labels_its_audit_entries(client):

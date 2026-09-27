@@ -28,6 +28,7 @@ reached validation, so nothing auditable is lost when the cache evaporates.
 from __future__ import annotations
 
 import secrets
+import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -102,6 +103,11 @@ class DraftStore:
     def __init__(self, ttl_seconds: int = MAX_AUTH_WINDOW_S):
         self.ttl = ttl_seconds
         self._drafts: dict[str, Draft] = {}
+        # Request threads share this dict, and every access sweeps it: without
+        # the lock, two sweeps deleting the same expired draft (KeyError), or a
+        # put() mid-sweep ("dictionary changed size"), turned a request into a
+        # 500 — the kill switch's included.
+        self._lock = threading.Lock()
 
     @staticmethod
     def new_id() -> str:
@@ -109,13 +115,15 @@ class DraftStore:
         return secrets.token_urlsafe(16)
 
     def put(self, draft: Draft) -> Draft:
-        self._sweep()
-        self._drafts[draft.draft_id] = draft
+        with self._lock:
+            self._sweep()
+            self._drafts[draft.draft_id] = draft
         return draft
 
     def get(self, draft_id: str) -> Draft | None:
-        self._sweep()
-        return self._drafts.get(draft_id)
+        with self._lock:
+            self._sweep()
+            return self._drafts.get(draft_id)
 
     def executable(self, draft_id: str, *, kind: str, submitted_hash: str):
         """None if THIS payload may execute now; else (rejection, reason).
@@ -153,15 +161,18 @@ class DraftStore:
     def open_ids(self, user_id: str) -> list[str]:
         """The user's drafts that could still be signed — every "ready" one,
         including those on a hold or waiting for a phone code."""
-        self._sweep()
-        return [k for k, d in list(self._drafts.items())     # a snapshot: other
-                if d.user_id == user_id and d.status == "ready"]  # requests may add drafts
+        with self._lock:
+            self._sweep()
+            return [k for k, d in self._drafts.items()
+                    if d.user_id == user_id and d.status == "ready"]
 
     def _sweep(self) -> None:
+        """Drop expired drafts. The caller holds the lock."""
         now = time.time()
         for k in [k for k, d in self._drafts.items() if d.is_expired(now, self.ttl)]:
             del self._drafts[k]
 
     def __len__(self) -> int:
-        self._sweep()
-        return len(self._drafts)
+        with self._lock:
+            self._sweep()
+            return len(self._drafts)
