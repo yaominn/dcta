@@ -139,14 +139,18 @@ def test_a_draft_the_app_never_created_gets_no_nonce_and_cannot_execute(client):
     assert _balance() == before
 
 
-def test_an_expired_draft_cannot_execute(client):
-    """Past the draft's window it is swept; its payload no longer binds."""
+def test_an_expired_draft_cannot_execute(client, monkeypatch):
+    """Past the draft's window it is swept; its payload no longer binds. A
+    draft lives as long as the signed payload it offers (an answered question
+    re-resolves it), so "expired" means both: an hour old, and 5 minutes on."""
     from backend.main import _drafts
     d = _draft(client)
     nonce = _nonce(client, d["draft_id"]).json()["nonce"]
     _drafts.get(d["draft_id"]).created_at -= 3600              # an hour old
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 301)    # past its payload's window
     out = _submit(d["resolved_plan"], nonce, client)
-    assert out["rejection"] == "STATE"
+    assert out["rejection"] == "EXPIRED"
     assert _drafts.get(d["draft_id"]) is None
 
 

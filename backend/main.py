@@ -1037,8 +1037,10 @@ _FLOOR_WARNING = ("This payment looked riskier earlier in this request, so the e
 
 def _hold_seconds() -> int:
     """SCAM_HOLD_SECONDS, capped so the hold ends with time left to sign: the
-    draft, its signed expires_at and the phone code all last MAX_AUTH_WINDOW_S
-    (5 min). A longer hold needs longer-lived drafts first."""
+    hold starts with the payload it holds, and that payload's signed
+    expires_at and the phone code both last MAX_AUTH_WINDOW_S (5 min) from
+    then (the draft lives as long as its payload). A longer hold needs
+    longer-lived payloads first."""
     return max(0, min(settings.scam_hold_seconds, MAX_AUTH_WINDOW_S - 60))
 
 

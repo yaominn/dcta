@@ -384,9 +384,7 @@ def load_scam_context(user_id: str, *, db_path=None, now: int, transcript: str =
                       recent_change_hours: int = 24, cooling_hours: int = 12) -> ScamContext:
     conn = connect(db_path or DB_PATH)
     try:
-        payee_ids = [r["id"] for r in conn.execute("SELECT id FROM payees WHERE user_id=?",
-                                                   (user_id,))]
-        dests = {pid: _destinations.current(conn, pid) for pid in payee_ids}
+        dests = _destinations.for_user(conn, user_id)
         history = [dict(r) for r in conn.execute(
             "SELECT payee_id, leg_type, amount, ts, dest_version FROM transaction_history "
             "WHERE user_id=?", (user_id,))]

@@ -38,7 +38,7 @@ from backend.gateway.signer import MockSigner
 from backend.gateway.stepup import StepUpStore
 from backend.data import destinations
 from backend.data.db import connect
-from backend.gateway.executor import AlreadyExecuted, MockExecutor
+from backend.gateway.executor import AlreadyExecuted, DestinationChanged, MockExecutor
 from backend.policy import safety, scam
 
 # Outcomes recorded for a draft that ended WITHOUT running.
@@ -55,25 +55,23 @@ _FROZEN_CONTACTS = ("your payments are frozen, so contacts can't be added or cha
                     "nothing was saved. Unfreeze them with a code on your phone first")
 
 
+_SUPERSEDED = "the payee's payment details changed after this was drafted — nothing was sent"
+
+
 def destination_refusal(plan: ResolvedPlan, db_path) -> tuple[str, str] | None:
     """(rejection, reason) for a transfer that must not run, else None. A
     transfer signs WHERE its money goes: unbound, or no longer the payee's
     current destination (a new number since the draft), and it does not run.
     The signing-challenge endpoint asks the same question, so the page never
     asks for a fingerprint this would refuse."""
+    if any(leg.type == "TRANSFER"
+           and (leg.destination_version is None or leg.destination_hash is None)
+           for leg in plan.plan):
+        return ("DESTINATION", "this transfer is not bound to a destination — nothing was sent")
     conn = connect(db_path)
     try:
-        for leg in plan.plan:
-            if leg.type != "TRANSFER":
-                continue
-            if leg.destination_version is None or leg.destination_hash is None:
-                return ("DESTINATION", "this transfer is not bound to a destination — "
-                                       "nothing was sent")
-            cur = destinations.current(conn, leg.payee_id)
-            if (cur is None or cur.version != leg.destination_version
-                    or cur.routing_hash != leg.destination_hash):
-                return ("SUPERSEDED", "the payee's payment details changed after this "
-                                      "was drafted — nothing was sent")
+        if destinations.superseded(conn, plan):
+            return ("SUPERSEDED", _SUPERSEDED)
     finally:
         conn.close()
     return None
@@ -170,7 +168,8 @@ class Gateway:
         # 3d-3f. scam protection: the kill switch, the signed destination, and
         #        the scam score's hold / step-up — enforced HERE, where money
         #        moves, whatever the page showed or skipped.
-        refused = self._scam_protection(resolved_plan, draft_id, p_hash)
+        owner = owner_of(resolved_plan, db_path=self.executor.db_path)
+        refused = self._scam_protection(resolved_plan, draft_id, p_hash, owner)
         if refused is not None:
             return self._reject(draft_id, p_hash, *refused)
 
@@ -178,7 +177,8 @@ class Gateway:
         #    from the ACCOUNT ROWS being debited, never from a field in the
         #    request, so a caller cannot nominate whose limits apply to them.
         if self.policy_db_path is not None:
-            owner = owner_of(resolved_plan, db_path=self.policy_db_path)
+            if self.policy_db_path != self.executor.db_path:
+                owner = owner_of(resolved_plan, db_path=self.policy_db_path)
             if owner is None:
                 return self._reject(draft_id, p_hash, "POLICY",
                                     "cannot determine the owner of the accounts "
@@ -205,6 +205,8 @@ class Gateway:
             result = self.executor.execute(resolved_plan, payload_hash=p_hash)
         except AlreadyExecuted as exc:     # lost a race to a concurrent submit
             return self._already_final(draft_id, p_hash, exc.prior)
+        except DestinationChanged:         # a new number landed after step 3e
+            return self._reject(draft_id, p_hash, "SUPERSEDED", _SUPERSEDED)
         if self.step_up is not None:
             self.step_up.consume(draft_id)
         safety.release_hold(draft_id, db_path=self.executor.db_path)   # a served hold is done
@@ -379,11 +381,12 @@ class Gateway:
         return any(safety.kill_switch_engaged(u, db_path=self.executor.db_path) is not None
                    for u in users if u)
 
-    def _scam_protection(self, plan: ResolvedPlan, draft_id: str, p_hash: str):
-        """(rejection, reason) or None. Reads the ledger, never the request."""
+    def _scam_protection(self, plan: ResolvedPlan, draft_id: str, p_hash: str,
+                         owner: str | None):
+        """(rejection, reason) or None. Reads the ledger, never the request:
+        `owner` is derived from the account rows being debited."""
         db = self.executor.db_path
         now = int(time.time())
-        owner = owner_of(plan, db_path=db)
 
         # The kill switch: the user froze all outgoing payments.
         if owner and safety.kill_switch_engaged(owner, db_path=db) is not None:

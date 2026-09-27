@@ -393,6 +393,60 @@ def test_superseded_names_no_one(client):
     assert not re.search(r"mom|9123|8123|4567", out["reason"], re.I), out["reason"]
 
 
+def _give_mom_a_new_number():
+    """A contact edit, as the executor writes it — for races the API can't stage."""
+    conn = connect()
+    try:
+        conn.execute("UPDATE payees SET phone='+65 8123 4567', last4='4567', "
+                     "dest_version=dest_version+1, dest_changed_at=? WHERE id='payee_17'",
+                     (int(time.time()),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_a_number_change_racing_the_payment_still_stops_it(client, monkeypatch):
+    """The change lands AFTER the gateway checked the destination, BEFORE the
+    debit: the executor asks again under its write lock, and nothing moves."""
+    from backend.gateway.gateway import Gateway
+    d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    checked = Gateway._scam_protection
+
+    def check_then_change(self, *a, **k):
+        out = checked(self, *a, **k)
+        _give_mom_a_new_number()
+        return out
+
+    monkeypatch.setattr(Gateway, "_scam_protection", check_then_change)
+    before = _balance()
+    out = _execute(client, d)
+    assert out["rejection"] == "SUPERSEDED" and _balance() == before
+    from backend.main import _executor
+    assert _executor.prior_execution(d["draft_id"]) is None        # not spent, not recorded
+
+
+def test_the_executor_refuses_a_superseded_transfer_itself(client):
+    from backend.gateway.executor import DestinationChanged
+    from backend.main import _executor
+    d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    plan = ResolvedPlan.model_validate(d["resolved_plan"])
+    _give_mom_a_new_number()
+    before = _balance()
+    with pytest.raises(DestinationChanged):
+        _executor.execute(plan, payload_hash=payload_hash(plan))
+    assert _balance() == before and _executor.prior_execution(d["draft_id"]) is None
+
+
+def test_one_query_loads_every_destination(client):
+    conn = connect()
+    try:
+        ids = [r[0] for r in conn.execute("SELECT id FROM payees WHERE user_id='u_alice'")]
+        assert destinations.for_user(conn, "u_alice") == {
+            i: destinations.current(conn, i) for i in ids}
+    finally:
+        conn.close()
+
+
 def test_the_new_number_is_what_the_card_and_the_phone_name(client):
     """Not the old, trusted "Mom ··3310" next to a changed number."""
     from backend.main import _phone
@@ -572,6 +626,35 @@ def test_the_same_payload_keeps_its_release_time(client):
                               payload_hash="p1") == first
     assert safety.create_hold("d-same", "u_alice", seconds=30, now=now + 20,
                               payload_hash="p2") == now + 50
+
+
+def test_a_question_answered_late_still_leaves_time_to_sign(client):
+    """The question sat unanswered for 280 s; the 30 s hold starts at the
+    answer, so it ends past the 5 minutes since the first words. The draft must outlive the hold — it lives as long as the signed
+    payload it offers, not 5 minutes from the first words."""
+    from backend.main import _drafts
+    d = client.post("/api/drafts", json={"transcript": "pay john 1000"}).json()
+    _drafts.get(d["draft_id"]).created_at -= 280
+    held = client.post(f"/api/drafts/{d['draft_id']}/clarify",
+                       json={"field": d["field"], "choice_id": "payee_22"}).json()
+    assert held["scam"]["outcome"] == "HOLD"
+    _drafts.get(d["draft_id"]).created_at -= 30             # ... and the hold ran its course
+    _release_hold_now(d["draft_id"])
+    if held["requires_extra_confirmation"]:
+        client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
+    assert _execute(client, held)["accepted"] is True
+
+
+def test_a_draft_still_waiting_on_a_question_expires_on_time():
+    from backend.drafts import Draft
+    now = time.time()
+    waiting = Draft(draft_id="d", user_id="u_alice", transcript="pay john 5",
+                    intent_plan={}, created_at=now - 301)
+    assert waiting.is_expired(now, 300)
+    ready = Draft(draft_id="d", user_id="u_alice", transcript="pay mom 50", intent_plan={},
+                  created_at=now - 301, resolved_plan=_plan(_mom(5000)))
+    assert not ready.is_expired(now, 300)                    # its payload is still signable
+    assert ready.is_expired(now + 301, 300)                  # and not a moment longer
 
 
 def test_the_hold_is_capped_so_it_can_still_be_signed(client, monkeypatch):

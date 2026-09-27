@@ -207,8 +207,9 @@ destination (its PayNow mobile, in the demo) is versioned: a new number bumps
 the version and records when. A transfer **signs** the version, the masked
 number the user saw (`+65 9123 ••10`, shown on the card) and a hash of the full
 routing value. A transfer drafted for the old number is refused as
-`SUPERSEDED` (before the fingerprint is even asked for); an unbound transfer
-never runs. After a number change the card, the phone code and the assistant's
+`SUPERSEDED` (before the fingerprint is even asked for, and again by the
+executor under its write lock, so a change landing mid-payment can't slip
+through); an unbound transfer never runs. After a number change the card, the phone code and the assistant's
 reply all name the new number ("Mom ··4567", "your first payment to Mom at this
 number"), never the old, trusted one.
 
@@ -239,7 +240,9 @@ payment (`RESCORED` — cancel and ask again). The hour is judged when the user
 asked, so a hold that runs past midnight doesn't make the payment a "night-time"
 one. A hold covers the payment it was shown for: if an answer changes the payee, the
 wait starts again. `SCAM_HOLD_SECONDS` sets the length (30 s by default), **capped at 240 s**:
-a draft lasts 5 minutes, and a held one must still be signable when the hold ends.
+a payment is signable for 5 minutes from when it's drafted (or from the answer
+that completed it — the draft lives as long as its payload), and a held one
+must still be signable when the hold ends.
 
 **Phrase flags** on the user's own words — one list, shared with the
 add-a-contact flow (`backend/policy/new_contact.py`): a "safe account", an

@@ -90,7 +90,12 @@ class Draft:
         return self.resolved_plan if self.kind == "payment" else self.resolved_change
 
     def is_expired(self, now: float, ttl: int) -> bool:
-        return (now - self.created_at) > ttl
+        """TTL from creation — but never while the payload it offers is still
+        signable. Answering a question re-resolves the payload (a fresh signed
+        window, and any safety hold starts then), so a draft that waited on a
+        question must not vanish before its hold ends."""
+        expires_at = getattr(self.payload, "expires_at", None)
+        return (now - self.created_at) > ttl and (expires_at is None or now > expires_at)
 
 
 class DraftStore:

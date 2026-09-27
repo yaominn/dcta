@@ -26,6 +26,7 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
+from backend.data import destinations
 from backend.data.db import DB_PATH, connect
 from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
@@ -42,6 +43,11 @@ class AlreadyExecuted(Exception):
     def __init__(self, prior: dict):
         self.prior = prior
         super().__init__(f"draft {prior['draft_id']} already executed")
+
+
+class DestinationChanged(Exception):
+    """A transfer's payee got a new destination after the gateway checked it.
+    Nothing ran, and the draft was not spent (its claim rolled back)."""
 
 
 class MockExecutor:
@@ -112,6 +118,12 @@ class MockExecutor:
         aborted = False
         try:
             self._claim(conn, plan.draft_id, "payment", payload_hash)
+            # Asked again HERE, under the claim's write lock: a number change
+            # that landed after the gateway's check cannot slip in before the
+            # debit, and the money never goes to a destination nobody signed.
+            if destinations.superseded(conn, plan):
+                conn.rollback()
+                raise DestinationChanged(plan.draft_id)
             for leg in plan.plan:
                 if aborted:
                     results.append({"id": leg.id, "type": leg.type, "status": "BLOCKED"})
