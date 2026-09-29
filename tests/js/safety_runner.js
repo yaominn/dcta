@@ -70,7 +70,12 @@ const said = [];
 const env = {
   window: { addEventListener() {} },
   document,
-  navigator: {},
+  navigator: {                        // a passkey that signs anything
+    credentials: { get: async () => ({ id: "cred", type: "public-key",
+      response: { authenticatorData: new ArrayBuffer(1), clientDataJSON: new ArrayBuffer(1),
+                  signature: new ArrayBuffer(1), userHandle: null } }) },
+  },
+  canonicalJson: (v) => JSON.stringify(v),   // frontend/canonical.js isn't loaded here
   fetch: (...args) => respond(...args),
   confirm: () => true,
   requestAnimationFrame: () => 0,
@@ -80,7 +85,7 @@ const env = {
 const app = new Function(...Object.keys(env), SRC + `
   showErr = (msg) => errors.push(msg);
   botSay = (text) => { said.push(text); };
-  return { wireKillSwitch, onDecline, handleDraft, typedName, CURRENT };`)(...Object.values(env));
+  return { wireKillSwitch, onDecline, onSign, handleDraft, typedName, CURRENT };`)(...Object.values(env));
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 const sign = () => document.getElementById("sign");
 const now = Math.floor(Date.now() / 1000);
@@ -145,11 +150,24 @@ const heldPayment = { status: 200, json: {
   Object.assign(stepUp.json, { draft_id: "d-step", requires_extra_confirmation: true,
                                confirmation: { reasons: [] } });
   Object.assign(stepUp.json.scam, { outcome: "HOLD_STEP_UP", score: 8, confirm_name: "Mom" });
+  stepUp.json.resolved_plan.draft_id = "d-step";
   app.handleDraft(stepUp);
   document.getElementById("name-check").value = " mom";
   const live = app.typedName();
+  let signed = null;
+  respond = async (url, opts) => {
+    if (url.includes("/api/auth/nonce")) return reply(200, { nonce: "n1", draft_id: "d-step" });
+    if (url.includes("/api/gateway/")) signed = { url, ...JSON.parse(opts.body) };
+    return reply(200, { accepted: false, rejection: "STATE", reason: "stub" });
+  };
+  Object.assign(app.CURRENT, { credentialIds: ["AAAA"], rpId: "localhost" });
+  await app.onSign();
+  out.signedBody = signed && { url: signed.url, confirm_name: signed.confirm_name,
+                               draft_id: signed.resolved_plan.draft_id };
   app.handleDraft(heldPayment);
   out.typedName = { live, afterNewCard: app.typedName() };
+  errors.length = 0;
+  said.length = 0;
 
   // Freeze with no connection: never shown as frozen.
   app.wireKillSwitch();

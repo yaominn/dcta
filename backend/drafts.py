@@ -158,10 +158,12 @@ class DraftStore:
         draft = self.get(draft_id)
         return draft.scam_floor if draft is not None else None
 
-    def confirm_name_of(self, draft_id: str) -> str | None:
-        """The payee name the draft's card asked the user to type (HOLD_STEP_UP), or None."""
+    def confirm_name_of(self, draft_id: str, submitted_hash: str) -> str | None:
+        """The payee name the card asked the user to type for THIS payload
+        (HOLD_STEP_UP), or None — including when it was worked out for another."""
         draft = self.get(draft_id)
-        return (draft.scam or {}).get("confirm_name") if draft is not None else None
+        stored = (draft.scam or {}) if draft is not None else {}
+        return stored.get("confirm_name") if stored.get("payload_hash") == submitted_hash else None
 
     def open_ids(self, user_id: str) -> list[str]:
         """The user's drafts that could still be signed — every "ready" one,

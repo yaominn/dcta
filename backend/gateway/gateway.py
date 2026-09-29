@@ -48,7 +48,7 @@ from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
 from backend.policy import (Decision, contact_change_refusal, contact_change_step_up,
                             evaluate, load_context, owner_of)
-from backend.policy.new_contact import required_at_gateway
+from backend.policy.new_contact import is_reported, required_at_gateway
 
 
 _FROZEN_CONTACTS = ("your payments are frozen, so contacts can't be added or changed — "
@@ -56,14 +56,15 @@ _FROZEN_CONTACTS = ("your payments are frozen, so contacts can't be added or cha
 
 
 _SUPERSEDED = "the payee's payment details changed after this was drafted — nothing was sent"
+_REPORTED_PAYEE = "the payee's number has been reported for scams — nothing was sent"
 
 
 def destination_refusal(plan: ResolvedPlan, db_path) -> tuple[str, str] | None:
     """(rejection, reason) for a transfer that must not run, else None. A
-    transfer signs WHERE its money goes: unbound, or no longer the payee's
-    current destination (a new number since the draft), and it does not run.
-    The signing-challenge endpoint asks the same question, so the page never
-    asks for a fingerprint this would refuse."""
+    transfer signs WHERE its money goes: unbound, no longer the payee's
+    current destination (a new number since the draft), or a number on the
+    scam list, and it does not run. The signing-challenge endpoint asks the
+    same question, so the page never asks for a fingerprint this would refuse."""
     if any(leg.type == "TRANSFER"
            and (leg.destination_version is None or leg.destination_hash is None)
            for leg in plan.plan):
@@ -72,6 +73,15 @@ def destination_refusal(plan: ResolvedPlan, db_path) -> tuple[str, str] | None:
     try:
         if destinations.superseded(conn, plan):
             return ("SUPERSEDED", _SUPERSEDED)
+        # A payee reported for scams since it was saved (or drafted). Asked
+        # here, before any hold, phone code or name, so nothing invites the
+        # user on towards a payment that can never run. The policy engine's
+        # reported_number rule refuses it when drafted.
+        payees = [leg.payee_id for leg in plan.plan if leg.type == "TRANSFER"]
+        if payees and any(is_reported(r["phone"]) for r in conn.execute(
+                f"SELECT phone FROM payees WHERE id IN ({','.join('?' * len(payees))})",
+                payees)):
+            return ("REPORTED", _REPORTED_PAYEE)
     finally:
         conn.close()
     return None
@@ -444,9 +454,9 @@ class Gateway:
         if outcome == scam.HOLD_STEP_UP:
             if not (self.step_up is not None and self.step_up.is_confirmed(draft_id, p_hash)):
                 return ("CONFIRMATION", "this payment needs the code sent to your phone first")
-            # The name the card asked for (the draft's), else the payee the
-            # risk points at now. A name the page never collected fails here.
-            expected = (getattr(self.drafts, "confirm_name_of", lambda _d: None)(draft_id)
+            # The name the card asked for with this payload, else the payee
+            # the risk points at now. A name the page never collected fails here.
+            expected = (getattr(self.drafts, "confirm_name_of", lambda *_: None)(draft_id, p_hash)
                         or assessment.riskiest_payee)
             if expected and not scam.name_confirmed(confirm_name, expected):
                 return ("CONFIRMATION", "this payment needs the payee's name typed in "

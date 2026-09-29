@@ -30,12 +30,10 @@ def load_context(user_id: str, *, db_path=None, now: int | None = None) -> Polic
             "SELECT payee_id, leg_type, amount, ts FROM transaction_history WHERE user_id=?",
             (user_id,))]
         now = int(time.time()) if now is None else int(now)
-        holds = {r["id"]: r["hold_until"] for r in conn.execute(
-            "SELECT id, hold_until FROM payees WHERE user_id=? AND hold_until > ?",
-            (user_id, now))}
-        reported = frozenset(r["id"] for r in conn.execute(
-            "SELECT id, phone FROM payees WHERE user_id=?", (user_id,))
-            if is_reported(r["phone"]))
+        payees = conn.execute("SELECT id, phone, hold_until FROM payees WHERE user_id=?",
+                              (user_id,)).fetchall()
+        holds = {r["id"]: r["hold_until"] for r in payees if (r["hold_until"] or 0) > now}
+        reported = frozenset(r["id"] for r in payees if is_reported(r["phone"]))
     finally:
         conn.close()
     return PolicyContext(

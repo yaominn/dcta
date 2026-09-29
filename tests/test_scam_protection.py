@@ -548,10 +548,23 @@ def test_hold_step_up_needs_the_name_typed_at_the_gateway(client):
 
 
 def test_the_gateway_compares_the_name_as_the_card_does():
-    """buildNameCheck in frontend/app.js: trimmed, case-insensitive, nothing else."""
+    """buildNameCheck in frontend/app.js: trimmed as JavaScript trims (a
+    byte-order mark too, which str.strip() keeps), case-insensitive."""
     assert scam.name_confirmed(" MOM ", "Mom") and scam.name_confirmed("mom", "Mom")
+    assert scam.name_confirmed("\ufeffMom\ufeff\n", "Mom")
     assert not scam.name_confirmed("Mo", "Mom") and not scam.name_confirmed("Mum", "Mom")
     assert not scam.name_confirmed(None, "Mom") and not scam.name_confirmed("", "Mom")
+
+
+def test_the_name_to_type_belongs_to_the_payload_it_was_shown_for():
+    """A re-run that fails before its payload is kept leaves the card's older
+    payload in place: the gateway must not ask for the newer run's name."""
+    from backend.drafts import Draft, DraftStore
+    store = DraftStore()
+    store.put(Draft(draft_id="d1", user_id="u_alice", transcript="", intent_plan={},
+                    created_at=time.time(), scam={"confirm_name": "Mom", "payload_hash": "h1"}))
+    assert store.confirm_name_of("d1", "h1") == "Mom"
+    assert store.confirm_name_of("d1", "h2") is None and store.confirm_name_of("gone", "h1") is None
 
 
 def _add_passkeys_now():
@@ -611,7 +624,8 @@ def test_a_lower_score_now_does_not_lift_the_phone_code(client):
     assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     _age_moms_number()
     _release_hold_now(d["draft_id"])
-    assert _execute(client, d)["rejection"] == "CONFIRMATION"
+    out = _execute(client, d, name="Mom")
+    assert out["rejection"] == "CONFIRMATION" and "code" in out["reason"]
 
 
 def test_a_clarification_does_not_lower_the_safeguards(client):
@@ -793,6 +807,9 @@ def test_only_the_live_card_s_typed_name_goes_to_the_gateway(page):
     """The name travels with the signed payment, from the card on screen: an
     older card's box, further up the conversation, is never read."""
     assert page["typedName"] == {"live": {"confirm_name": " mom"}, "afterNewCard": {}}
+    sent = page["signedBody"]
+    assert sent["url"].endswith("/api/gateway/execute-webauthn")
+    assert sent["confirm_name"] == " mom" and sent["draft_id"] == "d-step"
 
 
 def test_a_card_locks_confirm_from_the_moment_it_is_shown(page):
@@ -902,6 +919,7 @@ def test_an_unbound_transfer_never_runs(client):
 def test_a_number_on_the_scam_list_matches_however_it_is_written():
     from backend.policy.new_contact import is_reported
     assert is_reported("+65 8888 1234") and is_reported("6588881234") and is_reported("+65 8888-1234")
+    assert is_reported("8888 1234") and is_reported("88881234")         # local, as typed
     assert not is_reported("+65 9123 3310") and not is_reported("") and not is_reported(None)
 
 
@@ -918,13 +936,25 @@ def test_a_payee_reported_after_it_was_saved_is_never_paid(client, monkeypatch):
     d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     assert d["status"] == "ready" and d["scam"]["outcome"] == "ALLOW"
     _report(monkeypatch, "6591233310")
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and nonce.json()["detail"]["rejection"] == "REPORTED"
     before = _balance()
     out = _execute(client, d)
-    assert out["rejection"] == "POLICY" and "reported for scams" in out["reason"]
+    assert out["rejection"] == "REPORTED" and "reported for scams" in out["reason"]
     assert _balance() == before
     again = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     assert again["status"] == "blocked" and "resolved_plan" not in again
     assert any("reported for scams" in r and "1799" in r for r in again["reasons"])
+
+
+def test_a_reported_payee_is_refused_before_the_hold_code_or_name(client, monkeypatch):
+    """Nothing asks the user to wait, find a code or type a name for a
+    payment that can never run."""
+    _change_moms_number(client)
+    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    assert d["scam"]["outcome"] == "HOLD_STEP_UP"
+    _report(monkeypatch, "6581234567")
+    assert _execute(client, d)["rejection"] == "REPORTED"
 
 
 def _moms_phone():
@@ -954,6 +984,8 @@ def test_the_gateway_refuses_a_change_to_a_number_reported_after_drafting(client
     assert d["status"] == "ready"
     client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
     _report(monkeypatch, "6581234567")
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and "reported for scams" in nonce.json()["detail"]["error"]
     ch = ResolvedContactChange.model_validate(d["contact_change"])
     n = _nonce_store.issue(ch.draft_id)
     out = client.post("/api/contacts/apply", json={

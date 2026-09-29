@@ -91,11 +91,16 @@ def rose_past_drafted(drafted: str | None, fresh: str) -> bool:
             and _RANK[fresh] > _RANK.get(drafted, 0))
 
 
+# JavaScript's String.trim(): whitespace, and the byte-order mark that
+# Python's str.strip() leaves in place.
+_TRIM = re.compile(r"^[\s\ufeff]+|[\s\ufeff]+$")
+
+
 def name_confirmed(typed: str | None, expected: str) -> bool:
     """HOLD_STEP_UP's type-the-payee's-name check, as the gateway enforces it.
     The same comparison as the card's (buildNameCheck in frontend/app.js) —
     trimmed, case-insensitive — so a name the card accepts is never refused."""
-    return (typed or "").strip().lower() == expected.lower()
+    return _TRIM.sub("", typed or "").lower() == expected.lower()
 
 
 def outcome_for(score: int) -> str:

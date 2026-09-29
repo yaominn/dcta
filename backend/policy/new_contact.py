@@ -37,17 +37,26 @@ from dataclasses import dataclass, field
 # MOCK: a stand-in for a scam-number feed (ScamShield in Singapore). A real
 # deployment would query the feed; the demo needs one number that trips it.
 REPORTED_NUMBERS = frozenset({"+65 8888 1234", "+65 9999 1234"})
-_REPORTED_DIGITS = frozenset(re.sub(r"\D", "", n) for n in REPORTED_NUMBERS)
 REPORTED_REASON = "this number has been reported for scams"
 
 
+def _international_digits(phone: str | None) -> str:
+    """"+65 8888 1234", "6588881234" and "8888 1234" -> "6588881234". Eight
+    digits are a local Singapore number (resolver/contacts.normalize_phone)."""
+    digits = re.sub(r"\D", "", phone or "")
+    return "65" + digits if len(digits) == 8 else digits
+
+
+_REPORTED_DIGITS = frozenset(_international_digits(n) for n in REPORTED_NUMBERS)
+
+
 def is_reported(phone: str | None) -> bool:
-    """Whether this number is on the scam-number feed. Compared by digits, so
-    a number stored as "+65 8888 1234" and one typed as "6588881234" match.
+    """Whether this number is on the scam-number feed, however it is written.
     Asked wherever a number can become a destination — adding a contact,
-    changing one's number — and again before every payment (policy/context.py):
-    the feed changes, so a contact saved last month can be reported today."""
-    return re.sub(r"\D", "", phone or "") in _REPORTED_DIGITS
+    changing one's number — and again before every payment: the feed changes,
+    so a contact saved last month can be reported today."""
+    return _international_digits(phone) in _REPORTED_DIGITS
+
 
 LARGE_PENDING_CENTS = 100_000      # $1,000: a first payment this big is a strong sign
 # Wording with no innocent reading when saving a payee. Together with the LLM's

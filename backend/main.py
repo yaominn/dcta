@@ -19,7 +19,7 @@ import time
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from backend.config import settings
 from backend.data.db import DB_PATH, get_conn, migrate
@@ -44,7 +44,8 @@ from backend.agent import (ParseFailure, ProviderUnavailable, assess_scam_risk,
 from backend.models.contacts import (ContactAddPlan, ContactEditPlan, ResolvedContactAdd,
                                      ResolvedContactChange)
 from backend.models.schemas import MAX_AUTH_WINDOW_S
-from backend.policy.new_contact import NewContactFacts, decide as decide_new_contact
+from backend.policy.new_contact import (NewContactFacts, decide as decide_new_contact,
+                                        required_at_gateway)
 from backend.policy import contact_change_refusal, contact_change_step_up
 from backend.resolver.contacts import (InvalidValue, NewContact, normalize_nickname,
                                        resolve_contact_add, resolve_contact_edit)
@@ -283,6 +284,17 @@ _REG_CHALLENGE_TTL = 120.0
 DEMO_USER_ID = "u_alice"
 
 
+def _reported_contact(draft: Draft) -> str | None:
+    """A contact change or addition whose number is now on the scam list — the
+    gateway's own check (a payment's is destination_refusal's), asked before a
+    signing challenge so the page doesn't ask for a fingerprint it would refuse."""
+    if draft.kind == "contact_edit" and draft.resolved_change is not None:
+        return contact_change_refusal(draft.resolved_change)
+    if draft.kind == "contact_add" and draft.resolved_add is not None:
+        return required_at_gateway(draft.resolved_add.nickname, draft.resolved_add.phone)
+    return None
+
+
 @app.get("/api/auth/nonce")
 def issue_nonce(draft_id: str = Query(...)):
     """Issue a draft-bound, single-use, 120s-TTL nonce (brief 4.5).
@@ -360,6 +372,11 @@ def issue_nonce(draft_id: str = Query(...)):
             raise HTTPException(status_code=409, detail={
                 "error": _STALE_DESTINATION[stale[0]], "draft_id": draft_id,
                 "rejection": stale[0]})
+    reported = _reported_contact(draft)
+    if reported is not None:                   # reported since it was drafted
+        _traces.event(draft_id, "nonce", issued=False, reason="reported number")
+        raise HTTPException(status_code=409, detail={
+            "error": reported, "draft_id": draft_id, "rejection": "POLICY"})
     if draft.kind == "payment" and draft.resolved_plan is not None and draft.scam_floor:
         fresh = _rescore(draft, draft.resolved_plan, int(time.time()))
         if scam.rose_past_drafted(draft.scam_floor, fresh.outcome):
@@ -408,7 +425,7 @@ class ExecuteRequest(BaseModel):
     signature: str | None = None
     nonce: str
     credential_id: str
-    confirm_name: str | None = None      # HOLD_STEP_UP: the payee's name, as typed
+    confirm_name: str | None = Field(default=None, max_length=64)   # HOLD_STEP_UP: as typed
 
 
 @app.post("/api/gateway/execute", **_MOCK_ONLY)
@@ -548,7 +565,7 @@ class WebAuthnExecuteRequest(BaseModel):
     assertion: dict
     nonce: str
     credential_id: str
-    confirm_name: str | None = None      # HOLD_STEP_UP: the payee's name, as typed
+    confirm_name: str | None = Field(default=None, max_length=64)   # HOLD_STEP_UP: as typed
 
 
 @app.post("/api/gateway/execute-webauthn")
@@ -867,10 +884,14 @@ def _pipeline(draft: Draft) -> dict:
             # the card shows a hold with nothing explaining it.
             warnings.append(_FLOOR_WARNING)
         draft.scam_floor = scam_outcome
+        # confirm_name is for THIS payload (payload_hash): if the draft ends up
+        # keeping an older one (a failure below), the gateway doesn't ask for
+        # a name the card never showed.
         draft.scam = {**assessment.to_dict(), "outcome": scam_outcome,
                       "scored": assessment.outcome, "warnings": warnings,
                       "confirm_name": (assessment.riskiest_payee
-                                       if scam_outcome == scam.HOLD_STEP_UP else None)}
+                                       if scam_outcome == scam.HOLD_STEP_UP else None),
+                      "payload_hash": p_hash}
         _audit.append(AuditEntryType.SCAM_ASSESSMENT,
                       {"stage": "draft", "payload_hash": p_hash, **assessment.to_audit()})
         _traces.event(draft.draft_id, "scam", **draft.scam)
@@ -1054,6 +1075,7 @@ def create_draft(req: DraftRequest):
 _STALE_DESTINATION = {
     "SUPERSEDED": "the payee's payment details changed after this was drafted — ask again",
     "DESTINATION": "this transfer is not bound to a destination",
+    "REPORTED": "the payee's number has been reported for scams",
 }
 
 _FLOOR_WARNING = ("This payment looked riskier earlier in this request, so the extra "
@@ -1318,8 +1340,9 @@ def _contact_pipeline(draft: Draft) -> dict:
     if stop:
         draft.status = "blocked"
         draft.resolved_change = None
-        _audit.append(AuditEntryType.POLICY, {"draft_id": draft.draft_id,
-                                              "kind": "contact_edit", "rule": "reported_number"})
+        # The shape a refused contact_add is logged in (ContactDecision).
+        _audit.append(AuditEntryType.POLICY, {"draft_id": draft.draft_id, "kind": "contact_edit",
+                                              "rung": "REFUSE", "warnings": ["reported_number"]})
         _traces.event(draft.draft_id, "policy", decision="BLOCK", rule="reported_number")
         return {"status": "blocked", "kind": "contact_edit", "draft_id": draft.draft_id,
                 "reasons": [_REPORTED_CHANGE]}
