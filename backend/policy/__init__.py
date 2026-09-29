@@ -5,14 +5,15 @@ PURE deterministic functions, no LLM. Runs AFTER the resolver and BEFORE the
 confirmation overlay, over a concrete `ResolvedPlan`:
 
   - KYC gate (unverified users cannot transact; equity needs investment-eligible)
+  - a payee whose number is on the scam-number feed is never paid
   - per-transaction + daily limits
   - velocity throttling (rate-limit frequent transfers)
   - amount anomaly (flag amounts far above this user's median with this payee)
 
-Precedence is explicit and documented in engine.py: KYC -> per-transaction ->
-daily -> velocity -> anomaly, first BLOCK wins, and anomaly can only escalate
-to REQUIRE_EXTRA_CONFIRMATION. The engine never mutates the plan — the plan is
-what gets hashed and signed.
+Precedence is explicit and documented in engine.py: KYC -> reported number ->
+new-contact hold -> per-transaction -> daily -> velocity -> anomaly, first
+BLOCK wins, and anomaly can only escalate to REQUIRE_EXTRA_CONFIRMATION. The
+engine never mutates the plan — the plan is what gets hashed and signed.
 
 WHERE IT IS ENFORCED (the part that matters):
 
@@ -29,7 +30,7 @@ TRUST BOUNDARY (enforced by tests/test_import_boundary.py):
 Deterministic means deterministic: no path from a risk decision to the LLM.
 """
 from backend.policy.context import load_context, owner_of
-from backend.policy.contacts import contact_change_step_up
+from backend.policy.contacts import contact_change_refusal, contact_change_step_up
 from backend.policy.engine import (
     ANOMALY_MULTIPLE,
     Decision,
@@ -45,7 +46,7 @@ from backend.policy.engine import (
 )
 
 __all__ = [
-    "contact_change_step_up",
+    "contact_change_refusal", "contact_change_step_up",
     "ANOMALY_MULTIPLE", "Decision", "PolicyContext", "PolicyResult", "Verdict",
     "check_anomaly", "check_daily", "check_kyc", "check_per_transaction",
     "check_velocity", "evaluate", "load_context", "owner_of",

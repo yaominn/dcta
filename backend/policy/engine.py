@@ -8,8 +8,8 @@ never imports it.
 
 PRECEDENCE, and why it is explicit (a judge will ask):
 
-    KYC  ->  new-contact hold  ->  per-transaction limit  ->  daily limit
-         ->  velocity  ->  anomaly
+    KYC  ->  reported number  ->  new-contact hold  ->  per-transaction limit
+         ->  daily limit  ->  velocity  ->  anomaly
 
 The first BLOCK wins and the remaining rules are not consulted — a blocked leg
 has one reason, not four. Anomaly is the only rule that may *escalate* rather
@@ -56,7 +56,7 @@ class Verdict:
     limit", not "ERR_LIMIT_2"."""
     leg_id: str
     decision: Decision
-    rule: str          # kyc | investment_eligibility | new_contact_hold | per_transaction | daily | velocity | anomaly | ok
+    rule: str          # kyc | investment_eligibility | reported_number | new_contact_hold | per_transaction | daily | velocity | anomaly | ok
     reason: str
 
 
@@ -109,6 +109,9 @@ class PolicyContext:
     # payee_id -> hold_until (Unix seconds) for contacts added with a HOLD
     # safeguard (policy/new_contact.py). Only payees still on hold are listed.
     holds: dict = field(default_factory=dict)
+    # payee ids whose CURRENT number is on the scam-number feed
+    # (policy/new_contact.py). Only those payees are listed.
+    reported: frozenset = frozenset()
 
 
 # --------------------------------------------------------------------------- helpers
@@ -160,6 +163,20 @@ def check_kyc(leg: Any, ctx: PolicyContext) -> Verdict | None:
         return Verdict(leg.id, Decision.BLOCK, "investment_eligibility",
                        "This account is not approved for investing yet.")
     return None
+
+
+def check_reported_number(leg: Any, ctx: PolicyContext) -> Verdict | None:
+    """A payee whose number is on the scam-number feed is never paid. Adding
+    such a contact, or changing a contact to such a number, is refused already
+    — but the feed changes, so a contact saved last month can be reported
+    today. BLOCKS, whatever the scam score says, and the gateway re-runs this
+    engine, so it holds wherever the payment came from."""
+    if not _is_transfer(leg) or leg.payee_id not in ctx.reported:
+        return None
+    return Verdict(leg.id, Decision.BLOCK, "reported_number",
+                   f"{leg.payee_display}'s number has been reported for scams, so "
+                   f"nothing can be sent to it. If someone is telling you to pay, "
+                   f"hang up and call the ScamShield Helpline (1799).")
 
 
 def check_new_contact_hold(leg: Any, ctx: PolicyContext) -> Verdict | None:
@@ -268,6 +285,7 @@ def evaluate(plan: ResolvedPlan, ctx: PolicyContext) -> PolicyResult:
     for leg in plan.plan:
         verdict = (
             check_kyc(leg, ctx)
+            or check_reported_number(leg, ctx)
             or check_new_contact_hold(leg, ctx)
             or check_per_transaction(leg, ctx)
             or check_daily(leg, ctx, running_today)

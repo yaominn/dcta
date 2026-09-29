@@ -37,6 +37,17 @@ from dataclasses import dataclass, field
 # MOCK: a stand-in for a scam-number feed (ScamShield in Singapore). A real
 # deployment would query the feed; the demo needs one number that trips it.
 REPORTED_NUMBERS = frozenset({"+65 8888 1234", "+65 9999 1234"})
+_REPORTED_DIGITS = frozenset(re.sub(r"\D", "", n) for n in REPORTED_NUMBERS)
+REPORTED_REASON = "this number has been reported for scams"
+
+
+def is_reported(phone: str | None) -> bool:
+    """Whether this number is on the scam-number feed. Compared by digits, so
+    a number stored as "+65 8888 1234" and one typed as "6588881234" match.
+    Asked wherever a number can become a destination — adding a contact,
+    changing one's number — and again before every payment (policy/context.py):
+    the feed changes, so a contact saved last month can be reported today."""
+    return re.sub(r"\D", "", phone or "") in _REPORTED_DIGITS
 
 LARGE_PENDING_CENTS = 100_000      # $1,000: a first payment this big is a strong sign
 # Wording with no innocent reading when saving a payee. Together with the LLM's
@@ -178,7 +189,7 @@ def _display(cents: int) -> str:
 
 def rule_warnings(f: NewContactFacts) -> list[Warning]:
     out: list[Warning] = []
-    if f.phone in REPORTED_NUMBERS:
+    if is_reported(f.phone):
         out.append(Warning("reported_number",
                            "This number has been reported for scams. Don't send money to it.",
                            "refuse"))
@@ -241,6 +252,6 @@ def decide(f: NewContactFacts, *, ai_risk: str | None, ai_signals: list[str],
 def required_at_gateway(nickname: str, phone: str) -> str | None:
     """What the gateway re-derives from the payload alone, whatever the draft
     store says: a reported number is never added, however it was signed."""
-    if phone in REPORTED_NUMBERS:
-        return "this number has been reported for scams"
+    if is_reported(phone):
+        return REPORTED_REASON
     return None

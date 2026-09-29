@@ -13,6 +13,7 @@ import time
 from backend.data.db import DB_PATH, connect
 from backend.models.schemas import ResolvedPlan
 from backend.policy.engine import PolicyContext
+from backend.policy.new_contact import is_reported
 
 
 def load_context(user_id: str, *, db_path=None, now: int | None = None) -> PolicyContext:
@@ -32,6 +33,9 @@ def load_context(user_id: str, *, db_path=None, now: int | None = None) -> Polic
         holds = {r["id"]: r["hold_until"] for r in conn.execute(
             "SELECT id, hold_until FROM payees WHERE user_id=? AND hold_until > ?",
             (user_id, now))}
+        reported = frozenset(r["id"] for r in conn.execute(
+            "SELECT id, phone FROM payees WHERE user_id=?", (user_id,))
+            if is_reported(r["phone"]))
     finally:
         conn.close()
     return PolicyContext(
@@ -40,6 +44,7 @@ def load_context(user_id: str, *, db_path=None, now: int | None = None) -> Polic
         history=history,
         now=now,
         holds=holds,
+        reported=reported,
     )
 
 

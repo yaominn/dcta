@@ -24,6 +24,7 @@ pattern and slowing them down. So, before a draft can be signed:
           2-3  WARN           a scam-type-specific warning on the card
           4-6  HOLD           + a SERVER-enforced hold (backend/policy/safety.py)
           >=7  HOLD_STEP_UP   + a code on the phone, + typing the payee's name
+                              (both checked by the gateway, not only the page)
 
 DETERMINISTIC, NOT THE MODEL. Every signal here is a rule over the ledger and
 the raw transcript. The scam-wording rules (new_contact.py's list, shared with
@@ -88,6 +89,13 @@ def rose_past_drafted(drafted: str | None, fresh: str) -> bool:
     user never saw. `drafted` None (never assessed): nothing to compare."""
     return (drafted is not None and needs_hold(fresh)
             and _RANK[fresh] > _RANK.get(drafted, 0))
+
+
+def name_confirmed(typed: str | None, expected: str) -> bool:
+    """HOLD_STEP_UP's type-the-payee's-name check, as the gateway enforces it.
+    The same comparison as the card's (buildNameCheck in frontend/app.js) —
+    trimmed, case-insensitive — so a name the card accepts is never refused."""
+    return (typed or "").strip().lower() == expected.lower()
 
 
 def outcome_for(score: int) -> str:

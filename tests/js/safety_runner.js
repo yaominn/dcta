@@ -80,7 +80,7 @@ const env = {
 const app = new Function(...Object.keys(env), SRC + `
   showErr = (msg) => errors.push(msg);
   botSay = (text) => { said.push(text); };
-  return { wireKillSwitch, onDecline, handleDraft, CURRENT };`)(...Object.values(env));
+  return { wireKillSwitch, onDecline, handleDraft, typedName, CURRENT };`)(...Object.values(env));
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 const sign = () => document.getElementById("sign");
 const now = Math.floor(Date.now() / 1000);
@@ -138,6 +138,18 @@ const heldPayment = { status: 200, json: {
   out.contactCard = { atRender, afterFailedCancel, afterCode: sign().disabled };
   errors.length = 0;
   said.length = 0;
+
+  // HOLD_STEP_UP: the name typed on the live card goes with the signature; a
+  // newer card retires the box, and its old value is never sent.
+  const stepUp = JSON.parse(JSON.stringify(heldPayment));
+  Object.assign(stepUp.json, { draft_id: "d-step", requires_extra_confirmation: true,
+                               confirmation: { reasons: [] } });
+  Object.assign(stepUp.json.scam, { outcome: "HOLD_STEP_UP", score: 8, confirm_name: "Mom" });
+  app.handleDraft(stepUp);
+  document.getElementById("name-check").value = " mom";
+  const live = app.typedName();
+  app.handleDraft(heldPayment);
+  out.typedName = { live, afterNewCard: app.typedName() };
 
   // Freeze with no connection: never shown as frozen.
   app.wireKillSwitch();

@@ -46,8 +46,8 @@ CLOSED_OUTCOMES = frozenset({"DECLINED", "CANCELLED"})
 from backend.auth.credentials import MockCredentialStore
 from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
-from backend.policy import (Decision, contact_change_step_up, evaluate,
-                            load_context, owner_of)
+from backend.policy import (Decision, contact_change_refusal, contact_change_step_up,
+                            evaluate, load_context, owner_of)
 from backend.policy.new_contact import required_at_gateway
 
 
@@ -118,7 +118,12 @@ class Gateway:
         signature: str | None,
         nonce: str,
         credential_id: str,
+        *,
+        confirm_name: str | None = None,
     ) -> dict:
+        """`confirm_name`: the payee's name as the user typed it on the card
+        (HOLD_STEP_UP only). Not signed and never logged — it is friction the
+        server checks, not an authorization."""
         draft_id = resolved_plan.draft_id
         p_hash = payload_hash(resolved_plan)
         challenge = challenge_hash(p_hash, nonce)
@@ -166,10 +171,11 @@ class Gateway:
             return self._reject(draft_id, p_hash, *refused)
 
         # 3d-3f. scam protection: the kill switch, the signed destination, and
-        #        the scam score's hold / step-up — enforced HERE, where money
-        #        moves, whatever the page showed or skipped.
+        #        the scam score's hold / step-up (the phone code and the typed
+        #        name) — enforced HERE, where money moves, whatever the page
+        #        showed or skipped.
         owner = owner_of(resolved_plan, db_path=self.executor.db_path)
-        refused = self._scam_protection(resolved_plan, draft_id, p_hash, owner)
+        refused = self._scam_protection(resolved_plan, draft_id, p_hash, owner, confirm_name)
         if refused is not None:
             return self._reject(draft_id, p_hash, *refused)
 
@@ -230,7 +236,8 @@ class Gateway:
         credential_id: str,
     ) -> dict:
         """The same chokepoint for a contact edit: expiry -> nonce -> signature
-        -> step-up (a phone change) -> apply -> audit. A contact's details are
+        -> never a reported number -> step-up (a phone change) -> apply ->
+        audit. A contact's details are
         written nowhere else, so a rename or a number change needs the user's
         signature over exactly this change, however the request arrived."""
         draft_id = change.draft_id
@@ -266,6 +273,11 @@ class Gateway:
             return self._reject(draft_id, p_hash, *refused)
         if self._frozen(self._payee_owners([e.payee_id for e in change.edits])):
             return self._reject(draft_id, p_hash, "KILL_SWITCH", _FROZEN_CONTACTS)
+        # Re-derived HERE from the payload: whatever was drafted or signed, a
+        # contact's number is never changed to one on the scam list.
+        stop = contact_change_refusal(change)
+        if stop:
+            return self._reject(draft_id, p_hash, "POLICY", stop)
 
         # Re-derived HERE from the payload, not taken from the draft store: a
         # hand-assembled phone change needs the out-of-band code too.
@@ -382,7 +394,7 @@ class Gateway:
                    for u in users if u)
 
     def _scam_protection(self, plan: ResolvedPlan, draft_id: str, p_hash: str,
-                         owner: str | None):
+                         owner: str | None, confirm_name: str | None = None):
         """(rejection, reason) or None. Reads the ledger, never the request:
         `owner` is derived from the account rows being debited."""
         db = self.executor.db_path
@@ -429,9 +441,16 @@ class Gateway:
             if now < int(hold["release_at"]):
                 return ("HELD", f"this payment is on a safety hold for "
                                 f"{int(hold['release_at']) - now} more seconds — nothing was sent")
-        if outcome == scam.HOLD_STEP_UP and not (
-                self.step_up is not None and self.step_up.is_confirmed(draft_id, p_hash)):
-            return ("CONFIRMATION", "this payment needs the code sent to your phone first")
+        if outcome == scam.HOLD_STEP_UP:
+            if not (self.step_up is not None and self.step_up.is_confirmed(draft_id, p_hash)):
+                return ("CONFIRMATION", "this payment needs the code sent to your phone first")
+            # The name the card asked for (the draft's), else the payee the
+            # risk points at now. A name the page never collected fails here.
+            expected = (getattr(self.drafts, "confirm_name_of", lambda _d: None)(draft_id)
+                        or assessment.riskiest_payee)
+            if expected and not scam.name_confirmed(confirm_name, expected):
+                return ("CONFIRMATION", "this payment needs the payee's name typed in "
+                                        "first — nothing was sent")
         return None
 
     def _already_final(self, draft_id: str, p_hash: str, prior: dict) -> dict:

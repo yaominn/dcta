@@ -115,7 +115,7 @@ function assertionToJson(a) {
 }
 async function signAndExecute(plan, credentialIds, rpId,
                               endpoint = "/api/gateway/execute-webauthn",
-                              field = "resolved_plan") {
+                              field = "resolved_plan", extra = {}) {
   // rpId comes from the server (/api/auth/config) so registration and signing
   // cannot disagree (M1: location.hostname would differ from settings.rp_id
   // when the app is reached at 127.0.0.1 instead of localhost).
@@ -165,6 +165,7 @@ async function signAndExecute(plan, credentialIds, rpId,
     assertion: assertionToJson(assertion),
     nonce: nonce,
     credential_id: assertion.id,
+    ...extra,
   });
 }
 
@@ -963,7 +964,8 @@ function handleDraft(res) {
   }
   if (body.status === "blocked") {                 // M5 policy refusal
     showRefusal("Blocked by policy", body.reasons || [],
-      "A policy rule refused this before it could be drafted. Nothing was sent.");
+      "A policy rule refused this before it could be drafted. "
+      + (body.kind === "contact_edit" ? "Nothing was saved." : "Nothing was sent."));
     return;
   }
   if (body.status === "frozen") {                  // M6 validator freeze
@@ -1154,6 +1156,13 @@ function showCancelled() {
     + "say it again if you still want to send it."));
 }
 
+// HOLD_STEP_UP: the payee's name as typed on the live card. The gateway checks
+// it too — the disabled button is only the page's half of the check.
+function typedName() {
+  const input = document.getElementById("name-check");
+  return input ? { confirm_name: input.value } : {};
+}
+
 async function onSign() {
   const btn = document.getElementById("sign");
   if (!btn) return;
@@ -1165,7 +1174,8 @@ async function onSign() {
       : CURRENT.kind === "contact_add"
       ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
                              "/api/contacts/add-webauthn", "contact_add")
-      : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId);
+      : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
+                             undefined, undefined, typedName());
     // One draft, one signature: the card is spent whatever the outcome.
     // Retired BEFORE the result renders, so chips the result offers (carry on
     // with the payment) are not retired along with it.

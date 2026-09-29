@@ -45,7 +45,7 @@ from backend.models.contacts import (ContactAddPlan, ContactEditPlan, ResolvedCo
                                      ResolvedContactChange)
 from backend.models.schemas import MAX_AUTH_WINDOW_S
 from backend.policy.new_contact import NewContactFacts, decide as decide_new_contact
-from backend.policy import contact_change_step_up
+from backend.policy import contact_change_refusal, contact_change_step_up
 from backend.resolver.contacts import (InvalidValue, NewContact, normalize_nickname,
                                        resolve_contact_add, resolve_contact_edit)
 from backend.validator.contacts import validate_contact_add, validate_contact_change
@@ -408,6 +408,7 @@ class ExecuteRequest(BaseModel):
     signature: str | None = None
     nonce: str
     credential_id: str
+    confirm_name: str | None = None      # HOLD_STEP_UP: the payee's name, as typed
 
 
 @app.post("/api/gateway/execute", **_MOCK_ONLY)
@@ -417,7 +418,8 @@ def gateway_execute(req: ExecuteRequest):
     verification failure (brief acceptance test: unsigned request rejected+logged)."""
     return _traced_gateway(req.resolved_plan.draft_id, "mock signer",
                            _gateway.submit(req.resolved_plan, req.signature,
-                                           req.nonce, req.credential_id))
+                                           req.nonce, req.credential_id,
+                                           confirm_name=req.confirm_name))
 
 
 def _traced_gateway(draft_id: str, path: str, out: dict) -> dict:
@@ -546,6 +548,7 @@ class WebAuthnExecuteRequest(BaseModel):
     assertion: dict
     nonce: str
     credential_id: str
+    confirm_name: str | None = None      # HOLD_STEP_UP: the payee's name, as typed
 
 
 @app.post("/api/gateway/execute-webauthn")
@@ -556,7 +559,8 @@ def webauthn_execute(req: WebAuthnExecuteRequest):
     assertion, a stale challenge, or a replayed sign count."""
     return _traced_gateway(req.resolved_plan.draft_id, "WebAuthn",
                            _webauthn_gateway.submit(req.resolved_plan, req.assertion,
-                                                    req.nonce, req.credential_id))
+                                                    req.nonce, req.credential_id,
+                                                    confirm_name=req.confirm_name))
 
 
 # --------------------------------------------------------------------------- M3: LLM parser + opaque IDs
@@ -1283,6 +1287,11 @@ def _contacts_view(user_id: str) -> dict:
         for r in rows]}
 
 
+_REPORTED_CHANGE = ("That number has been reported for scams, so it can't be saved. If "
+                    "someone asked you to change this contact's number, stop and call the "
+                    "ScamShield Helpline (1799).")
+
+
 def _contact_pipeline(draft: Draft) -> dict:
     """resolve -> validate -> (step-up) over a contact-edit draft. Same shape
     as _pipeline: re-run in full after every clarification answer."""
@@ -1303,6 +1312,17 @@ def _contact_pipeline(draft: Draft) -> dict:
     draft.question = None
     _traces.event(draft.draft_id, "resolve", outcome="resolved",
                   contact_change=change.model_dump(mode="json"))
+    # A number on the scam list is never saved (the gateway re-checks): like a
+    # BLOCKED payment, the draft keeps nothing to sign.
+    stop = contact_change_refusal(change)
+    if stop:
+        draft.status = "blocked"
+        draft.resolved_change = None
+        _audit.append(AuditEntryType.POLICY, {"draft_id": draft.draft_id,
+                                              "kind": "contact_edit", "rule": "reported_number"})
+        _traces.event(draft.draft_id, "policy", decision="BLOCK", rule="reported_number")
+        return {"status": "blocked", "kind": "contact_edit", "draft_id": draft.draft_id,
+                "reasons": [_REPORTED_CHANGE]}
     report = validate_contact_change(plan, change, draft.transcript,
                                      answers=draft.answers, audit=_audit)
     draft.validation = {"verdict": report.verdict, "frozen": report.frozen,
