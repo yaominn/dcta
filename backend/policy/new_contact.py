@@ -120,38 +120,102 @@ class ContactDecision:
 # Conservative on purpose: supporting evidence, not a classifier. Each pattern
 # is a phrase a scam script uses and an ordinary "add Bob, 9123 4567" does not.
 _WORDS: list[tuple[str, str, re.Pattern, str]] = [
+    # --- things no real bank or official ever asks for (docs/SCAM_WORD_WEIGHTS.md):
+    #     refuse-grade here, and a payment that mentions one gets the strictest
+    #     safeguards (policy/scam.py NEVER_RULES)
     ("words_safe_account", "refuse", re.compile(
-        r"\b(safe|safety|secure|holding|protected)\s+account\b"
-        r"|\bprotect\s+(?:my|your|our|the)\s+(?:money|savings|funds)\b", re.I),
-     "You mentioned a “safe account”. No bank or government officer will ever "
-     "ask you to move money to one — this is a scam."),
+        r"\b(safe|safety|secure|holding|protected|verification)\s+accounts?\b"
+        r"|\bprotect\s+(?:my|your|our|the)\s+(?:money|savings|funds)\b"
+        r"|\bfor\s+safe[- ]?keeping\b|\bkeep\s+my\s+(?:money|savings|funds)\s+safe\b", re.I),
+     "You mentioned a “safe account”. No bank, police officer or government agency will "
+     "ever ask you to move money to one to protect it — this is a scam."),
     ("words_official_orders", "refuse", re.compile(
         r"\b(police|officer|polis|mas|monetary authority|cpf|iras|ica|interpol|court|"
-        r"government|ministry|bank staff|bank officer)\b[^.?!]{0,60}"
+        r"government|ministry|minlaw|bank staff|bank officer)\b[^.?!]{0,60}"
         r"\b(told|asked|instructed|ordered|wants?|needs?|said)\s+(?:me|us)\b"
         r"|\b(told|asked|instructed|ordered)\s+(?:me|us)\b[^.?!]{0,60}"
         r"\b(police|officer|polis|mas|cpf|iras|ica|interpol|court|government|ministry)\b", re.I),
      "An official seems to be telling you to pay someone. Real officers never ask "
      "you to transfer money — this is how government-impersonation scams work."),
+    ("words_investigation", "refuse", re.compile(
+        r"\b(?:for|assist(?:ing)?\s+(?:with|in))\s+(?:an?\s+|the\s+|their\s+|police\s+)?investigations?\b"
+        r"|\bunder\s+investigation\b|\bmoney\s+laundering\b"
+        r"|\bprove\s+(?:my|our|his|her|their)\s+innocence\b|\bfinancial\s+inspection\b"
+        r"|\b(?:call|line)\s+(?:was\s+)?transferred\s+to\s+(?:the\s+|an?\s+)?"
+        r"(?:police|mas|officer|investigator)\b", re.I),
+     "Banks, the police and government agencies never ask you to move money as part "
+     "of an investigation, and a bank never transfers your call to the police."),
+    ("words_credentials", "refuse", re.compile(
+        r"\botp\b|\bone[- ]time\s+(?:password|pin|code)\b|\bmy\s+(?:pin|password|login)\b"
+        r"|\btoken\s+approval\b|\bapprove\s+(?:the\s+|my\s+)?(?:digital\s+)?token\b"
+        r"|\banydesk\b|\bteamviewer\b|\bscreen[- ]?shar(?:e|ing)\b|\bremote\s+(?:access|control)\b"
+        r"|\binstall\s+(?:an?|the|this|their)\s+app\b|\bapk\b|\bplay\s+protect\b", re.I),
+     "No real bank or official asks for your OTP, PIN or token approval, asks you to "
+     "install an app, or asks to share your screen."),
+    ("words_hide_from_bank", "refuse", re.compile(
+        r"\b(?:don'?t|do\s+not|never|not\s+to)\s+tell\s+(?:the|my)\s+bank\b"
+        r"|\bbank\s+(?:is|are)\s+in\s+on\s+it\b|\bkeep\s+(?:it|this)\s+from\s+(?:the|my)\s+bank\b"
+        r"|\blie\s+to\s+the\s+bank\b", re.I),
+     "You've been told not to tell the bank. Scammers say this so nobody can stop the "
+     "payment — the bank is on your side."),
+    # --- strong signs
+    ("words_mule", "strong", re.compile(
+        r"\breceive\s+(?:the\s+|some\s+)?(?:money|funds|payments?)\s+(?:and|then)\s+"
+        r"(?:send|transfer|forward|pass|move)\b|\bforward\s+(?:the|this|that)\s+(?:money|funds|payment)\b"
+        r"|\buse\s+my\s+(?:bank\s+)?account\s+(?:for|to\s+receive)\b"
+        r"|\b(?:rent|sell|lend)\s+(?:out\s+)?my\s+(?:bank\s+)?account\b"
+        r"|\bpass\s+(?:it|the\s+money)\s+on\b", re.I),
+     "Receiving money and passing it on for someone is how scammers launder money. "
+     "Your account is for your own use only — this can be a crime."),
     ("words_secrecy", "strong", re.compile(
         r"\b(don'?t|do not|never)\s+tell\b|\bkeep\s+(?:it|this)\s+(?:a\s+)?secret\b"
-        r"|\bbetween\s+(?:you and me|us)\b|\bnobody\s+(?:can|must|should)\s+know\b", re.I),
+        r"|\bbetween\s+(?:you and me|us)\b|\bnobody\s+(?:can|must|should)\s+know\b"
+        r"|\bnon[- ]disclosure\b|\bnda\b", re.I),
      "You've been asked to keep this secret. Scammers ask for secrecy so nobody "
      "can warn you."),
+    ("words_directed", "strong", re.compile(
+        r"\bdon'?t\s+hang\s+up\b|\bstill\s+on\s+the\s+(?:line|phone|call)\b"
+        r"|\b(?:he|she|they)\s*(?:'s|'re|is|are)\s+(?:still\s+)?(?:on\s+the\s+(?:line|phone|call)"
+        r"|waiting\s+for\s+me)\b|\btold\s+me\s+what\s+to\s+say\b", re.I),
+     "Someone seems to be directing you right now. Hang up, then call your bank or "
+     "1799 on a number you look up yourself."),
     ("words_new_number", "strong", re.compile(
         r"\bnew\s+(?:phone\s+)?number\b|\bchanged\s+(?:my|his|her|their)\s+number\b"
-        r"|\blost\s+(?:my|his|her|their)\s+phone\b|\bphone\s+(?:is\s+)?broken\b", re.I),
+        r"|\blost\s+(?:my|his|her|their)\s+phone\b|\bphone\s+(?:is\s+)?broken\b"
+        r"|\bguess\s+who\b", re.I),
      "A “new number” is the classic opening of family-impersonation scams. "
      "Call them on the number you already have to check it's really them."),
+    ("words_online_contact", "strong", re.compile(
+        r"\bonline\s+(?:friend|boyfriend|girlfriend|partner)\b|\bmet\s+(?:him|her|them)\s+online\b"
+        r"|\bnever\s+met\s+(?:him|her|them)\b"
+        r"|\b(?:boyfriend|girlfriend|fianc[eé]e?|partner)\s+(?:overseas|abroad)\b"
+        r"|\bproof\s+of\s+(?:my|our)\s+love\b|\bdating\s+app\b", re.I),
+     "You may only know this person online. Scammers build a relationship, then ask "
+     "for money — check who they are before you pay."),
     ("words_investment", "strong", re.compile(
         r"\bguaranteed\b|\b(?:high|fixed|daily)\s+returns?\b|\bcrypto\b|\bbitcoin\b|\busdt\b"
-        r"|\btrading\s+platform\b|\bdouble\s+(?:my|your)\s+money\b", re.I),
-     "It involves an investment promise. Guaranteed or unusually high returns are a "
-     "hallmark of investment scams."),
+        r"|\btrading\s+platform\b|\bdouble\s+(?:my|your)\s+money\b"
+        r"|\b(?:withdrawal\s+fee|fee\s+to\s+withdraw|tax(?:es)?\s+to\s+withdraw)\b"
+        r"|\brelease\s+(?:my\s+|the\s+)?profits?\b|\btrading\s+signals?\b"
+        r"|\binvestment\s+(?:group|lessons?|class|community)\b", re.I),
+     "It involves an investment promise. Guaranteed or unusually high returns, or a fee "
+     "to withdraw your profits, are hallmarks of investment scams."),
     ("words_job_task", "strong", re.compile(
-        r"\b(?:commission|part[- ]time\s+job|task\s+(?:job|fee)|top[- ]?up\s+to\s+earn)\b", re.I),
+        r"\b(?:commission|part[- ]time\s+job|task\s+(?:job|fee)|top[- ]?up\s+to\s+earn)\b"
+        r"|\bunlock\s+(?:the\s+|my\s+|more\s+)?tasks?\b|\bupgrade\s+my\s+account\b"
+        r"|\brectify\s+(?:a|the|my)\s+mistake\b|\b(?:activation|training)\s+fee\b", re.I),
      "It sounds like a job that asks you to pay first. Real jobs don't make you "
      "transfer money to earn commission."),
+    ("words_upfront_fee", "strong", re.compile(
+        r"\b(?:processing|admin(?:istrative)?|release|clearance|handling)\s+fees?\b"
+        r"|\bcustoms\s+(?:fee|charge|duty|tax)\b|\bre-?delivery\s+fee\b"
+        r"|\bloan\s+(?:approval|activation|processing)\b"
+        r"|\bclaim\s+(?:my|the)\s+(?:prize|reward|winnings)\b"
+        r"|\bwon\s+(?:a|the)\s+(?:prize|lottery|lucky\s+draw)\b"
+        r"|\brecover\s+my\s+(?:money|funds|losses)\b|\bfund\s+recovery\b", re.I),
+     "You're being asked to pay a fee before you receive something (a loan, a prize, a "
+     "parcel or lost money). Real ones don't work that way."),
+    # --- mild signs
     ("words_urgency", "info", re.compile(
         r"\burgent(?:ly)?\b|\bright\s+now\b|\bimmediately\b|\basap\b"
         r"|\bas\s+soon\s+as\s+possible\b|\bbefore\s+it'?s\s+too\s+late\b", re.I),

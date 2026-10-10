@@ -371,6 +371,12 @@ function buildPlanCard(plan, confirmation, narration, transcript, risk) {
     for (const w of risk.warnings) box.append(el("p", null, "\u26a0\ufe0f " + w));
     card.append(box);
   }
+  // A large payment waits after Confirm (scam.RELEASE_DELAY_SECONDS) and can
+  // still be cancelled: say so before the user signs.
+  if (risk && risk.release_delay_seconds) {
+    card.append(el("p", "hint", "\u23f1 Large payment: after you confirm, it waits "
+      + risk.release_delay_seconds + " seconds before it's sent, and you can still cancel it."));
+  }
   // The server's copy of what was said — what the draft was actually built from.
   if (transcript) card.append(el("p", "said", "You said: \u201c" + transcript + "\u201d"));
 
@@ -587,8 +593,17 @@ function awaitNumber(forDraft, name) {
   const input = document.getElementById("say");
   if (input) { input.placeholder = name + "'s mobile number\u2026"; input.focus(); }
 }
+/* "What is this payment for?" — asked by the server when the scam score is
+   high. The next thing the user says is the answer, scored by the rules. */
+let PURPOSE_FOR = null;          // the draft waiting for its purpose
+function awaitPurpose(forDraft) {
+  PURPOSE_FOR = forDraft;
+  const input = document.getElementById("say");
+  if (input) { input.placeholder = "What is this payment for?\u2026"; input.focus(); }
+}
 function stopAwaitingNumber() {
   NEW_CONTACT = null;
+  PURPOSE_FOR = null;
   const input = document.getElementById("say");
   if (input) input.placeholder = "Pay, invest, or edit a contact\u2026";
 }
@@ -804,6 +819,7 @@ function announceSuccess(res) {
 
 function showResult(res) {
   if (res.json.rejection === "DUPLICATE") return showAlreadySent(res);
+  if (res.json.accepted && res.json.scheduled) return showScheduled(res);
   const ok = !!res.json.accepted;
   if (ok) {
     announceSuccess(res);
@@ -880,6 +896,76 @@ function afterContactAdded(c) {
   m.append(chips);
 }
 
+/* The scam score is too high to go ahead in the app at all (scam.BLOCK). The
+   sentences are FIXED server text; the way forward is a channel the user
+   opens themselves, which a scammer on the line can't be part of. */
+function showScamBlocked(body) {
+  const card = newResultCard(false);
+  card.append(el("h3", null, "Payment stopped"));
+  card.append(el("p", "lead", "This payment shows several signs of a scam, so it can't be made "
+    + "in the app. Nothing was sent."));
+  const box = el("div", "scam-warn stop");
+  for (const w of body.reasons || []) box.append(el("p", null, "\u26a0\ufe0f " + w));
+  card.append(box);
+  card.append(el("p", "scam-help", "If you still need to make it, call your bank on the number "
+    + "on the back of your card. If someone is telling you to make this payment, hang up and call "
+    + "the ScamShield Helpline on 1799."));
+  Voice.speak("I've stopped this payment. It shows several signs of a scam. Nothing was sent.");
+}
+
+/* A large payment, signed: it waits before the money moves, and Cancel still
+   works until then. The server sends it (its release loop); this page only
+   watches, and asks the server again rather than trusting its own clock. */
+function showScheduled(res) {
+  const draftId = res.json.draft_id;
+  const card = newResultCard(true);
+  card.append(el("h3", null, "Scheduled"));
+  const lead = el("p", "lead", "");
+  card.append(lead);
+  const cancel = el("button", "btn danger", "Cancel this payment");
+  card.append(cancel);
+  let left = Math.max(0, res.json.seconds_left || 0);
+  const paint = () => {
+    lead.textContent = "This is a large payment, so it waits before it's sent. It goes in "
+      + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0")
+      + ". You can still cancel it until then.";
+  };
+  const finish = (title, text) => {
+    clearInterval(tick); clearInterval(poll);
+    cancel.remove();
+    card.querySelector("h3").textContent = title;
+    lead.textContent = text;
+  };
+  paint();
+  const tick = setInterval(() => { left = Math.max(0, left - 1); paint(); }, 1000);
+  const poll = setInterval(async () => {
+    let st;
+    try { st = await jget(API + "/api/drafts/" + encodeURIComponent(draftId) + "/release"); }
+    catch (_) { return; }                        // try again on the next tick
+    if (st.status === "SENT") {
+      finish("Sent", "The wait is over and the payment has been sent.");
+      const { title, lines } = successToast(st.execution || {}, CURRENT.plan);
+      showToast(title, lines);
+      refreshBalances();
+    } else if (st.status === "CANCELLED") {
+      finish("Cancelled", "This payment was cancelled. Nothing was sent.");
+    } else if (typeof st.seconds_left === "number") {
+      left = st.seconds_left;
+    }
+  }, 2000);
+  cancel.onclick = async () => {
+    cancel.disabled = true;
+    const r = await jpost(API + "/api/drafts/" + encodeURIComponent(draftId) + "/cancel", {});
+    if (r.status === 200) {
+      finish("Cancelled", "You cancelled this payment. Nothing was sent.");
+    } else {
+      cancel.disabled = false;
+      const d = r.json.detail || {};
+      if (d.already_executed) finish("Sent", "Too late to cancel: the payment had already been sent.");
+    }
+  };
+}
+
 function showRefusal(title, detail, explanation) {
   const card = newResultCard(false);
   card.append(el("h3", null, title));
@@ -903,22 +989,59 @@ function setStatus(msg) {
   if (s) { s.textContent = msg; s.hidden = !msg; }
 }
 
+// [[7, "HOLD_STEP_UP"], [4, "HOLD"], [2, "WARN"], [0, "ALLOW"]]
+//   -> "0–1 ALLOW · 2–3 WARN · 4–6 HOLD · 7+ HOLD_STEP_UP"
+// The two thresholds (policy/scam.py), as the console prints them.
+function thresholdsText(t) {
+  if (!t) return "";
+  return "facts <" + t.facts_ask + " pass · " + t.facts_ask + "+ ask · " + t.facts_fail
+    + "+ delay · " + t.facts_call_bank + "+ call bank  |  words <" + t.words_fail + " pass · "
+    + t.words_fail + "+ delay · " + t.words_serious + "+ code · " + t.words_call_bank + "+ call bank";
+}
+
 // CONSOLE_DEBUG (server setting): the scam score and every prompt sent to the
 // model, printed to the browser console for each request.
 function logDebug(body) {
   const d = body && body.debug;
   if (!d || typeof console === "undefined") return;
   const s = d.scam;
-  console.groupCollapsed("%cDCTA scam check: " + (s ? s.outcome + " (score " + s.score + ")"
-                                                     : "no payment to score"), "font-weight:bold");
+  // Open, not collapsed: the score and which rule gave which points, at a glance.
+  console.group("%cDCTA scam check: " + (s ? "facts " + s.facts + ", words "
+                                             + (s.words_weighed ? s.words : "not weighed")
+                                             + " → " + s.decision + " → " + s.outcome
+                                           : "no payment to score"), "font-weight:bold");
   if (s) {
-    console.table((s.signals || []).map((x) => ({ signal: x.code, weight: "+" + x.weight,
-                                                  detail: x.detail })));
+    const rules = s.breakdown || [];
+    console.table(rules.map((r) => ({ rule: r.rule, points: r.points ? "+" + r.points : "0",
+                                      worth: r.worth, "looks for": r.looks_for,
+                                      why: r.why.join("; ") })));
+    const given = rules.filter((r) => r.points).map((r) => r.points);
+    console.log("total: " + (given.length ? given.join(" + ") + " = " : "") + s.score
+                + " → " + s.scored + "   (" + thresholdsText(s.thresholds) + ")");
+    if (s.outcome !== s.scored) {
+      console.log("outcome kept at " + s.outcome + ": an earlier score on this draft was "
+                  + "higher, and a draft's safeguards never go down");
+    }
     console.log("warnings shown:", s.warnings);
     console.log("full assessment (rules, not the model):", s);
   }
   if (d.scam_language && Object.keys(d.scam_language).length) {
     console.log("scam phrases found in your words:", d.scam_language);
+  }
+  const w = d.words;
+  if (w) {
+    const parts = w.categories.map((c) => c.category + " " + c.points
+                                     + (c.counts < 1 ? " × " + c.counts : ""));
+    console.log("word score: " + (parts.length ? parts.join(" + ") + " = " + w.raw : "no scam or urgency words")
+                + (w.raw > w.points ? "  →  capped at " + w.points : "")
+                + "  (adds " + w.points + " of at most " + w.max + ")"
+                + (w.never_rules.length ? "  ·  NEVER RULE: " + w.never_rules.join(", ")
+                                          + " → at least HOLD_STEP_UP" : ""));
+    if (w.urgent_words.length) {
+      console.log("  urgency words: " + w.urgent_words.map((x) => x[0] + " " + x[1]).join(", ")
+                  + (w.capitals ? ", capitals +" + w.capitals : "")
+                  + (w.exclamations ? ", !! +" + w.exclamations : ""));
+    }
   }
   console.groupEnd();
   (d.llm_calls || []).forEach((c, i) => {
@@ -960,6 +1083,10 @@ function handleDraft(res) {
     CURRENT.draftId = body.draft_id;               // the question's answer goes to it
     renderClarify(body);
     Voice.speak(body.question);
+    return;
+  }
+  if (body.status === "blocked" && body.kind === "scam") {   // too many scam signs
+    showScamBlocked(body);
     return;
   }
   if (body.status === "blocked") {                 // M5 policy refusal
@@ -1038,7 +1165,13 @@ async function submitTranscript(transcript, via) {
   }
   typing(true);
   const nc = NEW_CONTACT;
+  const purposeFor = PURPOSE_FOR;
   stopAwaitingNumber();
+  if (purposeFor) {                        // the answer to "what is this payment for?"
+    handleDraft(await jpost(API + "/api/drafts/" + encodeURIComponent(purposeFor) + "/purpose",
+                            { answer: transcript }));
+    return;
+  }
   if (!nc) CURRENT.afterAdd = null;       // a fresh request, not the number we asked for
   handleDraft(await jpost(API + "/api/drafts", {
     transcript, user_id: DEMO_USER, ...(nc ? { new_contact_for: nc.forDraft } : {}),
@@ -1056,7 +1189,16 @@ async function answerClarification(field, choiceId) {
 function renderClarify(body) {
   retireLiveCard();
   stopAwaitingNumber();
-  const m = addMsg("bot", el("div", "bubble", body.question));
+  const bubble = el("div", "bubble", body.kind === "purpose" && body.questions ? "" : body.question);
+  if (body.kind === "purpose" && body.questions) {
+    for (const q of body.questions) bubble.append(el("p", null, q));   // fixed server text
+  }
+  const m = addMsg("bot", bubble);
+  if (body.kind === "purpose") {
+    awaitPurpose(body.draft_id);
+    m.append(el("p", "meta-note", "Type or say your answer. Nothing has been sent."));
+    return;
+  }
   const nc = body.new_contact;
   if (nc && body.kind !== "payee") {
     // A new contact still missing (or with a bad) number: the reply is the number.

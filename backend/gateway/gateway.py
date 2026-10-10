@@ -39,7 +39,7 @@ from backend.gateway.stepup import StepUpStore
 from backend.data import destinations
 from backend.data.db import connect
 from backend.gateway.executor import AlreadyExecuted, DestinationChanged, MockExecutor
-from backend.policy import safety, scam
+from backend.policy import attempts, safety, scam
 
 # Outcomes recorded for a draft that ended WITHOUT running.
 CLOSED_OUTCOMES = frozenset({"DECLINED", "CANCELLED"})
@@ -185,7 +185,8 @@ class Gateway:
         #        name) — enforced HERE, where money moves, whatever the page
         #        showed or skipped.
         owner = owner_of(resolved_plan, db_path=self.executor.db_path)
-        refused = self._scam_protection(resolved_plan, draft_id, p_hash, owner, confirm_name)
+        refused, scam_outcome = self._scam_protection(resolved_plan, draft_id, p_hash, owner,
+                                                       confirm_name)
         if refused is not None:
             return self._reject(draft_id, p_hash, *refused)
 
@@ -216,6 +217,23 @@ class Gateway:
                                     "confirmation first: "
                                     + "; ".join(verdicts.reasons()))
 
+        # 4b. a payment that failed threshold 2 waits before the money moves
+        #     (scam.py), and can still be cancelled in that window. Everything
+        #     above has passed: release_due() runs it, re-checking the freeze
+        #     and policy first.
+        if scam.release_delay(scam_outcome):
+            release_at = safety.schedule_release(
+                draft_id, owner, payload=resolved_plan.model_dump_json(), payload_hash=p_hash,
+                now=now, seconds=scam.release_delay(scam_outcome), db_path=self.executor.db_path)
+            if self.step_up is not None:
+                self.step_up.consume(draft_id)
+            safety.release_hold(draft_id, db_path=self.executor.db_path)
+            self.audit.append(AuditEntryType.EXECUTION_SCHEDULED, {
+                "draft_id": draft_id, "payload_hash": p_hash, "release_at": release_at})
+            return {"accepted": True, "scheduled": True, "draft_id": draft_id,
+                    "payload_hash": p_hash, "release_at": release_at,
+                    "seconds_left": max(0, release_at - int(time.time()))}
+
         # 5. execute on the mock ledger.
         try:
             result = self.executor.execute(resolved_plan, payload_hash=p_hash)
@@ -226,6 +244,7 @@ class Gateway:
         if self.step_up is not None:
             self.step_up.consume(draft_id)
         safety.release_hold(draft_id, db_path=self.executor.db_path)   # a served hold is done
+        attempts.mark(draft_id, attempts.SENT, now=now, db_path=self.executor.db_path)
         self.audit.append(
             AuditEntryType.EXECUTION,
             {
@@ -403,28 +422,85 @@ class Gateway:
         return any(safety.kill_switch_engaged(u, db_path=self.executor.db_path) is not None
                    for u in users if u)
 
+    def release_due(self, now: int | None = None) -> list[dict]:
+        """Run every scheduled (large) payment whose wait is over. Each was
+        signed and passed every check when scheduled; the freeze and policy
+        are checked again now, because the ledger may have moved. A cancel in
+        the window already recorded CANCELLED in the executions table, so the
+        executor refuses the payment and nothing is sent."""
+        now = int(time.time()) if now is None else now
+        db = self.executor.db_path
+        done = []
+        for row in safety.claim_due_releases(now, db_path=db):
+            draft_id, p_hash = row["draft_id"], row["payload_hash"]
+            plan = ResolvedPlan.model_validate_json(row["payload"])
+            stop = None
+            if safety.kill_switch_engaged(row["user_id"], db_path=db) is not None:
+                stop = "kill switch"
+            elif self.policy_db_path is not None:
+                verdicts = evaluate(plan, load_context(row["user_id"], db_path=self.policy_db_path))
+                self.audit.append(AuditEntryType.POLICY, verdicts.to_audit_payload(draft_id))
+                if verdicts.blocked:
+                    stop = "policy: " + "; ".join(verdicts.reasons())
+            if stop is None:
+                try:
+                    result = self.executor.execute(plan, payload_hash=p_hash)
+                except AlreadyExecuted:              # cancelled in the window
+                    safety.set_release_status(draft_id, ("RUNNING",), "CANCELLED", db_path=db)
+                    attempts.mark(draft_id, attempts.STOPPED, now=now, db_path=db)
+                    done.append({"draft_id": draft_id, "status": "CANCELLED"})
+                    continue
+                except DestinationChanged:
+                    stop = "the payee's number changed"
+                else:
+                    safety.set_release_status(draft_id, ("RUNNING",), "SENT", db_path=db)
+                    attempts.mark(draft_id, attempts.SENT, now=now, db_path=db)
+                    self.audit.append(AuditEntryType.EXECUTION, {
+                        "draft_id": draft_id, "payload_hash": p_hash,
+                        "outcome": result["status"], "legs": result["legs"], "delayed": True})
+                    draft = self.drafts.get(draft_id) if hasattr(self.drafts, "get") else None
+                    if draft is not None:
+                        draft.status = "executed"
+                    done.append({"draft_id": draft_id, "status": "SENT", "execution": result})
+                    continue
+            try:
+                self.executor.close(draft_id, "payment", p_hash, "CANCELLED")
+            except AlreadyExecuted:
+                pass
+            safety.set_release_status(draft_id, ("RUNNING",), "CANCELLED", db_path=db)
+            attempts.mark(draft_id, attempts.STOPPED, now=now, db_path=db)
+            self.audit.append(AuditEntryType.DRAFT_CANCELLED, {
+                "draft_id": draft_id, "payload_hash": p_hash, "prior_status": "scheduled",
+                "by": stop})
+            draft = self.drafts.get(draft_id) if hasattr(self.drafts, "get") else None
+            if draft is not None:
+                draft.status = "cancelled"
+            done.append({"draft_id": draft_id, "status": "CANCELLED", "reason": stop})
+        return done
+
     def _scam_protection(self, plan: ResolvedPlan, draft_id: str, p_hash: str,
                          owner: str | None, confirm_name: str | None = None):
-        """(rejection, reason) or None. Reads the ledger, never the request:
-        `owner` is derived from the account rows being debited."""
+        """((rejection, reason) or None, the scam outcome that binds or None).
+        Reads the ledger, never the request: `owner` is derived from the
+        account rows being debited."""
         db = self.executor.db_path
         now = int(time.time())
 
         # The kill switch: the user froze all outgoing payments.
         if owner and safety.kill_switch_engaged(owner, db_path=db) is not None:
             return ("KILL_SWITCH", "your payments are frozen — nothing was sent. Unfreeze "
-                                   "them with a code on your phone first")
+                                   "them with a code on your phone first"), None
 
         refused = destination_refusal(plan, db)
         if refused is not None:
-            return refused
+            return refused, None
 
         # The scam score, re-run like policy. The draft's own outcome still
         # binds (a lower score now does not lift the hold the user was shown),
         # a HIGHER one the draft never arranged refuses (RESCORED), and a hold
         # on this draft is honoured whatever either score says.
         if not owner:
-            return None                          # policy refuses an ownerless plan below
+            return None, None                    # policy refuses an ownerless plan below
         drafted = getattr(self.drafts, "scam_outcome_of", lambda _d: None)(draft_id)
         transcript = getattr(self.drafts, "transcript_of", lambda _d: "")(draft_id) or ""
         assessment = scam.reassess(plan, owner, db_path=db, now=now, transcript=transcript,
@@ -432,36 +508,45 @@ class Gateway:
                                    cooling_hours=self.cooling_hours, draft_id=draft_id)
         self.audit.append(AuditEntryType.SCAM_ASSESSMENT,
                           {"stage": "gateway", "payload_hash": p_hash, **assessment.to_audit()})
-        if scam.rose_past_drafted(drafted, assessment.outcome):
-            return ("RESCORED", "this payment looks riskier than when it was drafted — "
-                                "cancel it and ask again; nothing was sent")
         outcome = scam.stricter(drafted, assessment.outcome)
+
+        def refuse(kind, reason):
+            return (kind, reason), outcome
+        if outcome == scam.BLOCK:
+            return refuse("BLOCKED", "this payment was stopped because it shows several signs "
+                                     "of a scam — nothing was sent. To make it, call your bank")
+        asked = getattr(self.drafts, "purpose_of", lambda _d: None)(draft_id) is not None
+        if (scam.rose_past_drafted(drafted, assessment.outcome)
+                or scam.asks_unasked(assessment, asked)):
+            return refuse("RESCORED", "this payment looks riskier than when it was drafted — "
+                                      "cancel it and ask again; nothing was sent")
         hold = safety.get_hold(draft_id, db_path=db)
         if hold is None and scam.needs_hold(outcome):
-            return ("HOLD_REQUIRED", "this payment now needs a safety hold — cancel it "
-                                     "and ask again; nothing was sent")
+            return refuse("HOLD_REQUIRED", "this payment now needs a safety hold — cancel it "
+                                           "and ask again; nothing was sent")
         if hold is not None:
             if hold["status"] == "CANCELLED":
-                return ("STATE", "this payment's hold was cancelled — nothing was sent")
+                return refuse("STATE", "this payment's hold was cancelled — nothing was sent")
             if not safety.hold_covers(hold, p_hash):
                 # The hold was for another payload on this draft (an answer
                 # changed it) and this one's wait was never recorded.
-                return ("HOLD_REQUIRED", "this payment's safety hold was for a different "
-                                         "payment — cancel it and ask again; nothing was sent")
+                return refuse("HOLD_REQUIRED", "this payment's safety hold was for a different "
+                                               "payment — cancel it and ask again; nothing was sent")
             if now < int(hold["release_at"]):
-                return ("HELD", f"this payment is on a safety hold for "
-                                f"{int(hold['release_at']) - now} more seconds — nothing was sent")
+                return refuse("HELD", f"this payment is on a safety hold for "
+                                      f"{int(hold['release_at']) - now} more seconds — nothing "
+                                      f"was sent")
         if outcome == scam.HOLD_STEP_UP:
             if not (self.step_up is not None and self.step_up.is_confirmed(draft_id, p_hash)):
-                return ("CONFIRMATION", "this payment needs the code sent to your phone first")
+                return refuse("CONFIRMATION", "this payment needs the code sent to your phone first")
             # The name the card asked for with this payload, else the payee
             # the risk points at now. A name the page never collected fails here.
             expected = (getattr(self.drafts, "confirm_name_of", lambda *_: None)(draft_id, p_hash)
                         or assessment.riskiest_payee)
             if expected and not scam.name_confirmed(confirm_name, expected):
-                return ("CONFIRMATION", "this payment needs the payee's name typed in "
-                                        "first — nothing was sent")
-        return None
+                return refuse("CONFIRMATION", "this payment needs the payee's name typed in "
+                                              "first — nothing was sent")
+        return None, outcome
 
     def _already_final(self, draft_id: str, p_hash: str, prior: dict) -> dict:
         """The draft already has its one outcome. Declined/cancelled is a STATE

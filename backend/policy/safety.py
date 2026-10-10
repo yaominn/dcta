@@ -93,6 +93,64 @@ def cancel_user_holds(user_id: str, *, db_path=None) -> list[str]:
         conn.close()
 
 
+# --------------------------------------------------------------------------- delayed release
+# A large payment, signed and checked, waits before the money moves.
+def schedule_release(draft_id: str, user_id: str, *, payload: str, payload_hash: str,
+                     now: int, seconds: int, db_path=None) -> int:
+    """Schedule it; returns the release time. Once per draft (INSERT OR IGNORE)."""
+    conn = connect(db_path or DB_PATH)
+    try:
+        conn.execute("INSERT OR IGNORE INTO delayed_payments (draft_id, user_id, payload, "
+                     "payload_hash, created_at, release_at, status) VALUES (?,?,?,?,?,?,'PENDING')",
+                     (draft_id, user_id, payload, payload_hash, now, now + seconds))
+        conn.commit()
+        return int(conn.execute("SELECT release_at FROM delayed_payments WHERE draft_id=?",
+                                (draft_id,)).fetchone()["release_at"])
+    finally:
+        conn.close()
+
+
+def get_release(draft_id: str, *, db_path=None) -> dict | None:
+    conn = connect(db_path or DB_PATH)
+    try:
+        row = conn.execute("SELECT * FROM delayed_payments WHERE draft_id=?",
+                           (draft_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def claim_due_releases(now: int, *, db_path=None) -> list[dict]:
+    """PENDING -> RUNNING for every payment whose wait is over, one row at a
+    time, so two release loops never run the same payment."""
+    conn = connect(db_path or DB_PATH)
+    try:
+        due = [dict(r) for r in conn.execute(
+            "SELECT * FROM delayed_payments WHERE status='PENDING' AND release_at<=?", (now,))]
+        claimed = []
+        for row in due:
+            cur = conn.execute("UPDATE delayed_payments SET status='RUNNING' "
+                               "WHERE draft_id=? AND status='PENDING'", (row["draft_id"],))
+            if cur.rowcount == 1:
+                claimed.append(row)
+        conn.commit()
+        return claimed
+    finally:
+        conn.close()
+
+
+def set_release_status(draft_id: str, frm: tuple[str, ...], to: str, *, db_path=None) -> bool:
+    conn = connect(db_path or DB_PATH)
+    try:
+        marks = ",".join("?" * len(frm))
+        cur = conn.execute(f"UPDATE delayed_payments SET status=? WHERE draft_id=? "
+                           f"AND status IN ({marks})", (to, draft_id, *frm))
+        conn.commit()
+        return cur.rowcount == 1
+    finally:
+        conn.close()
+
+
 # --------------------------------------------------------------------------- kill switch
 def kill_switch_engaged(user_id: str, *, db_path=None) -> int | None:
     """engaged_at while engaged, else None."""

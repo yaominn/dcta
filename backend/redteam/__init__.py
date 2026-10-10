@@ -62,14 +62,19 @@ def _client() -> TestClient:
     return TestClient(app)
 
 
-def _draft(client: TestClient, transcript: str, *, answer_first_choice=False) -> dict:
+def _draft(client: TestClient, transcript: str, *, answer_first_choice=False,
+           purpose: str = "paying them back") -> dict:
     """POST a transcript; optionally answer the first clarification by choosing
-    the first candidate (the demo's disambiguation step)."""
+    the first candidate (the demo's disambiguation step). A risky payment's
+    "what is this payment for?" is answered with `purpose` (the default adds
+    no points)."""
     r = client.post("/api/drafts", json={"transcript": transcript}).json()
     if answer_first_choice and r.get("status") == "clarify" and r.get("choices"):
         r = client.post(f"/api/drafts/{r['draft_id']}/clarify",
                         json={"field": r["field"],
                               "choice_id": r["choices"][0]["id"]}).json()
+    if r.get("status") == "clarify" and r.get("kind") == "purpose":
+        r = client.post(f"/api/drafts/{r['draft_id']}/purpose", json={"answer": purpose}).json()
     return r
 
 
@@ -494,15 +499,20 @@ def scenario_11_coached_victim(client: TestClient) -> Result:
     logged = [json.loads(e["payload"]) for e in chain if e["entry_type"] == "SCAM_ASSESSMENT"]
     r.line(f"audit log: the phrase flags came from '{logged[-1].get('source')}'" if logged
            else "audit log: no assessment recorded")
-    forced = _force_submit(client, d)
+    if d.get("status") == "blocked":
+        # Too many signs (scam.BLOCK, e.g. at night when UNUSUAL_HOUR adds a
+        # point): there is no plan to sign at all, so nothing to force.
+        forced = {"rejection": "BLOCKED", "reason": "no plan was ever signable"}
+    else:
+        forced = _force_submit(client, d)
     r.line(f"forced straight to the gateway: {forced.get('rejection')}")
     cancel = client.post(f"/api/drafts/{d['draft_id']}/cancel").json()
     r.line(f"one-tap Cancel: sent={cancel.get('sent')}; "
            f"acct_savings unchanged: {_balance('acct_savings') == before}")
-    r.passed = (risk.get("outcome") == "HOLD_STEP_UP"
+    r.passed = (risk.get("outcome") in ("HOLD_STEP_UP", "BLOCK")
                 and any(s["code"] == "SOCIAL_ENGINEERING_LANGUAGE" for s in risk.get("signals", []))
                 and bool(logged) and logged[-1].get("source") == "rules (not the model)"
-                and forced.get("rejection") in ("HELD", "CONFIRMATION")
+                and forced.get("rejection") in ("HELD", "CONFIRMATION", "BLOCKED")
                 and cancel.get("sent") is False and _balance("acct_savings") == before)
     return r
 

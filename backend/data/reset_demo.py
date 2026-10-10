@@ -41,6 +41,15 @@ def reset_demo(db_path: Path = DB_PATH) -> dict:
         for acct_id, _user, _alias, balance, _type in ACCOUNTS:
             conn.execute("UPDATE accounts SET balance=? WHERE id=?", (balance, acct_id))
         conn.execute("DELETE FROM transaction_history")
+        # A large payment still waiting to run would land on the reset balances.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='delayed_payments'").fetchone() is not None:
+            conn.execute("DELETE FROM delayed_payments WHERE status IN ('PENDING','RUNNING')")
+        # Earlier attempts feed the scam score (retries, stopped payments): a
+        # reset demo starts with none.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='scam_attempts'").fetchone() is not None:
+            conn.execute("DELETE FROM scam_attempts")
         # The seed's own rows and statement shape: one baseline, not two copies.
         conn.executemany(
             "INSERT INTO transaction_history (user_id, payee_id, leg_type, amount, ts) "

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import threading
+from contextlib import asynccontextmanager
 import time
 
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
@@ -58,13 +59,27 @@ from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
 from backend.drafts import Draft, DraftStore
 from backend.narrate import narrate
-from backend.policy import safety, scam
+from backend.policy import attempts, safety, scam
 from backend.trace import RecordingProvider, TraceStore
 from backend.display import add_summary, change_summary, cents_to_display, plan_summary
 
 from pathlib import Path
 
+@asynccontextmanager
+async def _lifespan(_app):
+    """The release loop (_release_loop) runs while the server does. Only a real
+    server starts it: tests drive Gateway.release_due() themselves."""
+    stop = threading.Event()
+    threading.Thread(target=_release_loop, args=(stop,), daemon=True,
+                     name="release-loop").start()
+    try:
+        yield
+    finally:
+        stop.set()
+
+
 app = FastAPI(
+    lifespan=_lifespan,
     title="DCTA — Direct Conversational Transaction Agent",
     description=(
         "GenAI is a generator of drafts, never an executor of funds. "
@@ -379,7 +394,8 @@ def issue_nonce(draft_id: str = Query(...)):
             "error": reported, "draft_id": draft_id, "rejection": "POLICY"})
     if draft.kind == "payment" and draft.resolved_plan is not None and draft.scam_floor:
         fresh = _rescore(draft, draft.resolved_plan, int(time.time()))
-        if scam.rose_past_drafted(draft.scam_floor, fresh.outcome):
+        if (scam.rose_past_drafted(draft.scam_floor, fresh.outcome)
+                or scam.asks_unasked(fresh, draft.purpose is not None)):
             _traces.event(draft_id, "nonce", issued=False, reason="riskier than drafted",
                           drafted=draft.scam_floor, now=fresh.outcome)
             raise HTTPException(status_code=409, detail={
@@ -446,7 +462,7 @@ def _traced_gateway(draft_id: str, path: str, out: dict) -> dict:
     if out.get("accepted") or out.get("rejection") == "DUPLICATE":
         draft = _drafts.get(draft_id)
         if draft is not None:
-            draft.status = "executed"
+            draft.status = "scheduled" if out.get("scheduled") else "executed"
     _traces.event(draft_id, "gateway", path=path, accepted=out.get("accepted"),
                   rejection=out.get("rejection"), reason=out.get("reason"),
                   execution=out.get("execution"), payload_hash=out.get("payload_hash"))
@@ -895,9 +911,37 @@ def _pipeline(draft: Draft) -> dict:
         _audit.append(AuditEntryType.SCAM_ASSESSMENT,
                       {"stage": "draft", "payload_hash": p_hash, **assessment.to_audit()})
         _traces.event(draft.draft_id, "scam", **draft.scam)
-        logging.info("scam assessment %s: %s (score %d) %s", draft.draft_id,
-                     assessment.outcome, assessment.score,
+        logging.info("scam assessment %s: %s (facts %s, words %s) %s", draft.draft_id,
+                     assessment.outcome, assessment.facts, assessment.words,
                      [f"{x.code}+{x.weight}" for x in assessment.signals])
+        asking = (scam.ASK_QUESTIONS and draft.purpose is None and assessment.asks
+                  and scam_outcome != scam.BLOCK)
+        # Remembered for later attempts' scores (retries, stopped payments).
+        attempts.record(draft.draft_id, draft.user_id,
+                        [leg for leg in resolved.plan if leg.type == "TRANSFER"],
+                        outcome=scam_outcome, asked=asking or draft.purpose is not None, now=now,
+                        status=attempts.STOPPED if scam_outcome == scam.BLOCK else attempts.OPEN)
+        if scam_outcome == scam.BLOCK:
+            # Too many signs to go ahead in the app at all: nothing to sign,
+            # and the user is told to call their bank.
+            draft.status = "blocked"
+            draft.resolved_plan = None
+            draft.question = None
+            _traces.event(draft.draft_id, "scam", blocked=True, score=assessment.score)
+            return {"status": "blocked", "kind": "scam", "draft_id": draft.draft_id,
+                    "reasons": warnings, "scam": _public_scam(assessment, None, draft.scam)}
+        if asking:
+            # Threshold 1 (facts 3-9.9): ask before anything is held or
+            # signable — questions picked by the facts that scored highest. The
+            # answer's words are weighed at threshold 2 and re-run this
+            # pipeline; the floor above means they can only add.
+            draft.status = "clarify"
+            draft.resolved_plan = None
+            draft.question = {"question": " ".join(assessment.questions), "field": "purpose",
+                              "kind": "purpose", "choices": [],
+                              "questions": list(assessment.questions)}
+            _traces.event(draft.draft_id, "scam", asked="purpose", score=assessment.score)
+            return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
         if scam.needs_hold(scam_outcome):
             hold_release = safety.create_hold(draft.draft_id, draft.user_id,
                                               seconds=_hold_seconds(), now=now,
@@ -1099,7 +1143,7 @@ def _hold_seconds() -> int:
 
 def _rescore(draft: Draft, plan: ResolvedPlan, now: int):
     return scam.reassess(plan, draft.user_id, db_path=DB_PATH, now=now,
-                         transcript=draft.transcript,
+                         transcript=draft.scam_text,
                          recent_change_hours=settings.recent_change_hours,
                          cooling_hours=settings.credential_cooling_hours,
                          draft_id=draft.draft_id)
@@ -1115,7 +1159,10 @@ def _public_scam(assessment, hold_release: int | None, stored: dict | None) -> d
            "signals": [{"code": s.code, "weight": s.weight, "detail": s.detail}
                        for s in assessment.signals],
            "warnings": stored["warnings"],
-           "confirm_name": stored["confirm_name"], "hold": None}
+           "confirm_name": stored["confirm_name"], "hold": None,
+           "facts": assessment.facts, "words": assessment.words,
+           "decision": assessment.decision,
+           "release_delay_seconds": scam.release_delay(stored["outcome"])}
     if hold_release is not None:
         out["hold"] = {"release_at": hold_release,
                        "seconds_left": max(0, hold_release - int(time.time()))}
@@ -1127,8 +1174,19 @@ def _with_debug(out: dict, draft: Draft, llm_calls: list) -> dict:
     page to print to the browser console. The /data page shows the same."""
     if not settings.console_debug:
         return out
-    out["debug"] = {"scam": getattr(draft, "scam", None),
+    assessed = getattr(draft, "scam", None)
+    if assessed:
+        assessed = {**assessed, "thresholds": {
+                        "facts_ask": scam.FACTS_ASK_FROM, "facts_fail": scam.FACTS_FAIL_FROM,
+                        "facts_call_bank": scam.FACTS_CALL_BANK_FROM,
+                        "words_fail": scam.WORDS_FAIL_FROM, "words_serious": scam.WORDS_SERIOUS_FROM,
+                        "words_call_bank": scam.WORDS_CALL_BANK_FROM},
+                    "breakdown": scam.breakdown(
+            assessed["signals"], recent_change_hours=settings.recent_change_hours,
+            cooling_hours=settings.credential_cooling_hours)}
+    out["debug"] = {"scam": assessed,
                     "scam_language": scam.phrase_codes(scam.scan_transcript(draft.transcript)),
+                    "words": scam.word_score(draft.scam_text),
                     "llm_calls": llm_calls}
     return out
 
@@ -1398,6 +1456,57 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
     return _with_debug(_run(draft), draft, getattr(draft, "llm_calls", []))
 
 
+@app.get("/api/drafts/{draft_id}/release", response_model=None)
+def release_status(draft_id: str):
+    """Where a scheduled (large) payment is: PENDING with seconds left, SENT
+    with what ran, or CANCELLED. Runs anything due first, so the page sees
+    the money move on time even between release-loop ticks."""
+    _gateway.release_due()
+    row = safety.get_release(draft_id)
+    if row is None:
+        raise HTTPException(404, {"error": "no scheduled payment for this draft",
+                                  "draft_id": draft_id})
+    out = {"draft_id": draft_id, "status": row["status"],
+           "seconds_left": max(0, int(row["release_at"]) - int(time.time()))}
+    prior = _executor.prior_execution(draft_id)
+    if row["status"] == "SENT" and prior is not None:
+        out["execution"] = prior["result"]
+    return out
+
+
+def _release_loop(stop: threading.Event) -> None:
+    """Send scheduled (large) payments when their wait is over."""
+    while not stop.wait(2):
+        try:
+            _gateway.release_due()
+        except Exception:
+            logging.exception("release loop failed; retrying")
+
+
+class PurposeAnswer(BaseModel):
+    """The user's own words for what a risky payment is for."""
+    answer: str = Field(min_length=1, max_length=300)
+
+
+@app.post("/api/drafts/{draft_id}/purpose", response_model=None)
+def answer_purpose(draft_id: str, body: PurposeAnswer):
+    """Answer "what is this payment for?". The answer is scored by the scam rules
+    (never the model) and the pipeline runs again: it can only add friction."""
+    draft = _drafts.get(draft_id)
+    if draft is None:
+        raise HTTPException(404, {"error": "no such draft (or it expired)",
+                                  "draft_id": draft_id})
+    if draft.status in FINAL_STATUSES:
+        raise HTTPException(409, {"error": f"draft is {draft.status}", "draft_id": draft_id,
+                                  "status": draft.status})
+    if (draft.question or {}).get("kind") != "purpose" or not body.answer.strip():
+        raise HTTPException(409, {"error": "this draft isn't waiting for what the payment "
+                                           "is for", "draft_id": draft_id})
+    draft.purpose = body.answer.strip()
+    _traces.event(draft_id, "answer", field="purpose", answer=draft.purpose)
+    return _with_debug(_run(draft), draft, getattr(draft, "llm_calls", []))
+
+
 # --------------------------------------------------------------------------- decline / cancel
 # Saying no, on the server. Before this the only way to refuse a draft was to
 # leave it alone, and it stayed signable for its whole window. Both are FINAL,
@@ -1440,6 +1549,11 @@ def _close_draft(draft_id: str, outcome: str, entry: AuditEntryType, *,
     if safety.cancel_hold(draft_id):                 # a held payment, stopped in its hold
         _audit.append(AuditEntryType.HOLD_CANCELLED, {"draft_id": draft_id,
                                                       "payload_hash": p_hash, **label})
+    # A large payment waiting to run: the executions row above already stops
+    # it; this keeps the release loop from picking it up at all.
+    safety.set_release_status(draft_id, ("PENDING",), "CANCELLED")
+    if draft.kind == "payment":
+        attempts.mark(draft_id, attempts.STOPPED, now=int(time.time()))
     _traces.event(draft_id, outcome.lower(), prior_status=was)
     return {"draft_id": draft_id, "status": outcome.lower(), "sent": False}
 

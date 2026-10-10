@@ -48,6 +48,8 @@ class Draft:
       frozen   — the validator froze it; the plan is retained for display, but
                  /api/auth/nonce refuses a nonce so it cannot be signed
       ready    — resolved, policy-cleared, validator-passed; signable
+      scheduled — signed and checked, a LARGE payment waiting
+                 scam.RELEASE_DELAY_SECONDS before it runs; can be cancelled
       executed — reached the executor once; never again (the `executions`
                  table enforces that — this field follows it for display)
       declined — the user said no before signing; final
@@ -82,6 +84,14 @@ class Draft:
     scam_floor: str | None = None
     llm_calls: list = field(default_factory=list)   # model prompts, for CONSOLE_DEBUG
     question: dict | None = None
+    # The answer to "what is this payment for?" (scam.PURPOSE_QUESTION), asked
+    # once when the score is high. Scored by the rules; never sent to the model.
+    purpose: str | None = None
+
+    @property
+    def scam_text(self) -> str:
+        """Everything the user said about this payment, for the scam score."""
+        return self.transcript + ("\n" + self.purpose if self.purpose else "")
 
     @property
     def payload(self):
@@ -149,9 +159,15 @@ class DraftStore:
         return None
 
     def transcript_of(self, draft_id: str) -> str:
-        """What the user said for this draft — for the gateway's scam re-check."""
+        """What the user said for this draft, with the purpose they gave — for the
+        gateway's scam re-check."""
         draft = self.get(draft_id)
-        return draft.transcript if draft is not None else ""
+        return draft.scam_text if draft is not None else ""
+
+    def purpose_of(self, draft_id: str) -> str | None:
+        """The user's answer to the threshold-1 questions, if they were asked."""
+        draft = self.get(draft_id)
+        return draft.purpose if draft is not None else None
 
     def scam_outcome_of(self, draft_id: str) -> str | None:
         """The strictest scam outcome the draft was shown with (None: never assessed)."""
@@ -167,11 +183,12 @@ class DraftStore:
 
     def open_ids(self, user_id: str) -> list[str]:
         """The user's drafts that could still be signed — every "ready" one,
-        including those on a hold or waiting for a phone code."""
+        including those on a hold or waiting for a phone code — and every
+        signed large payment still waiting to run ("scheduled")."""
         with self._lock:
             self._sweep()
             return [k for k, d in self._drafts.items()
-                    if d.user_id == user_id and d.status == "ready"]
+                    if d.user_id == user_id and d.status in ("ready", "scheduled")]
 
     def _sweep(self) -> None:
         """Drop expired drafts. The caller holds the lock."""

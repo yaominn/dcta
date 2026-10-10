@@ -71,11 +71,12 @@ def _mom(cents, *, version=1, acct="acct_savings", leg_id="t1"):
 
 
 def _ctx(*, now=NOON_SGT, mom=MOM, history=MOM_HISTORY, balances=None, creds=(NOON_SGT - 86400 * 30,),
-         transcript="", extra_dests=None):
+         transcript="", extra_dests=None, attempts=(), freeze_released_at=None):
     dests = {"payee_17": mom, **(extra_dests or {})}
     return scam.ScamContext(now=now, destinations=dests, history=list(history),
                             balances=balances or {"acct_savings": 842050, "acct_joint": 120000},
-                            credentials=list(creds), transcript=transcript)
+                            credentials=list(creds), transcript=transcript,
+                            attempts=list(attempts), freeze_released_at=freeze_released_at)
 
 
 def _codes(a):
@@ -100,23 +101,25 @@ def test_a_first_payment_warns():
     assert a.warnings and "first payment" in a.warnings[0]
 
 
-def test_the_new_number_scam_is_held():
-    """Mom's number changed an hour ago; $500 to the new number."""
+def test_the_new_number_scam_fails_whatever_the_answer():
+    """Mom's number changed an hour ago; $500 to the new number. A changed
+    number (5) + a first payment to it (2) = facts 7: a fail, even with calm words."""
     changed = destinations.Destination("payee_17", 2, "PAYNOW_MOBILE", "+65 8123 ••67", "h2",
                                        NOON_SGT - 3600)
-    a = scam.assess(_plan(_mom(50000, version=2)), _ctx(mom=changed))
+    a = scam.assess(_plan(_mom(50000, version=2)), _ctx(mom=changed, transcript="paying her back"))
     assert _codes(a) == {"FIRST_PAYMENT_TO_DESTINATION", "RECENT_DESTINATION_CHANGE"}
-    assert (a.score, a.outcome) == (5, "HOLD")
+    assert (a.facts, a.decision, a.outcome) == (7, "FAIL", "HOLD_STEP_UP")
     assert "Mom's PayNow number was changed 1 hour ago" in a.warnings[0]
     assert "Call Mom on a number you already know" in a.warnings[0]
 
 
-def test_a_large_first_payment_to_a_new_number_needs_everything():
+def test_a_large_first_payment_to_a_new_number_is_blocked():
+    """Changed number 5 + first payment 2 + amount (capped) 5 = facts 12: call the bank."""
     changed = destinations.Destination("payee_17", 2, "PAYNOW_MOBILE", "+65 8123 ••67", "h2",
                                        NOON_SGT - 7200)
     a = scam.assess(_plan(_mom(300000, version=2)), _ctx(mom=changed))
     assert "LARGE_FIRST_PAYMENT" in _codes(a)
-    assert (a.score, a.outcome, a.confirm_name) == (8, "HOLD_STEP_UP", "Mom")
+    assert (a.facts, a.decision, a.outcome, a.asks) == (12, "CALL_BANK", "BLOCK", False)
 
 
 def test_old_history_rows_count_as_the_first_destination():
@@ -148,9 +151,9 @@ def test_a_recently_added_passkey_but_not_the_first():
     assert "RECENT_CREDENTIAL_CHANGE" in _codes(second)
 
 
-def test_unusual_hour_only_for_a_first_payment_at_night():
+def test_unusual_hour_for_any_payment_at_night():
     assert "UNUSUAL_HOUR" in _codes(scam.assess(_plan(_mom(5000)), _ctx(now=TWO_AM_SGT, history=[])))
-    assert "UNUSUAL_HOUR" not in _codes(scam.assess(_plan(_mom(5000)), _ctx(now=TWO_AM_SGT)))
+    assert "UNUSUAL_HOUR" in _codes(scam.assess(_plan(_mom(5000)), _ctx(now=TWO_AM_SGT)))
     assert "UNUSUAL_HOUR" not in _codes(scam.assess(_plan(_mom(5000)), _ctx(history=[])))
 
 
@@ -159,11 +162,12 @@ def test_each_signal_counts_once_across_legs():
     assert a.score == 2
 
 
-def test_a_hold_always_says_why():
-    """First payment + large first payment hold it; neither has a sentence of
-    its own, so the card must not show a countdown with nothing explaining it."""
+def test_a_card_always_says_why():
+    """First payment + large first payment: neither has a sentence of its own,
+    so the card must not show friction with nothing explaining it."""
     a = scam.assess(_plan(_mom(300000)), _ctx(history=[]))
-    assert (a.outcome, _codes(a)) == ("HOLD", {"FIRST_PAYMENT_TO_DESTINATION", "LARGE_FIRST_PAYMENT"})
+    assert _codes(a) == {"FIRST_PAYMENT_TO_DESTINATION", "LARGE_FIRST_PAYMENT"}
+    assert (a.facts, a.asks, a.outcome) == (5, True, "WARN")
     assert a.warnings and "first payment" in a.warnings[0] and "large" in a.warnings[0]
 
 
@@ -179,9 +183,9 @@ def _landlord(cents, leg_id="t2"):
 
 
 def test_the_name_to_type_is_the_risky_payee_not_the_first():
+    # landlord: first payment 2 + amount (capped) 5 = facts 7, a serious fail
     a = scam.assess(_plan(_mom(5000, leg_id="t1"), _landlord(500000)),
-                    _ctx(extra_dests={"payee_30": LANDLORD},
-                         transcript="the police officer said to pay mom 50 and landlord 5000"))
+                    _ctx(extra_dests={"payee_30": LANDLORD}))
     assert a.outcome == "HOLD_STEP_UP" and a.confirm_name == "Landlord"
 
 
@@ -201,10 +205,20 @@ def test_a_drain_split_across_transfers_still_counts_once():
     assert [s.code for s in a.signals].count("BALANCE_DRAIN") == 1
 
 
-@pytest.mark.parametrize("score,outcome", [(0, "ALLOW"), (1, "ALLOW"), (2, "WARN"), (3, "WARN"),
-                                           (4, "HOLD"), (6, "HOLD"), (7, "HOLD_STEP_UP")])
-def test_score_bands(score, outcome):
-    assert scam.outcome_for(score) == outcome
+@pytest.mark.parametrize("facts,words,never,expected", [
+    (0, 8, (), ("PASS", "ALLOW")),             # below threshold 1 the words don't count
+    (2.9, 5, (), ("PASS", "ALLOW")),
+    (3, 0, (), ("PASS", "ALLOW")),             # asked, and the answer is calm
+    (3, 2, (), ("FAIL", "DELAY")),
+    (6.9, 3.9, (), ("FAIL", "DELAY")),
+    (3, 4, (), ("FAIL", "HOLD_STEP_UP")),      # serious words: the phone code too
+    (7, 0, (), ("FAIL", "HOLD_STEP_UP")),      # very risky facts fail, however calm
+    (3, 6, (), ("CALL_BANK", "BLOCK")),
+    (10, 0, (), ("CALL_BANK", "BLOCK")),       # too risky to ask
+    (0, 4, ("words_safe_account",), ("CALL_BANK", "BLOCK")),   # a never rule: always
+])
+def test_the_two_thresholds(facts, words, never, expected):
+    assert scam.decide(facts, words, never) == expected
 
 
 # --------------------------------------------------------------------------- the phrase flags
@@ -215,7 +229,8 @@ def test_the_coached_victim():
     assert {"words_safe_account", "words_secrecy", "words_urgency"} <= set(codes)
     a = scam.assess(_plan(_mom(5000)), _ctx(transcript=t))
     se = next(x for x in a.signals if x.code == "SOCIAL_ENGINEERING_LANGUAGE")
-    assert se.weight == 4 and a.outcome == "HOLD"          # a "safe account" alone holds it
+    assert se.weight == 8.0 and a.outcome == "BLOCK"          # never rules: call the bank
+    assert set(a.never_rules) == {"words_official_orders", "words_safe_account"}
     assert "safe account" in a.warnings[0] and "1799" in a.warnings[0]
 
 
@@ -223,7 +238,7 @@ def test_an_official_giving_orders_is_refuse_grade():
     found = scam.scan_transcript("the police told me to pay mom 5000")
     assert scam.strong_codes(found) == ["words_official_orders"]
     a = scam.assess(_plan(_mom(5000)), _ctx(transcript="the police told me to pay mom 5000"))
-    assert a.score == 4 and "1799" in a.warnings[0]
+    assert (a.words, a.outcome) == (4, "BLOCK") and "1799" in a.warnings[0]
 
 
 def test_one_phrase_list_for_payments_and_new_contacts():
@@ -244,6 +259,8 @@ def test_one_phrase_list_for_payments_and_new_contacts():
     "my officer told me to pay 40 for the unit dinner",
     # an agent's commission is a routine payment, not a job scam
     "pay the agent 2000 commission",
+    "pay mom back for the hospital bill", "transfer 1000 to my trading account",
+    "pay the insurance premium", "pay the contractor the renovation deposit",
 ])
 def test_ordinary_requests_are_not_flagged(benign):
     assert scam.strong_codes(scam.scan_transcript(benign)) == [], benign
@@ -265,6 +282,77 @@ def test_paying_to_unlock_commission_is_a_job_scam():
 def test_urgency_is_advisory_only():
     found = scam.scan_transcript("send john 20 asap")
     assert scam.phrase_codes(found) == ["words_urgency"] and scam.warning_for(found) is None
+
+
+def _words(t):
+    return scam.word_score(t)["points"]
+
+
+def test_different_urgency_words_count_more_than_one_repeated():
+    assert _words("hurry now hurry") > _words("hurry hurry") > _words("hurry")
+    assert (_words("hurry"), _words("hurry hurry"), _words("hurry now hurry")) == (0.8, 1.3, 2.1)
+
+
+def test_the_words_count_only_past_threshold_1():
+    """Below facts 3 nothing in the words adds friction (a known payee, $50)."""
+    known = scam.assess(_plan(_mom(5000)), _ctx(transcript="SEND 50 to mom NOW NOW NOW"))
+    assert (known.facts, known.words_weighed, known.outcome) == (0, False, "ALLOW")
+    # a first payment of $1,000+ (facts 5): now the same words are weighed
+    risky = scam.assess(_plan(_mom(150000)), _ctx(history=[], transcript="SEND it NOW NOW NOW"))
+    assert (risky.facts, risky.words, risky.outcome) == (5, 2.7, "DELAY")
+    assert any("rushed" in w for w in risky.warnings)
+
+
+@pytest.mark.parametrize("calm", [
+    "pay mom 50 now", "pay mom 50 now, it's urgent", "send john 20 ASAP",
+    "pay mom 50 dollars now please", "pay mom 500 NOW", "quick one: pay mom 50",
+])
+def test_an_urgent_word_or_two_adds_no_friction(calm):
+    a = scam.assess(_plan(_mom(5000)), _ctx(transcript=calm))
+    assert a.outcome == "ALLOW" and a.score == 0, calm
+
+
+def test_a_phrase_warning_still_shows_below_threshold_1():
+    """Not weighed, but the fixed warning sentence is shown (no other friction)."""
+    a = scam.assess(_plan(_mom(5000)), _ctx(transcript="pay mom 50, she has a new number"))
+    assert (a.words_weighed, a.outcome) == (False, "WARN") and "new number" in a.warnings[0]
+
+
+def test_categories_count_100_then_80_then_64_percent():
+    assert _words("my son has a new number") == 2.5                          # one category
+    # two categories: the stronger at 100%, the next at 80%, whatever the order
+    assert _words("guaranteed returns, he has a new number") == 2.5 + 2.5 * 0.8
+    assert _words("move it to a safe account") == 4.0
+    assert _words("move it to a safe account, don't tell anyone") == 4 + 3 * 0.8
+    # more phrases in ONE category don't add: its strongest counts
+    assert _words("guaranteed returns in crypto on a trading platform") == 2.5
+
+
+def test_words_never_pass_eight():
+    pile = _words("the police told me to transfer to a safe account for an investigation, "
+                  "don't tell the bank, give them my OTP, guaranteed crypto, my new number, "
+                  "part-time job, processing fee, NOW NOW hurry urgent immediately!!")
+    assert pile == scam.WORDS_MAX == 8.0
+
+
+@pytest.mark.parametrize("never", [
+    "pay mom 50, it's for an investigation", "pay mom 50 to my safe account",
+    "pay mom 50, the bank officer needs my OTP", "pay mom 50 and don't tell the bank",
+    "pay mom 50, they will receive the money and forward it",
+    "pay mom 50, my call was transferred to the police",
+])
+def test_a_never_rule_means_call_the_bank_whatever_the_facts(never):
+    a = scam.assess(_plan(_mom(5000)), _ctx(transcript=never))     # a known payee, $50
+    assert a.never_rules and (a.decision, a.outcome) == ("CALL_BANK", "BLOCK"), never
+
+
+@pytest.mark.parametrize("text,category", [
+    ("my online friend needs help", "contact"), ("pay the customs fee for my parcel", "fee"),
+    ("pay to unlock my tasks", "job"), ("he's still on the line", "pressure"),
+    ("I won a prize, pay the processing fee", "fee"), ("use my account to receive it", "mule"),
+])
+def test_the_singapore_scam_categories(text, category):
+    assert category in [c["category"] for c in scam.word_score(text)["categories"]], text
 
 
 def test_instruction_override_is_flagged():
@@ -346,6 +434,234 @@ def _change_moms_number(client, number="8123 4567"):
         "contact_change": d["contact_change"], "nonce": n, "credential_id": "cred_alice",
         "signature": _signer.sign(challenge_hash(payload_hash(ch), n))}).json()
     assert out["accepted"] is True, out
+
+
+# --------------------------------------------------------------------------- "what is it for?"
+@pytest.fixture
+def asking_client(client, monkeypatch):
+    monkeypatch.setattr(scam, "ASK_QUESTIONS", True)
+    return client
+
+
+def test_a_risky_payment_asks_before_anything_is_held(asking_client):
+    from backend.policy import safety
+    _change_moms_number(asking_client)
+    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()   # facts 7
+    assert (d["status"], d["kind"]) == ("clarify", "purpose")
+    assert "Mom's number changed" in d["questions"][0] and d["questions"][-1] == scam.CALL_QUESTION
+    assert "resolved_plan" not in d and safety.get_hold(d["draft_id"]) is None
+    assert asking_client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]}).status_code == 409
+    r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose",
+                           json={"answer": "her share of the rent"}).json()
+    # facts 7+ fail however calm the answer: the code and the server hold
+    assert r["status"] == "ready" and r["scam"]["outcome"] == "HOLD_STEP_UP" and r["scam"]["hold"]
+
+
+def test_a_calm_answer_passes_threshold_2(asking_client):
+    d = asking_client.post("/api/drafts", json={"transcript": "pay landlord 1500"}).json()
+    assert (d["status"], d["kind"]) == ("clarify", "purpose")          # facts 5: asked
+    assert "first payment to Landlord" in d["questions"][0]
+    r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose",
+                           json={"answer": "october rent, no one"}).json()
+    assert r["status"] == "ready" and r["scam"]["outcome"] == "WARN" and r["scam"]["hold"] is None
+
+
+def test_the_answer_is_scored_and_can_only_add(asking_client):
+    _change_moms_number(asking_client)
+    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()
+    r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose", json={
+        "answer": "the police officer told me to transfer it to a safe account"}).json()
+    assert r["status"] == "blocked" and r["scam"]["outcome"] == "BLOCK"   # never rules
+    assert "resolved_plan" not in r and "1799" in r["reasons"][0]
+    # the model never sees the answer: it's for the rules only
+    assert all("safe account" not in c["user"] for c in r["debug"]["llm_calls"])
+
+
+def test_an_ordinary_payment_is_not_asked(asking_client):
+    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    assert d["status"] == "ready" and d["scam"]["outcome"] == "ALLOW"
+
+
+def test_a_never_rule_skips_the_question_and_calls_the_bank(asking_client):
+    d = asking_client.post("/api/drafts", json={
+        "transcript": "pay mom 50 dollars, it's for an investigation"}).json()
+    assert d["status"] == "blocked" and d["scam"]["outcome"] == "BLOCK"
+    assert "investigation" in d["reasons"][0]
+
+
+def test_a_purpose_is_only_taken_when_asked(asking_client):
+    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose", json={"answer": "dinner"})
+    assert r.status_code == 409
+
+
+def _questions(**ctx):
+    return scam.assess(_plan(_mom(5000)), _ctx(**ctx)).questions
+
+
+def test_the_question_follows_the_highest_scoring_fact():
+    changed = destinations.Destination("payee_17", 2, "PAYNOW_MOBILE", "m", "h2", NOON_SGT - 3600)
+    q = scam.assess(_plan(_mom(5000, version=2)), _ctx(mom=changed)).questions
+    assert "Mom's number changed 1 hour ago" in q[0] and q[-1] == scam.CALL_QUESTION
+    assert "How do you know Mom" in _questions(now=TWO_AM_SGT, history=[])[0]   # first 2 > night 1
+    # a tie between different kinds of fact asks both
+    both = _questions(creds=(NOON_SGT - 86400 * 30, NOON_SGT - 60),
+                      freeze_released_at=NOON_SGT - 3600)
+    assert len(both) == 3 and "new device" in both[0] + both[1] and "freeze" in both[0] + both[1]
+    assert _questions() == ()                                       # facts 0: nothing to ask
+
+
+# --------------------------------------------------------------------------- amounts, BLOCK
+def test_the_amount_facts_add_up_to_five_at_most():
+    big = scam.assess(_plan(_mom(500000)), _ctx())
+    assert {"LARGE_AMOUNT", "LARGE_SHARE", "ABOVE_USUAL_MAX", "ABOVE_PAYEE_MAX"} <= _codes(big)
+    assert big.facts == scam.AMOUNT_MAX == 5                       # 8 points, capped
+    assert scam.assess(_plan(_mom(160000)), _ctx()).facts == 4     # > 3 x $500: usual + Mom's
+    assert scam.assess(_plan(_mom(100000)), _ctx()).facts == 0
+
+
+def test_a_blocked_payment_has_nothing_to_sign(client):
+    _change_moms_number(client)
+    d = client.post("/api/drafts", json={"transcript": "pay mom 500, the police told me to "
+                                         "transfer it to a safe account, don't tell anyone"}).json()
+    assert (d["status"], d["kind"], d["scam"]["outcome"]) == ("blocked", "scam", "BLOCK")
+    assert "resolved_plan" not in d and d["reasons"]
+    assert client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]}).status_code == 409
+
+
+# --------------------------------------------------------------------------- the delay on a fail
+@pytest.fixture
+def delaying_client(client, monkeypatch):
+    monkeypatch.setattr(scam, "RELEASE_DELAY_SECONDS", 60)
+    return client
+
+
+def _scheduled(client):
+    # first payment of $1,500 (facts 5) + shouting (words 2.7): a fail, DELAY
+    d = client.post("/api/drafts", json={"transcript": "pay landlord 1500 NOW NOW NOW"}).json()
+    assert d["scam"]["outcome"] == "DELAY" and d["scam"]["release_delay_seconds"] == 60, d["scam"]
+    if d["requires_extra_confirmation"]:                # the spending policy's own code
+        client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
+    out = _execute(client, d)
+    assert out["accepted"] is True and out["scheduled"] is True and out["seconds_left"] > 50, out
+    return d
+
+
+def test_a_failed_payment_waits_then_is_sent(delaying_client):
+    from backend.main import _gateway
+    before = _balance()
+    d = _scheduled(delaying_client)
+    assert _balance() == before and _gateway.release_due() == []          # not yet
+    done = _gateway.release_due(now=int(time.time()) + 61)
+    assert [x["status"] for x in done if x["draft_id"] == d["draft_id"]] == ["SENT"]
+    assert _balance() == before - 150000
+    st = delaying_client.get(f"/api/drafts/{d['draft_id']}/release").json()
+    assert st["status"] == "SENT" and st["execution"]["legs"][0]["status"] == "EXECUTED"
+    late = delaying_client.post(f"/api/drafts/{d['draft_id']}/cancel")
+    assert late.status_code == 409 and late.json()["detail"]["already_executed"]
+
+
+def test_a_failed_payment_can_be_cancelled_while_it_waits(delaying_client):
+    from backend.main import _gateway
+    before = _balance()
+    d = _scheduled(delaying_client)
+    assert delaying_client.post(f"/api/drafts/{d['draft_id']}/cancel").json()["sent"] is False
+    assert _gateway.release_due(now=int(time.time()) + 61) == []
+    assert _balance() == before
+    assert delaying_client.get(f"/api/drafts/{d['draft_id']}/release").json()["status"] == "CANCELLED"
+
+
+def test_the_freeze_stops_a_waiting_payment(delaying_client):
+    from backend.main import _gateway
+    before = _balance()
+    d = _scheduled(delaying_client)
+    delaying_client.post("/api/killswitch")
+    _gateway.release_due(now=int(time.time()) + 61)
+    assert _balance() == before
+    assert delaying_client.get(f"/api/drafts/{d['draft_id']}/release").json()["status"] == "CANCELLED"
+
+
+# --------------------------------------------------------------------------- earlier attempts
+def _attempt(payee="payee_17", amount=150000, *, status="STOPPED", outcome="HOLD_STEP_UP",
+             asked=1, ago=3600, draft="old"):
+    return {"draft_id": draft, "leg_id": "t1", "payee_id": payee, "amount": amount,
+            "outcome": outcome, "asked": asked, "status": status,
+            "created_at": NOON_SGT - ago, "updated_at": NOON_SGT - ago}
+
+
+def test_a_retry_after_a_stopped_payment_counts():
+    a = scam.assess(_plan(_mom(50000)), _ctx(attempts=[_attempt()]))
+    assert {"RETRY_AFTER_STOPPED", "SMALLER_AFTER_STOPPED"} <= _codes(a)    # $500 after $1,500
+    assert a.facts == 6 and a.asks and len(a.questions) == 3
+    bigger = scam.assess(_plan(_mom(200000)), _ctx(attempts=[_attempt()]))
+    assert "RETRY_AFTER_STOPPED" in _codes(bigger) and "SMALLER_AFTER_STOPPED" not in _codes(bigger)
+
+
+@pytest.mark.parametrize("not_stopped", [
+    _attempt(status="SENT"),                                      # it went through
+    _attempt(asked=0, outcome="ALLOW"),                           # cancelled with no friction
+    _attempt(ago=2 * 86400),                                      # more than a day ago
+])
+def test_only_recent_stopped_attempts_count(not_stopped):
+    a = scam.assess(_plan(_mom(50000)), _ctx(attempts=[not_stopped]))
+    assert "RETRY_AFTER_STOPPED" not in _codes(a), not_stopped
+
+
+def test_several_stopped_attempts_add_up():
+    two = [_attempt("p_x", draft="a"), _attempt("p_y", draft="b")]
+    a = scam.assess(_plan(_mom(5000)), _ctx(attempts=two))
+    assert dict((s.code, s.weight) for s in a.signals)["REPEATED_STOPPED_ATTEMPTS"] == 2
+    three = two + [_attempt("p_z", draft="c")]
+    a = scam.assess(_plan(_mom(5000)), _ctx(attempts=three))
+    assert dict((s.code, s.weight) for s in a.signals)["REPEATED_STOPPED_ATTEMPTS"] == 3
+
+
+def _paid(payee, amount, ago):
+    return {"payee_id": payee, "leg_type": "TRANSFER", "amount": amount, "dest_version": 1,
+            "ts": datetime.fromtimestamp(NOON_SGT - ago, timezone.utc).isoformat()}
+
+
+def test_split_payments_to_a_new_payee():
+    a = scam.assess(_plan(_landlord(50000)),
+                    _ctx(extra_dests={"payee_30": LANDLORD},
+                         history=MOM_HISTORY + [_paid("payee_30", 60000, 7200)]))
+    assert "SPLIT_PAYMENTS" in _codes(a)                          # $600 + $500 today
+
+
+def test_escalating_amounts_to_one_payee():
+    week = MOM_HISTORY + [_paid("payee_17", 10000, 3 * 86400), _paid("payee_17", 20000, 86400)]
+    assert "ESCALATING_AMOUNTS" in _codes(scam.assess(_plan(_mom(30000)), _ctx(history=week)))
+    assert "ESCALATING_AMOUNTS" not in _codes(scam.assess(_plan(_mom(15000)), _ctx(history=week)))
+
+
+def test_the_freeze_turned_off_dormant_accounts_and_ignored_warnings():
+    assert "FREEZE_TURNED_OFF" in _codes(scam.assess(
+        _plan(_mom(5000)), _ctx(freeze_released_at=NOON_SGT - 3600)))
+    old = [_paid("p_old", 5000, 120 * 86400)]
+    assert "DORMANT_ACCOUNT_WAKE" in _codes(scam.assess(_plan(_mom(5000)), _ctx(history=old)))
+    warned = [_attempt(status="SENT", outcome="WARN", draft="a"),
+              _attempt(status="SENT", outcome="DELAY", draft="b")]
+    assert "WARNINGS_IGNORED" in _codes(scam.assess(_plan(_mom(5000)), _ctx(attempts=warned)))
+
+
+def test_a_cancelled_payment_is_remembered_by_the_next_one(client):
+    """Cancel a delayed $1,500 to the landlord, then try $900: the retry and the
+    smaller amount push it to a serious fail."""
+    d = client.post("/api/drafts", json={"transcript": "pay landlord 1500 NOW NOW NOW"}).json()
+    assert d["scam"]["outcome"] == "DELAY"
+    client.post(f"/api/drafts/{d['draft_id']}/cancel")
+    again = client.post("/api/drafts", json={"transcript": "pay landlord 900"}).json()
+    codes = {s["code"] for s in again["scam"]["signals"]}
+    assert {"RETRY_AFTER_STOPPED", "SMALLER_AFTER_STOPPED"} <= codes
+    assert again["scam"]["outcome"] == "HOLD_STEP_UP"              # facts 2 + 3 + 3 = 8
+
+
+def test_a_sent_payment_is_recorded_as_sent(client):
+    from backend.policy import attempts
+    d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    assert _execute(client, d)["accepted"] is True
+    rows = attempts.recent("u_alice", since=0)
+    assert [r["status"] for r in rows if r["draft_id"] == d["draft_id"]] == ["SENT"]
 
 
 def _balance(acct="acct_savings"):
@@ -460,7 +776,7 @@ def test_the_new_number_is_what_the_card_and_the_phone_name(client):
     """Not the old, trusted "Mom ··3310" next to a changed number."""
     from backend.main import _phone
     _change_moms_number(client)
-    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
     assert d["resolved_plan"]["plan"][0]["payee_display"] == "Mom ··4567"
     sms = _phone.messages("u_alice")[0]["text"]
     assert "··4567" in sms and "3310" not in sms
@@ -497,8 +813,9 @@ def test_nothing_is_sent_when_the_hold_ends(client):
     _release_hold_now(d["draft_id"])
     time.sleep(0.05)
     assert _balance() == before
-    assert d["scam"]["outcome"] == "HOLD"                       # 5 (+1 if run after midnight)
-    assert _execute(client, d)["accepted"] is True               # the user confirms: now it runs
+    assert d["scam"]["outcome"] == "HOLD_STEP_UP"               # facts 7 (+1 after midnight)
+    _confirm(client, d)
+    assert _execute(client, d, name="Mom")["accepted"] is True   # the user confirms: now it runs
     assert _balance() == before - 50000
 
 
@@ -518,9 +835,15 @@ def test_cancel_during_the_hold_needs_no_signature_and_sends_nothing(client):
     assert _execute(client, d)["rejection"] == "STATE"
 
 
+def _confirm(client, d):
+    """Enter the phone code, as the user would."""
+    if d.get("requires_extra_confirmation"):
+        client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
+
+
 def test_hold_step_up_needs_the_code_after_the_hold(client):
     _change_moms_number(client)
-    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
     assert d["scam"]["outcome"] == "HOLD_STEP_UP" and d["scam"]["confirm_name"] == "Mom"
     assert d["requires_extra_confirmation"] is True
     _release_hold_now(d["draft_id"])
@@ -534,7 +857,7 @@ def test_hold_step_up_needs_the_name_typed_at_the_gateway(client):
     page, or a page that skips the box, is refused by the gateway. The typed
     name is compared as the card compares it, and never logged."""
     _change_moms_number(client)
-    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
     assert d["scam"]["confirm_name"] == "Mom"
     _release_hold_now(d["draft_id"])
     client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
@@ -578,12 +901,21 @@ def _add_passkeys_now():
         conn.close()
 
 
+def _turn_the_freeze_off_now():
+    from backend.policy import safety
+    now = int(time.time())
+    safety.engage_kill_switch("u_alice", now=now - 60)
+    safety.release_kill_switch("u_alice", now=now - 30)
+
+
 def test_a_score_that_rose_since_drafting_is_refused(client):
-    """Allowed when drafted; a passkey is added before signing -> it now needs a
-    hold the user was never shown: no signing challenge, and the gateway refuses."""
+    """Allowed when drafted; a passkey is added and the freeze turned off before
+    signing (facts 8) -> it now needs a hold and a code the user was never
+    shown: no signing challenge, and the gateway refuses."""
     d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     assert d["scam"]["outcome"] == "ALLOW"
     _add_passkeys_now()
+    _turn_the_freeze_off_now()
     nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
     assert nonce.status_code == 409 and nonce.json()["detail"]["rescored"] is True
     assert _execute(client, d)["rejection"] == "RESCORED"
@@ -596,7 +928,19 @@ def test_the_gateway_scores_a_draft_that_never_was(client):
     from backend.main import _drafts
     _drafts.get(d["draft_id"]).scam_floor = None
     _add_passkeys_now()
+    _turn_the_freeze_off_now()
     assert _execute(client, d)["rejection"] == "HOLD_REQUIRED"
+
+
+def test_a_question_the_user_never_saw_is_refused(asking_client):
+    """A new passkey after drafting (facts 4) would now ask what it's for: the
+    payment is refused so the new draft asks."""
+    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    assert d["status"] == "ready"
+    _add_passkeys_now()
+    nonce = asking_client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and nonce.json()["detail"]["rescored"] is True
+    assert _execute(asking_client, d)["rejection"] == "RESCORED"
 
 
 def _age_moms_number():
@@ -613,14 +957,14 @@ def _age_moms_number():
 def test_a_lower_score_now_does_not_lift_the_hold(client):
     _change_moms_number(client)
     d = client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()
-    assert d["scam"]["outcome"] == "HOLD"
+    assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     _age_moms_number()
     assert _execute(client, d)["rejection"] == "HELD"
 
 
 def test_a_lower_score_now_does_not_lift_the_phone_code(client):
     _change_moms_number(client)
-    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
     assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     _age_moms_number()
     _release_hold_now(d["draft_id"])
@@ -633,7 +977,7 @@ def test_a_clarification_does_not_lower_the_safeguards(client):
     here, since Mom's number is old news by then — but the draft keeps the
     HOLD_STEP_UP it was shown: the phone code is still required."""
     _change_moms_number(client)
-    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
     assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     _age_moms_number()
     leg = d["resolved_plan"]["plan"][0]["id"]
@@ -652,10 +996,10 @@ def test_a_clarification_does_not_lower_the_safeguards(client):
 def test_a_different_payee_on_the_same_draft_waits_again(client):
     """The hold covers the payment it was shown for: answering the question
     again with another payee, after the hold ran out, starts a new wait."""
-    d = client.post("/api/drafts", json={"transcript": "pay john 1000"}).json()
+    d = client.post("/api/drafts", json={"transcript": JOHN_RISKY}).json()
     held = client.post(f"/api/drafts/{d['draft_id']}/clarify",
                        json={"field": d["field"], "choice_id": "payee_22"}).json()
-    assert held["scam"]["outcome"] == "HOLD"
+    assert held["scam"]["outcome"] == "HOLD_STEP_UP"
     _release_hold_now(d["draft_id"])
     other = client.post(f"/api/drafts/{d['draft_id']}/clarify",
                         json={"field": d["field"], "choice_id": "payee_21"}).json()
@@ -666,12 +1010,17 @@ def test_a_different_payee_on_the_same_draft_waits_again(client):
     assert _execute(client, other)["rejection"] == "HELD"
 
 
+# A first $1,000 to John (facts 5) with investment and new-number words (4.5):
+# a serious fail, so a hold and a code.
+JOHN_RISKY = "pay john 1000, guaranteed returns, he has a new number"
+
+
 def _held_john(client):
     """A draft to John on hold, its question answered, its wait already over."""
-    d = client.post("/api/drafts", json={"transcript": "pay john 1000"}).json()
+    d = client.post("/api/drafts", json={"transcript": JOHN_RISKY}).json()
     held = client.post(f"/api/drafts/{d['draft_id']}/clarify",
                        json={"field": d["field"], "choice_id": "payee_22"}).json()
-    assert held["scam"]["outcome"] == "HOLD"
+    assert held["scam"]["outcome"] == "HOLD_STEP_UP"
     _release_hold_now(d["draft_id"])
     return d, held
 
@@ -856,16 +1205,16 @@ def test_a_question_answered_late_still_leaves_time_to_sign(client):
     answer, so it ends past the 5 minutes since the first words. The draft must outlive the hold — it lives as long as the signed
     payload it offers, not 5 minutes from the first words."""
     from backend.main import _drafts
-    d = client.post("/api/drafts", json={"transcript": "pay john 1000"}).json()
+    d = client.post("/api/drafts", json={"transcript": JOHN_RISKY}).json()
     _drafts.get(d["draft_id"]).created_at -= 280
     held = client.post(f"/api/drafts/{d['draft_id']}/clarify",
                        json={"field": d["field"], "choice_id": "payee_22"}).json()
-    assert held["scam"]["outcome"] == "HOLD"
+    assert held["scam"]["outcome"] == "HOLD_STEP_UP"
     _drafts.get(d["draft_id"]).created_at -= 30             # ... and the hold ran its course
     _release_hold_now(d["draft_id"])
     if held["requires_extra_confirmation"]:
         client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
-    assert _execute(client, held)["accepted"] is True
+    assert _execute(client, held, name=held["scam"]["confirm_name"])["accepted"] is True
 
 
 def test_a_draft_still_waiting_on_a_question_expires_on_time():
@@ -951,7 +1300,7 @@ def test_a_reported_payee_is_refused_before_the_hold_code_or_name(client, monkey
     """Nothing asks the user to wait, find a code or type a name for a
     payment that can never run."""
     _change_moms_number(client)
-    d = client.post("/api/drafts", json={"transcript": "send mom 3000"}).json()
+    d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
     assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     _report(monkeypatch, "6581234567")
     assert _execute(client, d)["rejection"] == "REPORTED"
@@ -1177,11 +1526,12 @@ def test_the_audit_log_keeps_codes_not_words(client):
     finally:
         conn.close()
     payload = json.loads(row[0])
-    assert ["SOCIAL_ENGINEERING_LANGUAGE", 2] in payload["signals"]
+    assert ["SOCIAL_ENGINEERING_LANGUAGE", 30] in payload["signals_tenths"]   # secrecy: 3.0 points
     assert "words_secrecy" in payload["phrase_codes"]
-    assert set(payload) == {"stage", "payload_hash", "draft_id", "score", "outcome",
-                            "signals", "phrase_codes", "source"}
-    assert all(len(sig) == 2 for sig in payload["signals"])     # code + weight, no details
+    assert set(payload) == {"stage", "payload_hash", "draft_id", "score_tenths", "facts_tenths",
+                            "words_tenths", "decision", "outcome", "signals_tenths",
+                            "phrase_codes", "source"}
+    assert all(len(sig) == 2 for sig in payload["signals_tenths"])     # code + weight, no details
 
 
 def test_scam_words_are_flagged_even_without_a_draft(client):
@@ -1215,8 +1565,29 @@ def test_a_contact_add_waiting_for_a_number_still_gets_the_warning(client):
 def test_console_debug_carries_the_score_and_the_prompts(client):
     d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     assert d["debug"]["scam"]["outcome"] == "ALLOW"
-    call = d["debug"]["llm_calls"][0]
+    rows = d["debug"]["scam"]["breakdown"]
+    assert len(rows) == len(scam.WEIGHTS)
+    assert sum(r["points"] for r in rows) == d["debug"]["scam"]["score"]
+    assert d["debug"]["words"]["points"] == 0
+    call =d["debug"]["llm_calls"][0]
     assert "intent parser" in call["system"] and "pay mom 50 dollars" in call["user"]
+
+
+def test_console_breakdown_itemises_every_rule_and_sums_to_the_score():
+    signals = [{"code": "FIRST_PAYMENT_TO_DESTINATION", "weight": 2, "detail": "no earlier payment"},
+               {"code": "LARGE_FIRST_PAYMENT", "weight": 3, "detail": "$1,500.00 as a first payment"},
+               # a second leg raising a rule again adds nothing (as in assess())
+               {"code": "FIRST_PAYMENT_TO_DESTINATION", "weight": 2, "detail": "another new payee"}]
+    rows = scam.breakdown(signals)
+    assert [r["rule"] for r in rows] == list(scam.WEIGHTS)
+    points = {r["rule"]: r["points"] for r in rows}
+    assert points["FIRST_PAYMENT_TO_DESTINATION"] == 2 and points["LARGE_FIRST_PAYMENT"] == 3
+    assert sum(points.values()) == 5
+    assert rows[0]["why"] == ["no earlier payment", "another new payee"]
+    # the amount facts count 5 at most: an extra row takes off the rest
+    capped = scam.breakdown([{"code": c, "weight": 2, "detail": ""} for c in
+                             ("LARGE_AMOUNT", "LARGE_SHARE", "ABOVE_USUAL_MAX")])
+    assert capped[-1]["rule"] == "AMOUNT_CAP" and sum(r["points"] for r in capped) == 5
 
 
 def test_console_debug_can_be_switched_off(client, monkeypatch):

@@ -94,7 +94,7 @@ def seed(db_path: Path = DB_PATH, *, reset_audit: bool = False) -> None:
     conn = connect(db_path)
     try:
         # drop + recreate so seeding is fully idempotent
-        tables = ["webauthn_credentials", "executions", "holds", "kill_switch",
+        tables = ["webauthn_credentials", "executions", "holds", "delayed_payments", "scam_attempts", "kill_switch",
                   "transaction_history", "limits",
                   "equities", "billers", "payees", "accounts", "users"]
         if reset_audit:

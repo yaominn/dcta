@@ -39,6 +39,7 @@ class AuditEntryType(str, Enum):
     CONTACT_ADD = "CONTACT_ADD"         # a signed new payee (and its safeguards)
     SIGNATURE = "SIGNATURE"
     EXECUTION = "EXECUTION"
+    EXECUTION_SCHEDULED = "EXECUTION_SCHEDULED"   # a large payment waiting before it runs
     DRAFT_DECLINED = "DRAFT_DECLINED"     # the user said no before signing
     DRAFT_CANCELLED = "DRAFT_CANCELLED"   # the user withdrew a pending draft
     SCAM_ASSESSMENT = "SCAM_ASSESSMENT"   # scam signals + score (policy/scam.py), by rule

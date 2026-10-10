@@ -213,22 +213,26 @@ through); an unbound transfer never runs. After a number change the card, the ph
 reply all name the new number ("Mom ··4567", "your first payment to Mom at this
 number"), never the old, trusted one.
 
-**A scam score** (`backend/policy/scam.py`) — rules only, never the model:
+**A scam score in two thresholds** (`backend/policy/scam.py`) — rules only,
+never the model. Full details: [`docs/SCAM_DECISION_FLOW.md`](docs/SCAM_DECISION_FLOW.md).
 
-| Signal | Rule | Weight |
-|---|---|---|
-| `FIRST_PAYMENT_TO_DESTINATION` | no earlier transfer to this destination *version* | 2 |
-| `RECENT_DESTINATION_CHANGE` | changed or added < 24 h ago | 3 |
-| `LARGE_FIRST_PAYMENT` | first payment and ≥ $1,000 | 3 |
-| `BALANCE_DRAIN` | transfers ≥ 80% of the source account (buying your own shares doesn't count) | 3 |
-| `RAPID_MULTI_DESTINATION` | ≥ 3 new destinations in 30 min | 4 |
-| `RECENT_CREDENTIAL_CHANGE` | a passkey added < 12 h ago (not the first) | 4 |
-| `SOCIAL_ENGINEERING_LANGUAGE` | phrase rules on the raw transcript ("safe account" or an official's orders: 4) | 2 |
-| `UNUSUAL_HOUR` | 00:00–05:00 Singapore time, first payment | 1 |
-
-**0–1 ALLOW** (just the biometric) · **2–3 WARN** (a scam-specific warning on
-the card) · **4–6 HOLD** (+ a 30-second server-enforced hold) · **≥7
-HOLD_STEP_UP** (+ a phone code, + typing the payee's name).
+- **Never rules** in the user's words (a "safe account", an OTP, "for an
+  investigation", "don't tell the bank", passing money on) → **BLOCK**: nothing
+  to sign, call the bank.
+- **Threshold 1, the facts** (no words): amount (at most 5), first payment 2,
+  number changed < 24 h 5 (contact added 3), 3+ new payees in 30 min 4, new
+  passkey 4, freeze turned off 4, midnight–5am 1, and **earlier attempts**
+  (`scam_attempts`): a retry after a stopped payment 3, a smaller amount after
+  it +3, several stopped attempts 2–3, split payments 3, growing amounts 2.
+  Under 3 → sign as normal (a warning may show); 10+ → **BLOCK**; 3–9.9 →
+  **ask** a question picked by the riskiest fact, plus "Is anyone on a call or
+  chat with you about it right now?" (never sent to the model).
+- **Threshold 2, the words** of the request and the answer, in 10 Singapore
+  scam categories (strongest 100%, next 80%, 64%…, at most 8;
+  [`docs/SCAM_WORD_WEIGHTS.md`](docs/SCAM_WORD_WEIGHTS.md)): under 2 (and facts
+  under 7) → sign; 2+ or facts 7+ → **DELAY**, a 60-second wait after signing
+  that can be cancelled — words 4+ or facts 7+ make it **HOLD_STEP_UP** (+ a
+  30-second hold, a phone code and typing the payee's name); 6+ → **BLOCK**.
 
 **Typing the name is checked by the server**, not only by the page. The page
 sends the typed name with the signed payment, and the gateway refuses it
@@ -307,7 +311,8 @@ red-team scenarios 10–12.
 
 **Demo lines.** `change mom's number to 8888 1234` (blocked: a reported
 number) · `the police officer told me to transfer 1000 to landlord, don't tell
-anyone` (score 9, HOLD_STEP_UP: warning, hold, phone code, type "Landlord").
+anyone` (a never rule: BLOCK, call the bank) · `pay landlord 1500 NOW NOW NOW`
+(asked; then a 60-second wait after signing, with Cancel).
 
 ## M3 — LLM parser + schema + opaque IDs
 
@@ -724,8 +729,8 @@ in a slide.
 | 7 | One byte edited in the audit log | `verify_chain()` names the exact entry |
 | 8 | Correctly signed payload, UI skipped | A hand-assembled $20,000.01 gets no nonce (no such draft); swapped into a real draft it is refused `OUTDATED` — only the drafted, policy-cleared payment executes |
 | 9 | Compromised **resolver** swaps the payee | The validator freezes it; a frozen draft gets no nonce, so it is unsignable (M6) |
-| 10 | **New-number scam**: Mom's number changed, then "pay mom 500" | Signed, versioned destination → scam score HOLD: warning, server-enforced hold (a forced submit gets `HELD`), one-tap Cancel, nothing sent |
-| 11 | **Coached victim**: "the police officer said… don't tell anyone" | Rule-based phrase flags on the raw transcript (not the model) → HOLD_STEP_UP: warning, hold, phone code, type the name |
+| 10 | **New-number scam**: Mom's number changed, then "pay mom 500" | Signed, versioned destination → facts 7 (a changed number 5 + first payment 2) fail whatever the answer → HOLD_STEP_UP: warning, server-enforced hold (a forced submit gets `HELD`), one-tap Cancel, nothing sent |
+| 11 | **Coached victim**: "the police officer said… don't tell anyone" | Rule-based phrase flags on the raw transcript (not the model) → a never rule: BLOCK, nothing to sign, call the bank |
 | 12 | *Benign control*: $50 to a long-standing payee | ALLOW — no warning, no hold, no extra step |
 
 Scenarios 8 and 9 are not in the brief's list. They are what an attacker tries

@@ -59,6 +59,33 @@ CREATE TABLE IF NOT EXISTS holds (
     status      TEXT NOT NULL CHECK (status IN ('PENDING','CANCELLED','RELEASED')),
     payload_hash TEXT                   -- the payload this wait was for
 );
+-- A LARGE payment, signed and checked, waiting RELEASE_DELAY_SECONDS before
+-- the money moves (policy/scam.py). Cancelling it in that window goes through
+-- the executions table like any cancel, so a cancel and the release can't both win.
+CREATE TABLE IF NOT EXISTS delayed_payments (
+    draft_id     TEXT PRIMARY KEY,
+    user_id      TEXT NOT NULL,
+    payload      TEXT NOT NULL,       -- the signed ResolvedPlan, as JSON
+    payload_hash TEXT NOT NULL,
+    created_at   INTEGER NOT NULL,
+    release_at   INTEGER NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('PENDING','RUNNING','SENT','CANCELLED'))
+);
+-- Earlier payment attempts, for the scam score's history facts
+-- (policy/attempts.py): one row per transfer leg of a scored draft.
+CREATE TABLE IF NOT EXISTS scam_attempts (
+    draft_id    TEXT NOT NULL,
+    leg_id      TEXT NOT NULL,
+    user_id     TEXT NOT NULL,
+    payee_id    TEXT,
+    amount      INTEGER NOT NULL,     -- cents
+    outcome     TEXT NOT NULL,        -- the scam outcome the user was shown
+    asked       INTEGER NOT NULL,     -- 1: asked what the payment was for
+    status      TEXT NOT NULL CHECK (status IN ('OPEN','SENT','STOPPED')),
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (draft_id, leg_id)
+);
 CREATE TABLE IF NOT EXISTS kill_switch (
     user_id     TEXT PRIMARY KEY,
     engaged_at  INTEGER NOT NULL,

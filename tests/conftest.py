@@ -99,3 +99,16 @@ def server_url():
         except subprocess.TimeoutExpired:
             proc.kill()
         seed()  # restore clean slate after the run
+
+
+@pytest.fixture(autouse=True)
+def _no_purpose_question(monkeypatch):
+    """The questions at threshold 1 (scam.ASK_QUESTIONS) are off unless a test
+    turns them on (test_scam_protection's asking_client): most tests are about
+    something else, and whether a payment reaches the threshold can depend on
+    the time of day (UNUSUAL_HOUR). The request's own words are still scored."""
+    from backend.policy import scam
+    monkeypatch.setattr(scam, "ASK_QUESTIONS", False)
+    # Likewise the wait after signing on a fail (scam.RELEASE_DELAY_SECONDS):
+    # off unless a test turns it on (test_scam_protection's delaying_client).
+    monkeypatch.setattr(scam, "RELEASE_DELAY_SECONDS", 0)
