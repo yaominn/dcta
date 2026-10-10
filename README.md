@@ -230,6 +230,29 @@ number"), never the old, trusted one.
 the card) · **4–6 HOLD** (+ a 30-second server-enforced hold) · **≥7
 HOLD_STEP_UP** (+ a phone code, + typing the payee's name).
 
+**Typing the name is checked by the server**, not only by the page. The page
+sends the typed name with the signed payment, and the gateway refuses it
+(`CONFIRMATION`) unless it matches the name the card asked for with that exact
+payment. It's compared the way the page compares it (trimmed,
+case-insensitive), so " landlord " is accepted. The name isn't part of what's
+signed and is never written to the audit log. A modified page, or a request
+sent straight to the gateway, can't skip it.
+
+**Reported numbers are never paid** (`backend/policy/new_contact.py`,
+`is_reported`). The mock scam-number list (`+65 8888 1234`, `+65 9999 1234`,
+standing in for a feed like ScamShield) is checked wherever a number can
+receive money, not only when a contact is added:
+
+- **Paying a reported payee is blocked**, whatever the score. A contact saved
+  long ago can be reported today, so it's checked on every payment: when it's
+  drafted (policy rule `reported_number`), when the page asks to sign
+  (`REPORTED`, so no fingerprint is asked for) and at the gateway, before any
+  hold, phone code or name.
+- **A contact's number is never changed to a reported one**: refused when
+  drafted (no phone code is sent) and again at the gateway.
+- Numbers match however they're written: `+65 8888 1234`, `6588881234` and
+  `8888 1234` are the same number.
+
 **The hold** (`backend/policy/safety.py`, `holds` table): no signing challenge
 and no execution until it ends, whatever the client sends; when it ends
 **nothing happens by itself** — the user still confirms. **Cancel needs no
@@ -281,6 +304,10 @@ Every assessment is written to the audit log (`SCAM_ASSESSMENT`, source "rules
 off) the browser console shows each request's score breakdown and every
 prompt sent to the model, with its reply. `tests/test_scam_protection.py`,
 red-team scenarios 10–12.
+
+**Demo lines.** `change mom's number to 8888 1234` (blocked: a reported
+number) · `the police officer told me to transfer 1000 to landlord, don't tell
+anyone` (score 9, HOLD_STEP_UP: warning, hold, phone code, type "Landlord").
 
 ## M3 — LLM parser + schema + opaque IDs
 
@@ -395,15 +422,18 @@ is CI-checked rather than asserted.
 | rule | source of truth | outcome |
 |---|---|---|
 | KYC | `users.kyc_status`, `users.investment_eligible` | BLOCK (`u_bob` is `PENDING`) |
+| reported number | the payee's current number on the mock scam list (`new_contact.is_reported`) | BLOCK |
+| new-contact hold | `payees.hold_until`, set when a contact is added with a HOLD | BLOCK until it ends |
 | per-transaction | `limits.per_transaction` ($20,000) | BLOCK |
 | daily | `limits.daily` ($50,000), accumulated across today's history **and** the legs of this plan | BLOCK |
 | velocity | `limits.velocity_count` / `velocity_window_minutes` (5 in 10 min) | BLOCK |
 | anomaly | median of this user's history with this payee | **escalate**, never block |
 
-**Precedence is explicit**: KYC → per-transaction → daily → velocity → anomaly,
-first BLOCK wins, and anomaly can only ever escalate. A blocked leg reports one
-reason, not four. The engine **never mutates the plan** — the plan is what gets
-hashed and signed, so changing it after resolution would break the binding
+**Precedence is explicit**: KYC → reported number → new-contact hold →
+per-transaction → daily → velocity → anomaly, first BLOCK wins, and anomaly can
+only ever escalate. A blocked leg reports one reason, not four. The engine
+**never mutates the plan** — the plan is what gets hashed and signed, so
+changing it after resolution would break the binding
 between what the user saw and what they signed (`test_evaluate_never_mutates_the_plan`).
 
 **Where it is enforced.** Checking policy before rendering the overlay is UX.
@@ -781,9 +811,12 @@ which is the classic account-takeover step. So:
   new value is actually in what the user said, and freezes the draft if not.
 - The user reviews **old → new** on a card and signs with their biometric. A
   **phone change also needs the out-of-band code**.
+- A **new number on the scam list is refused**, the same rule as adding a
+  contact: before the draft (no code is sent, nothing to sign) and again at the
+  gateway (`contact_change_refusal`, `backend/policy/contacts.py`).
 - `gateway.submit_contact_change()` is the only write path. It checks
-  signature, nonce, expiry and step-up, then updates **only if the stored
-  value is still the old one the user saw**. Each change is logged
+  signature, nonce, expiry, the scam list and step-up, then updates **only if
+  the stored value is still the old one the user saw**. Each change is logged
   (`CONTACT_UPDATE`) with payee ids and fields, but not the numbers.
 
 Tests: `pytest tests/test_contacts.py`. Routing between payments and contact
@@ -822,8 +855,10 @@ kept for `/data` only.
 **Enforced where it matters.** The safeguards and warning codes are inside the
 signed `ResolvedContactAdd`; the gateway (`submit_contact_add`) applies only the
 exact drafted payload, re-checks the reported-number list, and refuses without
-the phone code when one was required. A HOLD is a policy rule
-(`new_contact_hold`), which the gateway re-runs before any payment. The
+the phone code when one was required. The same list blocks later payments to a
+contact whose number is reported after it was saved (see "Scam protection"). A
+HOLD is a policy rule (`new_contact_hold`), which the gateway re-runs before any
+payment. The
 validator freezes a contact whose name or number isn't in what the user said.
 Saved contacts carry `added_at` / `hold_until` (added by `migrate()`, no
 re-seed). Tests: `tests/test_contact_add.py`.
