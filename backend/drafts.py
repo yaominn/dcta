@@ -35,6 +35,7 @@ from typing import Any
 
 from backend.audit.canonical import payload_hash
 from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
+from backend.models.mandates import RecurringBillMandate
 from backend.models.schemas import MAX_AUTH_WINDOW_S, ResolvedPlan
 
 
@@ -66,11 +67,16 @@ class Draft:
     intent_plan: dict
     created_at: float
     kind: str = "payment"             # payment | contact_edit | contact_add
+                                      # | recurring_setup | mandate
     status: str = "clarify"
     answers: dict[str, str] = field(default_factory=dict)
     resolved_plan: ResolvedPlan | None = None
     resolved_change: ResolvedContactChange | None = None     # kind == contact_edit
     resolved_add: ResolvedContactAdd | None = None           # kind == contact_add
+    resolved_mandate: RecurringBillMandate | None = None     # kind == mandate
+    # kind recurring_setup / mandate: what the rules read from the request
+    # (backend/recurring/parse.py), and the mandate id these terms will carry.
+    setup: dict | None = None
     # contact_add: why it needs what it needs (policy/new_contact.py), and the
     # draft whose question it answers (a payment that named an unknown payee).
     risk: dict | None = None
@@ -102,6 +108,8 @@ class Draft:
         """Whatever this draft would have the user sign, or None."""
         if self.kind == "contact_add":
             return self.resolved_add
+        if self.kind in ("mandate", "recurring_setup"):
+            return self.resolved_mandate
         return self.resolved_plan if self.kind == "payment" else self.resolved_change
 
     def is_expired(self, now: float, ttl: int) -> bool:

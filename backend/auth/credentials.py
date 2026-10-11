@@ -32,12 +32,20 @@ class MockCredentialStore:
 
     def __init__(self):
         self._creds: Dict[str, str] = {}
+        self._users: Dict[str, str] = {}
 
-    def register(self, credential_id: str, public_key: str) -> None:
+    def register(self, credential_id: str, public_key: str, user_id: str | None = None) -> None:
         self._creds[credential_id] = public_key
+        if user_id is not None:
+            self._users[credential_id] = user_id
 
     def get(self, credential_id: str) -> str | None:
         return self._creds.get(credential_id)
+
+    def user_of(self, credential_id: str) -> str | None:
+        """Whose passkey this stands in for (None: not recorded — a mandate
+        signed with it is refused, the closed direction)."""
+        return self._users.get(credential_id)
 
 
 @dataclass

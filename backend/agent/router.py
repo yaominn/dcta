@@ -1,5 +1,6 @@
 """
-Which pipeline a request goes to: a payment, a contact edit, or a contacts list.
+Which pipeline a request goes to: a payment, a contact edit, a contacts list,
+or a recurring bill setup.
 
 Routing is NOT a security decision. Whatever this returns, the request still
 ends at a draft the user must review and sign (or, for the list, a read-only
@@ -31,12 +32,36 @@ _EDIT = re.compile(
     re.I)
 
 
+# "every month", "monthly", "recurring", "autopay", "standing instruction"...:
+# the user is asking for something ONGOING. That goes to recurring setup, which
+# asks for every detail it can't read and needs its own signature — a one-time
+# payment never becomes a recurring one by inference.
+_RECURRING = re.compile(
+    r"\b(?:every|each)\s+(?:\w+\s+)?(?:day|week|fortnight|month|quarter|year)s?\b"
+    r"|\b(?:daily|weekly|fortnightly|monthly|quarterly|yearly|annually)\b"
+    r"|\b(?:recurring|repeating|auto[\s-]?pay|standing\s+(?:order|instruction)|direct\s+debit"
+    r"|giro|regularly|on\s+a\s+schedule)\b"
+    r"|\bset\s+up\b.*\b(?:bill|payment)s?\b.*\bautomatic",
+    re.I)
+# "pay my bill" and nothing else: one payment, or an arrangement? Asked, never
+# assumed either way.
+_BARE_BILL = re.compile(
+    r"^\s*(?:please\s+)?(?:pay|settle|do)\s+(?:my|the|our|a|this\s+month'?s)\s+"
+    r"(?:\w+\s+)?bills?\s*(?:for\s+me\s*)?(?:please)?\s*[.!?]*\s*$",
+    re.I)
+
+
 def classify_request(transcript: str) -> str:
-    """'contact_list' | 'contact_add' | 'contact_edit' | 'payment'."""
+    """'contact_list' | 'contact_add' | 'contact_edit' | 'recurring_bill' |
+    'bill_ambiguous' | 'payment'."""
     if _LIST.search(transcript):
         return "contact_list"
     if _ADD.search(transcript):
         return "contact_add"
     if _EDIT.search(transcript):
         return "contact_edit"
+    if _RECURRING.search(transcript):
+        return "recurring_bill"
+    if _BARE_BILL.search(transcript):
+        return "bill_ambiguous"
     return "payment"

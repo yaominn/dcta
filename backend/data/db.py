@@ -37,7 +37,7 @@ def get_conn() -> sqlite3.Connection:
 EXECUTIONS_DDL = """
 CREATE TABLE IF NOT EXISTS executions (
     draft_id     TEXT PRIMARY KEY,
-    kind         TEXT NOT NULL,       -- payment | contact_edit
+    kind         TEXT NOT NULL,       -- payment | contact_edit | contact_add | mandate
     payload_hash TEXT NOT NULL,
     outcome      TEXT NOT NULL,       -- EXECUTED | FAILED | UPDATED
     result       TEXT NOT NULL,       -- the execution result, as JSON
@@ -94,6 +94,77 @@ CREATE TABLE IF NOT EXISTS kill_switch (
 """
 
 
+# Recurring bill payments (backend/recurring/, docs/RECURRING_BILLS.md).
+#
+# mandates: one row per SIGNED RecurringBillMandate. `terms` is the canonical
+# JSON the user's passkey signed (with the nonce) and `payload_hash` its hash;
+# every execution re-derives the hash from `terms` and refuses on a mismatch,
+# so editing a stored term stops the mandate rather than widening it. The
+# counters are the server's own record — no browser flag says "automatic".
+#
+# mandate_occurrences: every payment the mandate allows, created with it.
+# `draft_id` is the occurrence's execution key in the `executions` table, so an
+# occurrence is debited at most once whichever path (the user's signature or
+# the mandate) runs it, and however many workers try.
+RECURRING_DDL = """
+CREATE TABLE IF NOT EXISTS mandates (
+    mandate_id           TEXT PRIMARY KEY,
+    version              INTEGER NOT NULL,
+    user_id              TEXT NOT NULL,
+    terms                TEXT NOT NULL,      -- the signed RecurringBillMandate, canonical JSON
+    payload_hash         TEXT NOT NULL,
+    credential_id        TEXT NOT NULL,      -- the passkey that signed it
+    draft_id             TEXT NOT NULL UNIQUE,
+    status               TEXT NOT NULL CHECK (status IN
+                             ('ACTIVE','PAUSED','SUSPENDED','CANCELLED','COMPLETED')),
+    mode                 TEXT NOT NULL CHECK (mode IN ('SUPERVISED','AUTO')),
+    supervised_successes INTEGER NOT NULL DEFAULT 0,
+    paid_count           INTEGER NOT NULL DEFAULT 0,
+    paid_total_cents     INTEGER NOT NULL DEFAULT 0,
+    status_reason        TEXT,
+    created_at           INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mandate_occurrences (
+    mandate_id    TEXT NOT NULL REFERENCES mandates(mandate_id),
+    seq           INTEGER NOT NULL,          -- 1..occurrence_count
+    due_date      TEXT NOT NULL,             -- local date, YYYY-MM-DD
+    due_at        INTEGER NOT NULL,          -- Unix s: DUE_LOCAL_TIME on due_date
+    auto_until    INTEGER NOT NULL,          -- Unix s: end of the due date (automatic window)
+    review_until  INTEGER NOT NULL,          -- Unix s: last moment it can be approved
+    draft_id      TEXT NOT NULL UNIQUE,      -- the execution key (executions.draft_id)
+    phase         TEXT CHECK (phase IN ('SUPERVISED','AUTO')),   -- set when it falls due
+    status        TEXT NOT NULL CHECK (status IN
+                      ('SCHEDULED','PENDING_APPROVAL','NEEDS_REVIEW','HELD','EXECUTED',
+                       'FAILED','DECLINED','EXPIRED','MISSED','SKIPPED','CANCELLED')),
+    reason        TEXT,
+    updated_at    INTEGER NOT NULL,
+    PRIMARY KEY (mandate_id, seq)
+);
+-- What the user is told: after every payment, and on a pause, failure, hold
+-- or anything that needs them. Durable, so a closed app still shows it.
+-- Text only: a notification never carries a link that authorizes anything.
+CREATE TABLE IF NOT EXISTS notifications (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    title       TEXT NOT NULL,
+    body        TEXT NOT NULL,
+    mandate_id  TEXT,
+    seq         INTEGER,
+    created_at  INTEGER NOT NULL,
+    read_at     INTEGER
+);
+-- DEMO ONLY (RECURRING_DEMO_CLOCK=1): how far the recurring clock runs ahead
+-- of real time, so a demo can reach next month's due date in seconds.
+-- Ignored unless that flag is on (backend/recurring/clock.py).
+CREATE TABLE IF NOT EXISTS recurring_clock (
+    id        INTEGER PRIMARY KEY CHECK (id = 1),
+    offset_s  INTEGER NOT NULL
+);
+"""
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     """Bring an existing ledger up to the current schema without re-seeding
     (a re-seed would drop the user's own edits and registered passkeys).
@@ -108,8 +179,13 @@ def migrate(conn: sqlite3.Connection) -> None:
     if hcols and "dest_version" not in hcols:
         conn.execute("ALTER TABLE transaction_history ADD COLUMN dest_version INTEGER")
         conn.commit()
+    bcols = {r["name"] for r in conn.execute("PRAGMA table_info(billers)")}
+    if bcols and "ref_version" not in bcols:
+        conn.execute("ALTER TABLE billers ADD COLUMN ref_version INTEGER NOT NULL DEFAULT 1")
+        conn.commit()
     conn.executescript(EXECUTIONS_DDL)
     conn.executescript(SAFETY_DDL)
+    conn.executescript(RECURRING_DDL)
     if "payload_hash" not in {r["name"] for r in conn.execute("PRAGMA table_info(holds)")}:
         conn.execute("ALTER TABLE holds ADD COLUMN payload_hash TEXT")
         conn.commit()
@@ -155,7 +231,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS billers (
             id             TEXT PRIMARY KEY,             -- 'biller_07' (opaque ID)
             name           TEXT NOT NULL,
-            reference_text TEXT NOT NULL                  -- UNTRUSTED stored field (brief 4.3)
+            reference_text TEXT NOT NULL,                -- UNTRUSTED stored field (brief 4.3)
+            -- bumps whenever reference_text changes (backend/data/billers.py):
+            -- a recurring mandate signs the version, so a changed bill
+            -- reference stops its payments until the user signs again.
+            ref_version    INTEGER NOT NULL DEFAULT 1
         );
 
         CREATE TABLE IF NOT EXISTS equities (
@@ -199,3 +279,4 @@ def init_schema(conn: sqlite3.Connection) -> None:
     )
     conn.executescript(EXECUTIONS_DDL)
     conn.executescript(SAFETY_DDL)
+    conn.executescript(RECURRING_DDL)
