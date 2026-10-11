@@ -435,3 +435,51 @@ details.sec[open] summary::before { transform: rotate(90deg); }
   .appbar { padding-top: max(12px, env(safe-area-inset-top)); }
   .composer { padding-bottom: max(10px, env(safe-area-inset-bottom)); }
 }
+
+/* ---------- recurring bills ---------- */
+.bills { position: relative; border: 1px solid var(--line); background: var(--surface); color: var(--fg); border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 700; cursor: pointer; }
+.bills:hover { background: var(--accent-soft); }
+.badge { display: inline-grid; place-items: center; min-width: 16px; height: 16px; margin-left: 5px; padding: 0 4px; border-radius: 999px; background: var(--bad); color: #fff; font-size: 10px; line-height: 1; vertical-align: 1px; }
+.badge[hidden] { display: none; }
+
+.setup-questions { margin: 0 0 10px; padding: 8px 10px; border-radius: 12px; background: var(--accent-soft); font-size: 13px; }
+.setup-form { display: flex; flex-direction: column; gap: 10px; margin-bottom: 4px; }
+.setup-row { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.setup-label { font-size: 12px; font-weight: 700; color: var(--muted); }
+.setup-error { font-size: 12px; color: var(--bad); }
+.setup-form select, .setup-form input[type=date], .setup-form input[type=number], .setup-amount input {
+  font: inherit; color: var(--fg); background: var(--surface-2); border: 1px solid var(--line);
+  border-radius: 10px; padding: 8px 10px; min-width: 0; }
+.setup-amount { display: flex; align-items: center; gap: 6px; }
+.setup-amount input { flex: 1; }
+.setup-radios { display: flex; flex-direction: column; gap: 6px; }
+.setup-radio { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.setup-radio input[type=radio] { margin: 0; }
+.setup-count { width: 72px; }
+.setup-form .btn.primary { margin-top: 4px; }
+
+.mandate-card .terms dd.strong, .strong { font-weight: 700; }
+.approvals-box { margin: 10px 0 4px; padding: 8px 10px; border-radius: 12px; background: var(--surface-2); font-size: 13px; }
+.approvals-box.auto { background: var(--warn-soft); color: var(--fg); }
+
+.bills-card .mandate { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
+.mandate-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 4px; }
+.mandate-name { font-weight: 700; }
+.mandate-line { margin: 2px 0 !important; font-size: 13px; }
+.mandate-actions { display: flex; flex-direction: column; }
+.pill { font-size: 11px; font-weight: 700; padding: 2px 8px; border-radius: 999px; background: var(--surface-2); color: var(--muted); white-space: nowrap; }
+.pill.active { background: var(--ok-soft); color: var(--ok); }
+.pill.paused { background: var(--warn-soft); color: var(--warn); }
+.pill.suspended, .pill.cancelled { background: var(--bad-soft); color: var(--bad); }
+.occ-list { list-style: none; margin: 6px 0 0; padding: 0; font-size: 12.5px; }
+.occ-list li { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 2px 8px; padding: 6px 0; border-top: 1px solid var(--line); }
+.occ-list li:first-child { border-top: 0; }
+.occ-list .chip { margin-top: 4px; }
+.occ-reason { flex-basis: 100%; color: var(--muted); font-size: 12px; }
+.occ.executed span:last-child { color: var(--ok); }
+.occ.failed span:last-child, .occ.held span:last-child, .occ.needs_review span:last-child,
+.occ.missed span:last-child, .occ.expired span:last-child, .occ.declined span:last-child { color: var(--bad); }
+.occ.pending_approval span:last-child { color: var(--warn); }
+/* A plain option (no input beside it): keep the radio next to its text. */
+.setup-radio:not(:has(input:not([type=radio]))) { flex-wrap: nowrap; align-items: flex-start; }
+.setup-radio:not(:has(input:not([type=radio]))) input { margin-top: 3px; }

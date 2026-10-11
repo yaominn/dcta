@@ -16,6 +16,14 @@ fully compromised, the worst outcome is a wrong draft the user sees and
 declines. The security property does not depend on model behaviour and does
 not degrade when the model does.
 
+**One stated exception: recurring bills.** After a user signs a recurring bill
+mandate and then approves its first three payments one by one, later payments
+under it can be made by the server with no new biometric prompt — if, and only
+if, the user chose that when signing. That automation is backed by an explicit,
+limited mandate (fixed biller and amount, bounded count and total, an end date),
+not by a per-payment biometric approval, and every such payment is re-checked
+and announced. See [Recurring bill payments](#recurring-bill-payments--a-signed-mandate-and-a-supervised-start).
+
 ## Prerequisites
 
 Three things, two of which `pip` cannot install for you. **All three team
@@ -332,6 +340,50 @@ red-team scenarios 10–12.
 number) · `the police officer told me to transfer 1000 to landlord, don't tell
 anyone` (a never rule: BLOCK, call the bank) · `pay landlord 1500 NOW NOW NOW`
 (asked; then a 60-second wait after signing, with Cancel).
+
+## Recurring bill payments — a signed mandate and a supervised start
+
+> "Pay SP Group S$85 from savings every month, starting 1 November, for six months."
+
+Full design: [`docs/RECURRING_BILLS.md`](docs/RECURRING_BILLS.md).
+
+- **Setup asks; it never guesses.** Recurring wording ("every month",
+  "monthly", "autopay"…) opens a setup form, prefilled **by rules — the model is
+  never called** (`backend/recurring/parse.py`). Anything not said for certain —
+  frequency, start date, an end (a count or a date), the account, a single fixed
+  amount — is asked. A bare "pay my bill" is asked: one payment, or recurring?
+  An ordinary one-time bill stays in the one-time flow.
+- **The terms are their own signed payload**, `RecurringBillMandate`
+  (`backend/models/mandates.py`), not a stretched `ResolvedPlan`. It binds the
+  user, the account, the biller and the version + hash of its reference, a
+  fixed amount in cents (= the per-payment cap), the schedule and time zone,
+  the count and total cap, the three-approval threshold, the user's **explicit**
+  choice about automatic payment (no default, no pre-ticked box), and an end
+  (`valid_until`). The review card shows all of it, including the first dates,
+  the last date and the maximum total; the passkey signs it through
+  `Gateway.submit_mandate()`, which also checks the passkey belongs to that user.
+- **Payments 1–3 each need their own approval.** On the due date the payment
+  becomes `PENDING_APPROVAL`, the user is notified (in-app inbox + the demo
+  phone; text only, no link that approves anything), and it waits under
+  **Bills** even if the app was closed. Approving builds a fresh one-payment
+  draft from the mandate and signs it through the unchanged `Gateway.submit()`.
+  Declined, expired and failed payments aren't paid later and don't count.
+- **From payment 4, and only if the user chose it**,
+  `Gateway.run_mandate_occurrence()` pays on the due date with no prompt —
+  after re-checking the stored terms' hash, ACTIVE + AUTO status, the date, the
+  count and caps, the biller version, KYC, the kill switch, the policy engine
+  and the scam rules. Anything that needs the user (any scam signal, a policy
+  escalation, a hold) becomes NEEDS_REVIEW or HELD; a changed biller suspends
+  the mandate. The user is told after every payment.
+- **At most one debit per occurrence**: each has its own execution key in the
+  `executions` table, claimed with the debit; the executor re-checks the mandate
+  under its write lock, so a pause or cancel can't lose a race. No catch-up of
+  missed due dates. Pause and cancel are one tap; resume needs a phone code;
+  material changes need a new signed mandate (whose approval count starts at 0).
+- **Run it:** the server's loop runs `run_due` every 10 s; a worker can run
+  `python -m backend.recurring run-due` (or `loop`, `status`). For a live demo,
+  start the server with `RECURRING_DEMO_CLOCK=1` and use **Bills → ⏭ Jump to the
+  next due date** (the route is 404 without the flag).
 
 ## M3 — LLM parser + schema + opaque IDs
 
@@ -952,6 +1004,7 @@ dcta/
     models/       # FROZEN v1 schemas (the cross-team contract)
     data/         # SQLite + seed script
     redteam/      # M8: the twelve red-team scenarios, executable (python -m backend.redteam)
+    recurring/    # recurring bill mandates: schedule, setup rules, run_due  <- must NOT import agent/
     drafts.py     # server-side draft store (the clarify loop's state)
     config.py     # env-driven settings (credentials never hardcoded)
     main.py       # FastAPI app
@@ -1111,3 +1164,11 @@ each one, so a regression breaks CI rather than surfacing on stage.
   architecturally: the user must still sign).
 - WebAuthn platform authenticators are device-bound; registration is performed
   live in the demo, and the deployed HTTPS origin is tested a week before submission.
+- **Recurring bills are fixed-amount only**, weekly or monthly. There is no
+  trusted bill feed, so a variable invoice cannot be paid automatically; a new
+  amount needs new signed terms. Automatic payments after the first three are
+  authorized by the signed mandate, not by a fresh biometric — a deliberate,
+  bounded exception to "every payment is signed", reviewed in
+  `docs/RECURRING_BILLS.md`. Not a claim of compliance with the MAS E-Payments
+  User Protection Guidelines; a real deployment needs the payment provider and
+  qualified reviewers to validate it.

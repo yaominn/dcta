@@ -440,13 +440,17 @@ class MockSignRequest(BaseModel):
     Lets an HTTP client obtain a valid signature over the canonical challenge
     without the server's mock secret, which is exactly why it must not be
     reachable on a demo: the browser signs via WebAuthn."""
-    resolved_plan: ResolvedPlan
+    resolved_plan: ResolvedPlan | None = None
+    mandate: RecurringBillMandate | None = None       # recurring terms (the same mock)
     nonce: str
 
 
 @app.post("/api/auth/mock-sign", **_MOCK_ONLY)
 def mock_sign(req: MockSignRequest):
-    p_hash = payload_hash(req.resolved_plan)
+    payload = req.resolved_plan if req.resolved_plan is not None else req.mandate
+    if payload is None:
+        raise HTTPException(422, {"error": "nothing to sign"})
+    p_hash = payload_hash(payload)
     challenge = challenge_hash(p_hash, req.nonce)
     return {"signature": _signer.sign(challenge),
             "payload_hash": p_hash, "challenge": challenge,

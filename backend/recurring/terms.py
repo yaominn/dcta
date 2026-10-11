@@ -86,8 +86,10 @@ def build(form: dict, *, conn, user_id: str, draft_id: str, mandate_id: str,
         errors["start_date"] = "The first payment has to be in the future."
 
     count = None
-    if not errors.keys() & {"frequency", "start_date"}:
-        raw_count, raw_end = form.get("occurrence_count"), form.get("end_date")
+    raw_count, raw_end = form.get("occurrence_count"), form.get("end_date")
+    if raw_count in (None, "") and raw_end in (None, ""):
+        errors["end"] = "Choose when it stops: a number of payments or an end date."
+    elif not errors.keys() & {"frequency", "start_date"}:
         if raw_count not in (None, "") and raw_end not in (None, ""):
             errors["end"] = "Choose a number of payments OR an end date, not both."
         elif raw_count not in (None, ""):
@@ -110,8 +112,6 @@ def build(form: dict, *, conn, user_id: str, draft_id: str, mandate_id: str,
                 if count > MAX_OCCURRENCES:
                     errors["end"] = f"That's more than {MAX_OCCURRENCES} payments."
                     count = None
-        else:
-            errors["end"] = "Choose when it stops: a number of payments or an end date."
         if count:
             dates = schedule.occurrence_dates(frequency, start, count)
             if (dates[-1] - dates[0]).days > MAX_SPAN_DAYS:

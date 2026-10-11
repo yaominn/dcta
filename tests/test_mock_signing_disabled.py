@@ -46,7 +46,8 @@ from backend.models.contacts import ResolvedContactChange
 from backend.models.schemas import ResolvedPlan
 
 REPO = Path(__file__).resolve().parents[1]
-MOCK_ROUTES = ["/api/auth/mock-sign", "/api/gateway/execute", "/api/contacts/apply"]
+MOCK_ROUTES = ["/api/auth/mock-sign", "/api/gateway/execute", "/api/contacts/apply",
+               "/api/recurring/mandates/enroll"]
 
 
 @pytest.fixture

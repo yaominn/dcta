@@ -49,6 +49,9 @@
                   aria-label="Mute the assistant's voice" title="Mute the assistant's voice">
             <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 9.5h3.2L12 5.5v13l-4.8-4H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Z"/><path class="w1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.2 9.2a4 4 0 0 1 0 5.6"/><path class="w2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M17.8 6.8a7.5 7.5 0 0 1 0 10.4"/><path class="x" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.5 9.5l5 5m0-5-5 5"/></svg>
           </button>
+          <!-- Recurring bills: the arrangements, and any payment waiting for
+               the user's approval (the badge counts those). -->
+          <button id="bills" class="bills" type="button" title="Recurring bill payments">Bills<span id="bills-badge" class="badge" hidden></span></button>
           <!-- The kill switch: one tap freezes every outgoing payment. -->
           <button id="freeze" class="freeze" type="button" title="Freeze all outgoing payments">Freeze</button>
           <div class="shield" title="Every payment needs your biometric">

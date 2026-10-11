@@ -853,6 +853,8 @@ function announceSuccess(res) {
 }
 
 function showResult(res) {
+  if (res.json.accepted && res.json.mandate_id) return showMandateCreated(res);
+  refreshBillsBadge();               // a recurring payment approved (or refused) here
   if (res.json.rejection === "DUPLICATE") return showAlreadySent(res);
   if (res.json.accepted && res.json.scheduled) return showScheduled(res);
   const ok = !!res.json.accepted;
@@ -1132,12 +1134,35 @@ function handleDraft(res) {
     showContactRefused(body);
     return;
   }
+  if (body.kind === "recurring_setup") {           // the setup form, with what's missing
+    renderSetupForm(body);
+    if (body.questions && body.questions.length) Voice.speak(body.questions.join(" "));
+    return;
+  }
+  if (body.kind === "mandate" && body.status === "ready") {   // recurring terms to sign
+    CURRENT.draftId = body.draft_id;
+    CURRENT.plan = body.mandate;
+    CURRENT.kind = "mandate";
+    addMsg("bot", el("div", "bubble", "Here's the recurring payment. Check every detail — you're "
+      + "agreeing to these exact terms — then confirm with your biometric."),
+      buildMandateCard(body.mandate, body.preview));
+    return;
+  }
+  if (body.status === "info") {                    // nothing to draft (e.g. unsupported)
+    botSay(body.message);
+    return;
+  }
+  if (body.status === "blocked" && body.kind === "recurring_review") {
+    showRefusal("Not paid", body.reasons || [], body.message || "Nothing was sent.");
+    refreshBillsBadge();
+    return;
+  }
 
   // Four outcomes, and the user must be able to tell them apart. All are HTTP
   // 200: needing to ask is a normal conversational result, and a refusal is a
   // successful request whose answer is "no".
   if (body.status === "clarify") {
-    CURRENT.draftId = body.draft_id;               // the question's answer goes to it
+    if (body.draft_id) CURRENT.draftId = body.draft_id;   // the question's answer goes to it
     renderClarify(body);
     Voice.speak(body.question);
     return;
@@ -1200,12 +1225,24 @@ function handleDraft(res) {
   // The assistant's reply: what it worked out, built by the server from the
   // same checked data as the card (backend/narrate.py) — never model text.
   const reply = body.narration && body.narration.reply;
-  const intro = el("div", "bubble", reply
+  const rec = body.recurring;
+  const intro = el("div", "bubble", rec
+    ? "Payment " + rec.seq + " of " + rec.count + " for your " + rec.biller + " arrangement is due. "
+      + "Check it, then approve it with your biometric — nothing is paid until you do."
+    : reply
     ? reply
     : conf ? "Here's the draft. It's unusual for you, so I need one more check first."
            : "Here's the draft. Check it, then confirm with your biometric.");
-  addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf, body.narration, body.transcript,
-                                     body.scam));
+  // A recurring payment wasn't said by anyone just now: don't label the
+  // server's description of it "You said".
+  const card = buildPlanCard(body.resolved_plan, conf, body.narration, rec ? null : body.transcript,
+                             body.scam);
+  if (rec) {
+    card.insertBefore(el("p", "said", "Payment " + rec.seq + " of " + rec.count + " under the recurring "
+      + "arrangement you set up. Its biller, account and amount are fixed by what you signed then."),
+      card.querySelector(".legs"));
+  }
+  addMsg("bot", intro, card);
   if (reply && CURRENT.via) Voice.speak(reply);     // spoken request -> spoken reply
   if (conf) {
     const code = document.getElementById("stepup-code");
@@ -1257,6 +1294,23 @@ function renderClarify(body) {
   if (body.kind === "purpose") {
     awaitPurpose(body.draft_id);
     m.append(el("p", "meta-note", "Type or say your answer. Nothing has been sent."));
+    return;
+  }
+  if (body.kind === "recurrence") {                // "pay my bill": once, or recurring?
+    const chips = el("div", "chips live");
+    for (const c of body.choices || []) {
+      const b = el("button", "chip choice", c.display);
+      b.type = "button";
+      b.onclick = () => {
+        chips.classList.remove("live");
+        chips.querySelectorAll("button").forEach((x) => { x.disabled = true; });
+        b.classList.add("chosen");
+        userSay(c.display);
+        resubmitWithRecurrence(body.transcript, c.id);
+      };
+      chips.append(b);
+    }
+    m.append(chips);
     return;
   }
   const nc = body.new_contact;
@@ -1376,6 +1430,9 @@ async function onSign() {
       : CURRENT.kind === "contact_add"
       ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
                              "/api/contacts/add-webauthn", "contact_add")
+      : CURRENT.kind === "mandate"
+      ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
+                             "/api/recurring/mandates/enroll-webauthn", "mandate")
       : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
                              undefined, undefined, typedName());
     // One draft, one signature: the card is spent whatever the outcome.
@@ -1389,6 +1446,426 @@ async function onSign() {
       : String(e));
     btn.disabled = false;
   }
+}
+
+/* ---------- recurring bills ---------- */
+/* Setup is a FORM, not a guess: the server reads what it can by rules (never
+   the model) and every field is confirmed here before any terms exist. The
+   terms are signed once with the passkey. Each of the first payments is its
+   own card, signed like any payment; later ones are paid by the server only
+   if the user chose that, explicitly, on this form. Every value shown comes
+   from the server's JSON and is set with textContent. */
+const OCC_LABELS = {
+  SCHEDULED: "Scheduled", PENDING_APPROVAL: "Waiting for your approval",
+  NEEDS_REVIEW: "Needs your review", HELD: "On hold — not paid", EXECUTED: "Paid",
+  FAILED: "Failed — not paid", DECLINED: "Declined — not paid", EXPIRED: "Expired — not paid",
+  MISSED: "Missed — not paid", SKIPPED: "Skipped (paused) — not paid", CANCELLED: "Cancelled",
+};
+const MANDATE_LABELS = { ACTIVE: "Active", PAUSED: "Paused", SUSPENDED: "Stopped — needs new setup",
+                         CANCELLED: "Cancelled", COMPLETED: "Finished" };
+
+function centsToInput(cents) {
+  // Integer arithmetic only: the amount box shows "85.00" for 8500.
+  return cents == null ? "" : Math.floor(cents / 100) + "." + String(cents % 100).padStart(2, "0");
+}
+
+function setupRow(labelText, control, error) {
+  const row = el("label", "setup-row");
+  row.append(el("span", "setup-label", labelText), control);
+  if (error) row.append(el("span", "setup-error", error));
+  return row;
+}
+
+function selectBox(name, options, value) {
+  const s = el("select");
+  s.name = name;
+  for (const o of options) {
+    const opt = el("option", null, o.label);
+    opt.value = o.value;
+    if (o.value === value) opt.selected = true;
+    s.append(opt);
+  }
+  return s;
+}
+
+function radioGroup(name, options, value) {
+  const box = el("div", "setup-radios");
+  for (const o of options) {
+    const lab = el("label", "setup-radio");
+    const r = el("input");
+    r.type = "radio"; r.name = name; r.value = o.value;
+    r.checked = o.value === value;      // only what the user said or chose
+    lab.append(r, el("span", null, o.label));
+    if (o.extra) lab.append(o.extra);
+    box.append(lab);
+  }
+  return box;
+}
+
+function renderSetupForm(body) {
+  retireLiveCard();
+  CURRENT.draftId = body.draft_id;
+  CURRENT.kind = "recurring_setup";
+  const f = body.fields || {}, err = body.errors || {}, opt = body.options || {};
+  const card = el("div", "bubble card plan-card setup-card");
+  card.append(el("p", "card-title", "Set up a recurring bill payment"));
+  if (body.transcript) card.append(el("p", "said", "You said: “" + body.transcript + "”"));
+  if ((body.questions || []).length) {
+    const q = el("div", "setup-questions");
+    q.append(el("p", null, "I need a few more details:"));
+    for (const t of body.questions) q.append(el("p", null, "• " + t));
+    card.append(q);
+  }
+  for (const n of body.notes || []) card.append(el("p", "hint", n));
+
+  const form = el("form", "setup-form");
+  form.append(setupRow("Bill", selectBox("biller_id",
+    [{ value: "", label: "Choose a bill" }].concat((opt.billers || []).map(
+      (b) => ({ value: b.id, label: b.name + " · " + b.reference }))), f.biller_id || ""),
+    err.biller_id));
+  form.append(setupRow("From", selectBox("source_account",
+    [{ value: "", label: "Choose an account" }].concat((opt.accounts || []).map(
+      (a) => ({ value: a.id, label: a.label }))), f.source_account || ""), err.source_account));
+  const amount = el("input");
+  amount.name = "amount"; amount.inputMode = "decimal"; amount.placeholder = "e.g. 85.00";
+  amount.value = f.amount != null ? String(f.amount) : centsToInput(f.amount_cents);
+  const amountBox = el("div", "setup-amount");
+  amountBox.append(el("span", null, "S$"), amount);
+  form.append(setupRow("Amount, the same every time", amountBox, err.amount));
+  form.append(setupRow("How often", radioGroup("frequency",
+    (opt.frequencies || []).map((x) => ({ value: x.id, label: x.label })), f.frequency),
+    err.frequency));
+  const start = el("input");
+  start.type = "date"; start.name = "start_date"; start.min = body.today || "";
+  start.value = f.start_date || "";
+  form.append(setupRow("First payment (" + (body.due_time || "09:00") + ", "
+    + (body.timezone || "") + ")", start, err.start_date));
+  const count = el("input");
+  count.type = "number"; count.name = "occurrence_count"; count.min = "1";
+  count.max = String(opt.max_occurrences || 60); count.className = "setup-count";
+  count.value = f.occurrence_count != null ? String(f.occurrence_count) : "";
+  const until = el("input");
+  until.type = "date"; until.name = "end_date"; until.value = f.end_date || "";
+  const endBy = f.end_date ? "date" : f.occurrence_count != null ? "count" : null;
+  const ends = radioGroup("end_by", [
+    { value: "count", label: "After this many payments:", extra: count },
+    { value: "date", label: "On this date:", extra: until }], endBy);
+  form.append(setupRow("Ends", ends, err.end));
+
+  // The automation choice: two options, NEITHER selected until the user picks
+  // one (the server refuses terms without it). Never a pre-ticked box.
+  const n = opt.approvals || 3;
+  const auto = f.auto_after_supervised === true ? "auto" : f.auto_after_supervised === false ? "each" : null;
+  form.append(setupRow("Approvals", radioGroup("approvals", [
+    { value: "each", label: "Ask me to approve every payment" },
+    { value: "auto", label: "Ask me to approve the first " + n + " payments, then pay the rest "
+                              + "automatically on their due dates" }], auto),
+    err.auto_after_supervised));
+
+  const submit = el("button", "btn primary", "Review");
+  submit.type = "submit";
+  form.append(submit);
+  form.onsubmit = async (e) => {
+    e.preventDefault();
+    const pick = (name) => { const r = form.querySelector("input[name=" + name + "]:checked"); return r ? r.value : null; };
+    const by = pick("end_by"), choice = pick("approvals");
+    const payload = {
+      biller_id: form.querySelector("select[name=biller_id]").value || null,
+      source_account: form.querySelector("select[name=source_account]").value || null,
+      amount: amount.value.trim() || null,
+      frequency: pick("frequency"),
+      start_date: start.value || null,
+      occurrence_count: by === "count" && count.value ? parseInt(count.value, 10) : null,
+      end_date: by === "date" && until.value ? until.value : null,
+      auto_after_supervised: choice === "auto" ? true : choice === "each" ? false : null,
+    };
+    submit.disabled = true;
+    typing(true);
+    let res;
+    try {
+      res = await jpost(API + "/api/recurring/setup/" + encodeURIComponent(body.draft_id), payload);
+    } catch (_) {
+      res = { status: 0, json: { detail: { error: "No connection — nothing was set up." } } };
+    }
+    form.querySelectorAll("input, select, button").forEach((x) => { x.disabled = true; });
+    handleDraft(res);
+  };
+  card.append(form);
+  const cancel = el("button", "btn danger", "Cancel");
+  cancel.type = "button";
+  cancel.onclick = () => {
+    form.querySelectorAll("input, select, button").forEach((x) => { x.disabled = true; });
+    cancel.disabled = true;
+    botSay("OK — nothing was set up.");
+  };
+  card.append(cancel);
+  addMsg("bot", card);
+}
+
+function buildMandateCard(m, preview) {
+  retireLiveCard();
+  const p = preview || {};
+  const card = el("div", "bubble card plan-card plan mandate-card");
+  card.id = "plan";
+  card.append(el("p", "card-title", "Review recurring payment"));
+  const dl = el("dl", "meta terms");
+  const row = (k, v, cls) => dl.append(el("dt", null, k), el("dd", cls || null, v));
+  row("Pay", m.biller_display + " · " + m.biller_reference_masked);
+  row("From", m.source_display);
+  row("Amount", p.amount_display + " each time", "strong");
+  row("How often", p.frequency_label);
+  row("First payment", (p.first_dates || [])[0] + " at " + p.due_time);
+  if ((p.first_dates || []).length > 1) row("Then", p.first_dates.slice(1).join(", ") + (p.count > 3 ? ", …" : ""));
+  row("Last payment", p.final_date);
+  row("Payments", "at most " + p.count);
+  row("Total", "at most " + p.total_display, "strong");
+  card.append(dl);
+  if (p.short_months) card.append(el("p", "hint", p.short_months));
+  const box = el("div", "approvals-box" + (m.auto_after_supervised ? " auto" : ""));
+  box.append(el("p", null, p.approvals));
+  if (m.auto_after_supervised) {
+    box.append(el("p", null, "Automatic payments only ever pay these exact terms. They stop "
+      + "for anything unusual — a changed bill reference, a frozen account, a safety check — "
+      + "and you're told after every payment."));
+  }
+  card.append(box);
+  card.append(el("p", "hint", "You can pause or cancel it at any time under Bills. Pausing "
+    + "skips payments; nothing is ever paid late."));
+
+  const sec = el("details", "sec");
+  sec.append(el("summary", null, "Security details"));
+  const meta = el("dl", "meta");
+  const add = (k, v, id, cls) => { const dd = el("dd", cls, v); if (id) dd.id = id; meta.append(el("dt", null, k), dd); };
+  add("Arrangement", m.mandate_id + " v" + m.version, null, "mono");
+  add("Signing window", windowLabel(m.created_at, m.expires_at), "window");
+  add("Transcript hash", m.transcript_hash.slice(0, 16) + "…", "txhash", "mono");
+  add("Payload hash (your browser)", "computed when you confirm", "phash", "mono");
+  sec.append(meta);
+  card.append(sec);
+
+  const btn = el("button", "btn primary", SIGN_LABEL);
+  btn.id = "sign";
+  btn.onclick = onSign;
+  CURRENT.gate = {};
+  card.append(btn, declineButton());
+  updateSignGate(btn);
+  card.append(el("p", "hint", "Your device signs a hash of exactly these terms. Nothing is paid now."));
+  return card;
+}
+
+function showMandateCreated(res) {
+  const card = newResultCard(true);
+  card.append(el("h3", null, "SET UP"));
+  card.append(el("p", "lead", "Your recurring payment is set up. Nothing has been paid yet — "
+    + "when a payment falls due, you'll get a message and it will wait under Bills for you to approve."));
+  const b = el("button", "btn secondary", "Open Bills");
+  b.type = "button";
+  b.onclick = showBills;
+  card.append(b);
+  refreshBillsBadge();
+}
+
+async function resubmitWithRecurrence(transcript, choice) {
+  typing(true);
+  handleDraft(await jpost(API + "/api/drafts", { transcript, user_id: DEMO_USER, recurrence: choice }));
+}
+
+async function reviewOccurrence(mandateId, seq) {
+  typing(true);
+  let res;
+  try {
+    res = await jpost(API + "/api/recurring/occurrences/" + encodeURIComponent(mandateId) + "/"
+      + encodeURIComponent(seq) + "/review", { user_id: DEMO_USER });
+  } catch (_) {
+    res = { status: 0, json: { detail: { error: "No connection" } } };
+  }
+  handleDraft(res);
+}
+
+async function mandateAction(mandateId, action) {
+  const r = await jpost(API + "/api/recurring/mandates/" + encodeURIComponent(mandateId) + "/" + action,
+                        { user_id: DEMO_USER });
+  if (r.status !== 200) { showErr(((r.json.detail || {}).error || "That didn't work") + "."); return; }
+  botSay(action === "pause"
+    ? "Paused. Nothing will be paid while it's paused, and payments that fall due are skipped, not paid later."
+    : action === "cancel" ? "Cancelled. Nothing more will be paid under it."
+    : "Resumed. Payments due from now on go ahead as agreed.");
+  showBills();
+}
+
+function resumeControls(mandateId, holder) {
+  const b = el("button", "btn secondary", "Resume (code by text)");
+  b.type = "button";
+  b.onclick = async () => {
+    const r = await jpost(API + "/api/recurring/mandates/" + encodeURIComponent(mandateId) + "/resume/begin",
+                          { user_id: DEMO_USER });
+    if (r.status !== 200) { showErr(((r.json.detail || {}).error || "Couldn't send a code") + "."); return; }
+    b.disabled = true;
+    const form = el("form", "stepup-form");
+    const code = el("input");
+    code.inputMode = "numeric"; code.maxLength = 6; code.placeholder = "6-digit code";
+    const go = el("button", "btn primary", "Resume");
+    go.type = "submit";
+    form.append(code, go);
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const rr = await jpost(API + "/api/recurring/mandates/" + encodeURIComponent(mandateId) + "/resume",
+                             { user_id: DEMO_USER, code: code.value.trim() });
+      if (rr.status !== 200) { showErr(((rr.json.detail || {}).error || "That code didn't work") + "."); return; }
+      form.querySelectorAll("input, button").forEach((x) => { x.disabled = true; });
+      botSay("Resumed. Payments due from now on go ahead as agreed; anything skipped while paused stays unpaid.");
+      showBills();
+    };
+    holder.append(form);
+    code.focus();
+    botSay("I've texted a code to your phone. Enter it to resume the payments.");
+  };
+  return b;
+}
+
+function mandateBlock(m) {
+  const box = el("div", "mandate");
+  const head = el("div", "mandate-head");
+  head.append(el("span", "mandate-name", m.biller || "Recurring payment"),
+              el("span", "pill " + String(m.status || "").toLowerCase(), MANDATE_LABELS[m.status] || m.status));
+  box.append(head);
+  if (m.broken) { box.append(el("p", "hint", m.status_reason)); return box; }
+  box.append(el("p", "mandate-line", m.amount_display + " " + (m.frequency === "WEEKLY" ? "weekly" : "monthly")
+    + " from " + m.account + " · " + m.reference));
+  box.append(el("p", "mandate-line", "Paid " + m.paid_count + " of " + m.count + " (" + m.paid_total_display
+    + " of at most " + m.total_cap_display + ")"));
+  if (m.next_due && (m.status === "ACTIVE" || m.status === "PAUSED")) {
+    box.append(el("p", "mandate-line", "Next due: " + m.next_due + " at " + m.due_time + " (" + m.timezone + ")"));
+  }
+  box.append(el("p", "mandate-line strong", "Automatic payment: " + m.automatic));
+  if (m.status_reason && m.status !== "ACTIVE") box.append(el("p", "hint", m.status_reason));
+  const det = el("details", "sec");
+  det.append(el("summary", null, "Payments"));
+  const ul = el("ul", "occ-list");
+  for (const o of m.occurrences || []) {
+    const li = el("li", "occ " + String(o.status).toLowerCase());
+    li.append(el("span", null, "#" + o.seq + " · " + o.due), el("span", null, OCC_LABELS[o.status] || o.status));
+    if (o.reason && o.status !== "EXECUTED") li.append(el("span", "occ-reason", o.reason));
+    if (o.approvable) {
+      const b = el("button", "chip choice", "Review & approve");
+      b.type = "button";
+      b.onclick = () => reviewOccurrence(m.mandate_id, o.seq);
+      li.append(b);
+    }
+    ul.append(li);
+  }
+  det.append(ul);
+  box.append(det);
+  const actions = el("div", "mandate-actions");
+  if (m.status === "ACTIVE") {
+    const b = el("button", "btn secondary", "Pause");
+    b.type = "button";
+    b.onclick = () => mandateAction(m.mandate_id, "pause");
+    actions.append(b);
+  }
+  if (m.status === "PAUSED") actions.append(resumeControls(m.mandate_id, actions));
+  if (m.status === "ACTIVE" || m.status === "PAUSED" || m.status === "SUSPENDED") {
+    const b = el("button", "btn danger", "Cancel arrangement");
+    b.type = "button";
+    b.onclick = () => {
+      if (!confirm("Cancel this recurring payment? Nothing more will be paid under it.")) return;
+      mandateAction(m.mandate_id, "cancel");
+    };
+    actions.append(b);
+  }
+  box.append(actions);
+  return box;
+}
+
+async function showBills() {
+  let mandates = [], pending = [], notes = [], clock = {};
+  try {
+    [mandates, pending, notes, clock] = await Promise.all([
+      jget(API + "/api/recurring/mandates?user_id=" + DEMO_USER).then((r) => r.mandates || []),
+      jget(API + "/api/recurring/pending?user_id=" + DEMO_USER).then((r) => r.pending || []),
+      jget(API + "/api/recurring/notifications?user_id=" + DEMO_USER).then((r) => r.notifications || []),
+      jget(API + "/api/recurring/clock").catch(() => ({})),
+    ]);
+  } catch (_) {
+    showErr("Couldn't load your recurring payments.");
+    return;
+  }
+  paintBillsBadge(pending.length);
+  const card = el("div", "bubble card plan-card bills-card");
+  card.append(el("p", "card-title", "Recurring payments"));
+  if (pending.length) {
+    card.append(el("p", "sg-title", "WAITING FOR YOUR APPROVAL"));
+    const ul = el("ul", "occ-list pending");
+    for (const p of pending) {
+      const li = el("li", "occ pending_approval");
+      li.append(el("span", null, p.biller + " · " + p.amount_display + " · payment " + p.seq + " of " + p.count),
+                el("span", null, "Due " + p.due + "; approve by " + p.review_until));
+      if (p.reason) li.append(el("span", "occ-reason", p.reason));
+      const b = el("button", "chip choice", "Review & approve");
+      b.type = "button";
+      b.onclick = () => reviewOccurrence(p.mandate_id, p.seq);
+      li.append(b);
+      ul.append(li);
+    }
+    card.append(ul);
+  }
+  if (!mandates.length) {
+    card.append(el("p", "hint", "No recurring payments yet. Try: “Pay SP Group S$85 from savings every "
+      + "month, starting 1 November, for six months.”"));
+  }
+  for (const m of mandates) card.append(mandateBlock(m));
+  if (notes.length) {
+    const act = el("details", "sec");
+    act.append(el("summary", null, "Recent messages"));
+    const ul = el("ul", "occ-list");
+    for (const n of notes.slice(0, 8)) {
+      const li = el("li", "occ");
+      li.append(el("span", "strong", n.title), el("span", "occ-reason", n.body));
+      ul.append(li);
+    }
+    act.append(ul);
+    card.append(act);
+  }
+  if (clock.demo) {
+    // DEMO ONLY: the server's RECURRING_DEMO_CLOCK lets a demo reach next
+    // month's due date now. Off (and this button absent) on a normal server.
+    card.append(el("p", "hint", "Demo clock: today is " + clock.today + "."));
+    const b = el("button", "btn secondary", "⏭ Demo: jump to the next due date");
+    b.type = "button";
+    b.onclick = async () => {
+      b.disabled = true;
+      const r = await jpost(API + "/api/recurring/clock/advance", { user_id: DEMO_USER });
+      if (r.status !== 200) { showErr(((r.json.detail || {}).error || "Couldn't move the clock") + "."); return; }
+      botSay("Demo clock moved to " + r.json.today + ".");
+      refreshBalances();
+      showBills();
+    };
+    card.append(b);
+  }
+  addMsg("bot", card);
+}
+
+function paintBillsBadge(n) {
+  const badge = document.getElementById("bills-badge");
+  if (!badge) return;
+  badge.hidden = !n;
+  badge.textContent = n ? String(n) : "";
+}
+
+async function refreshBillsBadge() {
+  try {
+    const pending = (await jget(API + "/api/recurring/pending?user_id=" + DEMO_USER)).pending || [];
+    paintBillsBadge(pending.length);
+    return pending;
+  } catch (_) {
+    return null;                       // the badge is a convenience; the list is the record
+  }
+}
+
+function wireBills() {
+  const btn = document.getElementById("bills");
+  if (btn) btn.onclick = showBills;
+  setInterval(refreshBillsBadge, 15000);
 }
 
 /* ---------- voice input, three tiers ---------- */
@@ -1488,6 +1965,7 @@ function wireVoice() {
 
 const SUGGESTIONS = [
   "Pay mom five hundred then buy Apple with the rest",
+  "Pay SP Group S$85 from savings every month, starting 1 November, for six months",
   "Send fifty to John",
   "Send five thousand to John",
   "Send 200 to Uncle Bob",
@@ -1656,8 +2134,21 @@ async function init() {
     return;
   }
   wireVoice();
+  wireBills();
   document.getElementById("say-box").hidden = false;
   greet();
+  // Bills that fell due while the app was closed are still waiting: say so.
+  const pending = await refreshBillsBadge();
+  if (pending && pending.length) {
+    const m = botSay("You have " + pending.length + " bill payment" + (pending.length > 1 ? "s" : "")
+      + " waiting for your approval. Nothing is paid until you approve.");
+    const chips = el("div", "chips live");
+    const b = el("button", "chip choice", "Review now");
+    b.type = "button";
+    b.onclick = () => { chips.classList.remove("live"); b.disabled = true; showBills(); };
+    chips.append(b);
+    m.append(chips);
+  }
 }
 window.addEventListener("DOMContentLoaded", init);
 
