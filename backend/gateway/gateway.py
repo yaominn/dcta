@@ -38,8 +38,15 @@ from backend.gateway.signer import MockSigner
 from backend.gateway.stepup import StepUpStore
 from backend.data import destinations
 from backend.data.db import connect
-from backend.gateway.executor import AlreadyExecuted, DestinationChanged, MockExecutor
+from backend.gateway.executor import (AlreadyExecuted, DestinationChanged, MandateRefused,
+                                      MockExecutor)
 from backend.policy import attempts, safety, scam
+from backend.data import billers
+from backend.models.mandates import RecurringBillMandate
+from backend.recurring import clock as recurring_clock
+from backend.recurring import schedule
+from backend.recurring import store as recurring
+from backend.recurring.terms import occurrence_plan
 
 # Outcomes recorded for a draft that ended WITHOUT running.
 CLOSED_OUTCOMES = frozenset({"DECLINED", "CANCELLED"})
@@ -406,6 +413,270 @@ class Gateway:
         if not self.signer.verify(pubkey, signature, challenge_hash(p_hash, nonce)):
             return self._reject(draft_id, p_hash, "SIGNATURE", "bad signature")
         return None
+
+    # ------------------------------------------------------------ recurring mandates
+    def submit_mandate(
+        self,
+        terms: RecurringBillMandate,
+        signature: str | None,
+        nonce: str,
+        credential_id: str,
+    ) -> dict:
+        """Create a recurring bill mandate: expiry -> nonce -> signature -> at
+        most once -> exactly the drafted terms -> the signer is the user the
+        terms name -> setup checks -> store (with its occurrences) -> audit.
+
+        This moves no money. It records what the user agreed to; every payment
+        under it is checked again when it falls due."""
+        draft_id = terms.draft_id
+        p_hash = payload_hash(terms)
+        refused = self._authenticate(draft_id, p_hash, terms.expires_at, signature,
+                                     nonce, credential_id)
+        if refused is not None:
+            return refused
+        prior = self.executor.prior_execution(draft_id)
+        if prior is not None:
+            return self._already_final(draft_id, p_hash, prior)
+        refused = self.drafts.executable(draft_id, kind="mandate", submitted_hash=p_hash)
+        if refused is not None:
+            return self._reject(draft_id, p_hash, *refused)
+        # Whose authority this is: the passkey that signed must be the user
+        # the terms name. An unknown owner fails closed, as a mismatch does.
+        if self._credential_user(credential_id) != terms.user_id:
+            return self._reject(draft_id, p_hash, "WRONG_USER",
+                                "this passkey doesn't belong to the account holder — nothing "
+                                "was set up")
+        stop = self._mandate_setup_refusal(terms)
+        if stop is not None:
+            return self._reject(draft_id, p_hash, *stop)
+        try:
+            result = self.executor.create_mandate(terms, payload_hash=p_hash,
+                                                  credential_id=credential_id,
+                                                  now=recurring_clock.now(db_path=self.executor.db_path))
+        except AlreadyExecuted as exc:
+            return self._already_final(draft_id, p_hash, exc.prior)
+        except MandateRefused as exc:
+            return self._reject(draft_id, p_hash, "POLICY", exc.reason)
+        # Ids, amounts and choices — no names: the chain is hard to redact.
+        self.audit.append(AuditEntryType.MANDATE_CREATED, {
+            "draft_id": draft_id, "payload_hash": p_hash, "mandate_id": terms.mandate_id,
+            "version": terms.version, "user_id": terms.user_id, "credential_id": credential_id,
+            "biller_id": terms.biller_id, "biller_ref_version": terms.biller_ref_version,
+            "source_account": terms.source_account, "amount_cents": terms.amount_cents,
+            "frequency": terms.frequency, "start_date": terms.start_date,
+            "occurrence_count": terms.occurrence_count, "total_cap_cents": terms.total_cap_cents,
+            "supervised_approvals": terms.supervised_approvals,
+            "auto_after_supervised": terms.auto_after_supervised,
+            "valid_until": terms.valid_until})
+        return {"accepted": True, "draft_id": draft_id, "payload_hash": p_hash,
+                "execution": result, "mandate_id": terms.mandate_id}
+
+    def _credential_user(self, credential_id: str) -> str | None:
+        cred = self.credentials.get(credential_id)
+        user = getattr(cred, "user_id", None)
+        if user is None:
+            user = getattr(self.credentials, "user_of", lambda _c: None)(credential_id)
+        return user
+
+    def _mandate_setup_refusal(self, terms: RecurringBillMandate) -> tuple[str, str] | None:
+        db = self.executor.db_path
+        if safety.kill_switch_engaged(terms.user_id, db_path=db) is not None:
+            return ("KILL_SWITCH", "your payments are frozen, so nothing new can be set up — "
+                                   "unfreeze them with a code on your phone first")
+        conn = connect(db)
+        try:
+            user = conn.execute("SELECT kyc_status FROM users WHERE id=?",
+                                (terms.user_id,)).fetchone()
+            acct = conn.execute("SELECT user_id FROM accounts WHERE id=?",
+                                (terms.source_account,)).fetchone()
+            cap = conn.execute("SELECT value FROM limits WHERE key='per_transaction'").fetchone()
+            biller_ok = billers.matches(conn, terms.biller_id, terms.biller_ref_version,
+                                        terms.biller_ref_hash)
+        finally:
+            conn.close()
+        if user is None or str(user["kyc_status"]).upper() != "VERIFIED":
+            return ("POLICY", "your identity verification is still pending, so payments are on hold")
+        if acct is None or acct["user_id"] != terms.user_id:
+            return ("POLICY", "the account to pay from isn't yours")
+        if not biller_ok:
+            return ("SUPERSEDED", f"{terms.biller_display}'s payment details changed after this "
+                                  "was drafted — review them again")
+        if cap and terms.amount_cents > int(cap["value"]):
+            return ("POLICY", "each payment is over your per-transaction limit")
+        first = schedule.due_at(terms.due_dates()[0], terms.timezone)
+        if first <= recurring_clock.now(db_path=db):
+            return ("STATE", "the first payment date has already passed — set it up again")
+        return None
+
+    def run_mandate_occurrence(self, mandate_id: str, seq: int, *, now: int) -> dict:
+        """Pay one occurrence of a mandate in its AUTOMATIC phase — the only
+        path that moves money without a signature over the payment itself.
+
+        Its authority is the signed mandate, and only within it: the stored
+        terms must still hash to what was signed, the mandate must be ACTIVE
+        and in AUTO mode (switched by the server after the user's third
+        individually signed payment, and only because the signed terms say the
+        user chose that), it must be the occurrence's due date, and the count,
+        the caps, the biller's reference and the account owner must all hold.
+        Then today's rules, exactly as for a signed payment: KYC, the kill
+        switch, the policy engine and the scam rules. Anything that would need
+        the user — a hold, a phone code, an escalation, any scam signal — makes
+        the occurrence NEEDS_REVIEW or HELD, and nothing is paid unattended.
+        The executor re-checks the mandate under its write lock and claims the
+        occurrence's execution key with the debit: at most one debit, however
+        many workers or retries."""
+        db = self.executor.db_path
+        conn = connect(db)
+        try:
+            m = recurring.get_mandate(conn, mandate_id)
+            occ = recurring.occurrence(conn, mandate_id, seq)
+        finally:
+            conn.close()
+        if m is None or occ is None:
+            return {"status": "UNKNOWN", "mandate_id": mandate_id, "seq": seq}
+        prior = self.executor.prior_execution(occ["draft_id"])
+        if prior is not None:                       # a retry, a second worker, a restart
+            return {"status": "ALREADY", "mandate_id": mandate_id, "seq": seq,
+                    "execution": prior["result"], "executed_at": prior["executed_at"]}
+        terms = recurring.load_terms(m)
+        if terms is None:
+            return self._occurrence_stop(m, occ, None, "HELD", "INTEGRITY",
+                                         "the stored arrangement doesn't match what you signed.",
+                                         now=now, suspend=True)
+        if m["status"] != "ACTIVE" or occ["status"] != "SCHEDULED" or occ["phase"] != "AUTO":
+            return {"status": "NOT_RUNNABLE", "mandate_id": mandate_id, "seq": seq,
+                    "mandate_status": m["status"], "occurrence_status": occ["status"]}
+        if (m["mode"] != "AUTO" or not terms.auto_after_supervised
+                or m["supervised_successes"] < terms.supervised_approvals):
+            return self._occurrence_stop(m, occ, terms, "NEEDS_REVIEW", "NOT_AUTO",
+                                         "automatic payment isn't switched on for it.", now=now)
+        if now < occ["due_at"]:
+            return {"status": "NOT_DUE", "mandate_id": mandate_id, "seq": seq}
+        if now > occ["auto_until"] or now > terms.valid_until:
+            return self._occurrence_stop(m, occ, terms, "MISSED", "MISSED",
+                                         "it couldn't be run on its due date.", now=now)
+        if (m["paid_count"] >= terms.occurrence_count
+                or m["paid_total_cents"] + terms.amount_cents > terms.total_cap_cents):
+            return self._occurrence_stop(m, occ, terms, "HELD", "CAP",
+                                         "it would go over the arrangement's limit.", now=now)
+        conn = connect(db)
+        try:
+            biller_ok = billers.matches(conn, terms.biller_id, terms.biller_ref_version,
+                                        terms.biller_ref_hash)
+            acct = conn.execute("SELECT user_id, balance FROM accounts WHERE id=?",
+                                (terms.source_account,)).fetchone()
+            user = conn.execute("SELECT kyc_status FROM users WHERE id=?",
+                                (terms.user_id,)).fetchone()
+        finally:
+            conn.close()
+        if not biller_ok:
+            return self._occurrence_stop(
+                m, occ, terms, "HELD", "BILLER_CHANGED",
+                f"{terms.biller_display}'s payment details changed since you set this up.",
+                now=now, suspend=True)
+        if acct is None or acct["user_id"] != terms.user_id:
+            return self._occurrence_stop(m, occ, terms, "HELD", "ACCOUNT",
+                                         "the account to pay from isn't yours any more.",
+                                         now=now, suspend=True)
+        if user is None or str(user["kyc_status"]).upper() != "VERIFIED":
+            return self._occurrence_stop(m, occ, terms, "HELD", "KYC",
+                                         "your identity verification is pending.", now=now)
+        if safety.kill_switch_engaged(terms.user_id, db_path=db) is not None:
+            return self._occurrence_stop(m, occ, terms, "HELD", "KILL_SWITCH",
+                                         "your payments are frozen.", now=now)
+
+        real_now = int(time.time())     # policy and scam rules keep real time
+        plan = occurrence_plan(terms, draft_id=occ["draft_id"], seq=seq,
+                               due=schedule.parse_date(occ["due_date"]), now=real_now)
+        p_hash = payload_hash(plan)
+        verdicts = evaluate(plan, load_context(terms.user_id,
+                                               db_path=self.policy_db_path or db, now=real_now))
+        self.audit.append(AuditEntryType.POLICY, verdicts.to_audit_payload(occ["draft_id"]))
+        if verdicts.blocked:
+            return self._occurrence_stop(m, occ, terms, "HELD", "POLICY",
+                                         "; ".join(verdicts.reasons()), now=now)
+        if verdicts.decision is Decision.REQUIRE_EXTRA_CONFIRMATION:
+            return self._occurrence_stop(m, occ, terms, "NEEDS_REVIEW", "POLICY",
+                                         "it needs an extra confirmation from you: "
+                                         + "; ".join(verdicts.reasons()), now=now)
+        assessment = scam.reassess(plan, terms.user_id, db_path=db, now=real_now,
+                                   recent_change_hours=self.recent_change_hours,
+                                   cooling_hours=self.cooling_hours, draft_id=occ["draft_id"])
+        self.audit.append(AuditEntryType.SCAM_ASSESSMENT,
+                          {"stage": "mandate", "payload_hash": p_hash, **assessment.to_audit()})
+        if assessment.outcome != scam.ALLOW or assessment.signals:
+            # Unattended payment needs a clean slate: ANY scam signal (a new
+            # passkey, the freeze just turned off, stopped attempts) means the
+            # user decides this one.
+            why = "; ".join(s.detail for s in assessment.signals) or assessment.outcome
+            return self._occurrence_stop(m, occ, terms, "NEEDS_REVIEW", "SCAM",
+                                         f"something on your account needs a look first ({why}).",
+                                         now=now)
+        if acct["balance"] < terms.amount_cents:
+            return self._occurrence_stop(m, occ, terms, "FAILED", "FUNDS",
+                                         f"there isn't enough money in {terms.source_display}.",
+                                         now=now)
+
+        # Audit-critical: if the log can't take this entry, the exception
+        # propagates and nothing is debited.
+        self.audit.append(AuditEntryType.MANDATE_OCCURRENCE, {
+            "mandate_id": mandate_id, "seq": seq, "draft_id": occ["draft_id"],
+            "payload_hash": p_hash, "stage": "executing", "authority": recurring.MANDATE})
+        try:
+            result = self.executor.execute(plan, payload_hash=p_hash,
+                                           authority=recurring.MANDATE, now=now)
+        except AlreadyExecuted as exc:
+            return {"status": "ALREADY", "mandate_id": mandate_id, "seq": seq,
+                    "execution": exc.prior["result"], "executed_at": exc.prior["executed_at"]}
+        except MandateRefused as exc:
+            return self._occurrence_stop(m, occ, terms, "HELD", "MANDATE", exc.reason + ".",
+                                         now=now)
+        self.audit.append(AuditEntryType.EXECUTION, {
+            "draft_id": occ["draft_id"], "payload_hash": p_hash, "outcome": result["status"],
+            "legs": result["legs"], "authority": recurring.MANDATE,
+            "mandate_id": mandate_id, "mandate_version": terms.version, "seq": seq})
+        return {"status": result["status"], "mandate_id": mandate_id, "seq": seq,
+                "execution": result}
+
+    def _occurrence_stop(self, m: dict, occ: dict, terms, to: str, code: str, reason: str, *,
+                         now: int, suspend: bool = False) -> dict:
+        """An automatic occurrence that won't be paid: record why, tell the
+        user, and (for a change only new terms can fix) suspend the mandate."""
+        db = self.executor.db_path
+        conn = connect(db)
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            moved = recurring.set_occurrence(conn, m["mandate_id"], occ["seq"], frm=("SCHEDULED",),
+                                             to=to, now=now, reason=reason, phase="AUTO")
+            if moved and terms is not None:
+                what = recurring.describe(terms, occ["seq"])
+                until = schedule.label(schedule.local_date(occ["review_until"], terms.timezone))
+                title, body = {
+                    "HELD": (f"{terms.biller_display} payment {occ['seq']} on hold",
+                             f"{what} was NOT paid: {reason} You can review it and approve it "
+                             f"yourself until {until}."),
+                    "NEEDS_REVIEW": (f"{terms.biller_display} payment {occ['seq']} needs you",
+                                     f"{what} was NOT paid automatically: {reason} Open it to "
+                                     f"approve it with your passkey, until {until}."),
+                    "FAILED": (f"{terms.biller_display} payment {occ['seq']} failed",
+                               f"{what} was NOT paid: {reason} It won't be retried — pay it "
+                               f"yourself if you need to."),
+                    "MISSED": (f"{terms.biller_display} payment {occ['seq']} missed",
+                               f"{what} was NOT paid: {reason} It won't be paid late — pay it "
+                               f"yourself if you need to."),
+                }[to]
+                recurring.notify(conn, m["user_id"], to, title, body, now=now,
+                                 mandate_id=m["mandate_id"], seq=occ["seq"])
+            if suspend:
+                recurring.suspend(conn, m, terms, reason[:1].upper() + reason[1:], now=now)
+            conn.commit()
+        finally:
+            conn.close()
+        self.audit.append(AuditEntryType.MANDATE_OCCURRENCE, {
+            "mandate_id": m["mandate_id"], "seq": occ["seq"], "draft_id": occ["draft_id"],
+            "stage": "stopped", "status": to, "code": code, "suspended": suspend})
+        return {"status": to, "code": code, "reason": reason, "mandate_id": m["mandate_id"],
+                "seq": occ["seq"]}
 
     def _payee_owners(self, payee_ids: list[str]) -> set[str]:
         conn = connect(self.executor.db_path)
