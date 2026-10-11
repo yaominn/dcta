@@ -26,10 +26,13 @@ import sqlite3
 import time
 from datetime import datetime, timezone
 
-from backend.data import destinations
+from backend.data import billers, destinations
 from backend.data.db import DB_PATH, connect
 from backend.models.contacts import ResolvedContactAdd, ResolvedContactChange
+from backend.models.mandates import RecurringBillMandate
 from backend.models.schemas import ResolvedPlan
+from backend.recurring import clock as recurring_clock
+from backend.recurring import store as recurring
 
 # Contact fields a signed change may write -> their column. A fixed map, so a
 # column name never comes from a payload.
@@ -48,6 +51,16 @@ class AlreadyExecuted(Exception):
 class DestinationChanged(Exception):
     """A transfer's payee got a new destination after the gateway checked it.
     Nothing ran, and the draft was not spent (its claim rolled back)."""
+
+
+class MandateRefused(Exception):
+    """A recurring occurrence failed its mandate check under the write lock
+    (paused, cancelled, over a cap, the biller changed, outside its window...).
+    Nothing ran, and the claim rolled back."""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__(reason)
 
 
 class MockExecutor:
@@ -100,6 +113,11 @@ class MockExecutor:
             self._claim(conn, draft_id, kind, payload_hash)
             result = {"draft_id": draft_id, "status": outcome}
             self._record(conn, draft_id, result)
+            # A recurring occurrence's approval, declined: final for it too.
+            occ = recurring.occurrence_for_draft(conn, draft_id)
+            if occ is not None:
+                recurring.record_closed(conn, occ, outcome,
+                                        now=recurring_clock.now(db_path=self.db_path))
             conn.commit()
         finally:
             conn.close()
@@ -111,13 +129,21 @@ class MockExecutor:
                      (result["status"], json.dumps(result), draft_id))
 
     # ------------------------------------------------------------ execution
-    def execute(self, plan: ResolvedPlan, *, payload_hash: str) -> dict:
+    def execute(self, plan: ResolvedPlan, *, payload_hash: str,
+                authority: str = recurring.SIGNATURE, now: int | None = None) -> dict:
         """Run the plan at most once per draft_id. Raises AlreadyExecuted, or
         DestinationChanged when a transfer's payee got a new destination since
-        the gateway checked (nothing ran, and the claim was rolled back)."""
+        the gateway checked (nothing ran, and the claim was rolled back), or
+        MandateRefused when a recurring occurrence fails its mandate check.
+
+        `authority`: what authorizes this debit. SIGNATURE (the default) — the
+        user signed this exact plan, via Gateway.submit(). MANDATE — a signed
+        recurring mandate, via Gateway.run_mandate_occurrence(); accepted only
+        for an occurrence of that mandate in its automatic phase, on its day."""
         conn = connect(self.db_path)
         results = []
         aborted = False
+        when = recurring_clock.now(db_path=self.db_path) if now is None else now
         try:
             self._claim(conn, plan.draft_id, "payment", payload_hash)
             # Asked again HERE, under the claim's write lock: a number change
@@ -126,6 +152,17 @@ class MockExecutor:
             if destinations.superseded(conn, plan):
                 conn.rollback()
                 raise DestinationChanged(plan.draft_id)
+            # A recurring occurrence: its mandate is re-read under the same
+            # lock, so a pause, a cancel or a changed biller that commits first
+            # stops it, and one that comes later finds it paid.
+            occ = recurring.occurrence_for_draft(conn, plan.draft_id)
+            refusal = (recurring.execution_refusal(conn, occ, plan, authority=authority, now=when)
+                       if occ is not None else
+                       None if authority == recurring.SIGNATURE else
+                       "only a recurring occurrence can be paid under a mandate")
+            if refusal is not None:
+                conn.rollback()
+                raise MandateRefused(refusal)
             for leg in plan.plan:
                 if aborted:
                     results.append({"id": leg.id, "type": leg.type, "status": "BLOCKED"})
@@ -155,6 +192,44 @@ class MockExecutor:
             # A failed execution is recorded too: one draft, one attempt,
             # whatever the outcome — the card the user signed is spent.
             self._record(conn, plan.draft_id, result)
+            if occ is not None:
+                recurring.record_execution(conn, occ, result, authority=authority, now=when)
+            conn.commit()
+        finally:
+            conn.close()
+        return result
+
+    def create_mandate(self, terms: RecurringBillMandate, *, payload_hash: str,
+                       credential_id: str, now: int) -> dict:
+        """Store a signed recurring mandate and its occurrences, at most once
+        per enrollment draft. The biller and account are re-checked under the
+        claim's write lock (a reference change racing the signature loses)."""
+        conn = connect(self.db_path)
+        try:
+            self._claim(conn, terms.draft_id, "mandate", payload_hash)
+            row = conn.execute("SELECT user_id FROM accounts WHERE id=?",
+                               (terms.source_account,)).fetchone()
+            if row is None or row["user_id"] != terms.user_id:
+                conn.rollback()
+                raise MandateRefused("the account to pay from isn't yours")
+            if not billers.matches(conn, terms.biller_id, terms.biller_ref_version,
+                                   terms.biller_ref_hash):
+                conn.rollback()
+                raise MandateRefused(f"{terms.biller_display}'s payment details changed "
+                                     "while you were reviewing — review them again")
+            recurring.create(conn, terms, payload_hash_hex=payload_hash,
+                             credential_id=credential_id, now=now)
+            recurring.notify(conn, terms.user_id, "CREATED",
+                             f"{terms.biller_display}: recurring payment set up",
+                             f"{recurring.money(terms)} {terms.frequency.lower()}, "
+                             f"{terms.occurrence_count} payments from {terms.source_display}. "
+                             f"The first {terms.supervised_approvals} need your approval"
+                             + (", then they're paid automatically." if terms.auto_after_supervised
+                                else "; so does every one after that."),
+                             now=now, mandate_id=terms.mandate_id)
+            result = {"draft_id": terms.draft_id, "status": "CREATED",
+                      "mandate_id": terms.mandate_id, "version": terms.version}
+            self._record(conn, terms.draft_id, result)
             conn.commit()
         finally:
             conn.close()

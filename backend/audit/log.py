@@ -46,6 +46,9 @@ class AuditEntryType(str, Enum):
     HOLD_CANCELLED = "HOLD_CANCELLED"     # a held payment cancelled — nothing sent
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"     # all outgoing payments frozen
     KILL_SWITCH_RELEASED = "KILL_SWITCH_RELEASED"   # unfrozen, with a phone code
+    MANDATE_CREATED = "MANDATE_CREATED"         # a signed recurring bill mandate stored
+    MANDATE_OCCURRENCE = "MANDATE_OCCURRENCE"   # an occurrence fell due / ran / was stopped
+    MANDATE_STATUS = "MANDATE_STATUS"           # paused, resumed, cancelled, suspended
 
 
 GENESIS_HASH = "0" * 64   # prev_hash of the very first entry

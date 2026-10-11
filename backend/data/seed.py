@@ -95,6 +95,7 @@ def seed(db_path: Path = DB_PATH, *, reset_audit: bool = False) -> None:
     try:
         # drop + recreate so seeding is fully idempotent
         tables = ["webauthn_credentials", "executions", "holds", "delayed_payments", "scam_attempts", "kill_switch",
+                  "notifications", "mandate_occurrences", "mandates", "recurring_clock",
                   "transaction_history", "limits",
                   "equities", "billers", "payees", "accounts", "users"]
         if reset_audit:
@@ -107,7 +108,7 @@ def seed(db_path: Path = DB_PATH, *, reset_audit: bool = False) -> None:
         conn.executemany("INSERT INTO accounts VALUES (?,?,?,?,?)", ACCOUNTS)
         conn.executemany("INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone) "
                          "VALUES (?,?,?,?,?,?)", PAYEES)
-        conn.executemany("INSERT INTO billers VALUES (?,?,?)", BILLERS)
+        conn.executemany("INSERT INTO billers (id, name, reference_text) VALUES (?,?,?)", BILLERS)
         conn.executemany("INSERT INTO equities VALUES (?,?)", EQUITIES)
         conn.executemany("INSERT INTO limits VALUES (?,?)",
                          [(k, v) for k, v in LIMITS.items()])
