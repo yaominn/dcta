@@ -308,7 +308,7 @@ def scan_transcript(transcript: str) -> list:
 CATEGORIES = (
     # name, what it means, {phrase code: points}
     ("official", "An official or the bank directing the payment",
-     {"words_official_orders": 4.0, "words_investigation": 4.0}),
+     {"words_official_orders": 4.0, "words_investigation": 4.0, "words_bank_orders": 4.0}),
     ("safe_account", "A \u201csafe account\u201d", {"words_safe_account": 4.0}),
     ("credentials", "OTPs, passwords, app installs or screen-sharing", {"words_credentials": 4.0}),
     ("secrecy", "Keeping it secret", {"words_hide_from_bank": 4.0, "words_secrecy": 3.0}),

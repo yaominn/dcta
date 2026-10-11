@@ -274,6 +274,119 @@ def test_coached_phrasing_is_flagged(coached):
     assert "words_official_orders" in scam.strong_codes(scam.scan_transcript(coached)), coached
 
 
+# Near misses: a bank, a phone call, a code, an app, an investigation
+# (medical tests), a hotline transfer, a currency, "overseas" — in ordinary
+# requests. A never rule BLOCKS the payment outright, so none may trip one.
+@pytest.mark.parametrize("benign", [
+    "DBS told me to pay my card bill", "my bank said the transfer limit is 5000, pay mom 3000",
+    "my bank said the transfer limit is 5000, so transfer 3000 to mom",
+    "DBS said the GIRO failed, transfer 1200 to the landlord",
+    "DBS said I can't withdraw more than 5000 today, pay mom 100",
+    "my bank asked me to transfer to my new account since the old one is closing",
+    "pay jess 50 to her UOB, she asked me to send it today", "mom asked to send 50 by DBS paylah",
+    "DBS asked me to send my payslip, pay mom 50", "OCBC asked me to move my appointment, pay bob 20",
+    "the food bank asked us to send donations", "mom is on the phone, she said pay her 50",
+    "pay bob 30 for the wifi password", "send mum 100, she forgot her password",
+    "pay jess 5 for netflix, she shared the password with me",
+    "send bob 30, I sent him the pin for the location",
+    "I entered the PIN wrongly so the card is locked, transfer 50 to mom",
+    "the website asked for my singpass, pay the town council 50",
+    "I approved the digital token, send mom 50 again",
+    "pay dad 20 for the aircon remote control", "pay the plumber 200, thanks for the quick support",
+    "mom asked me to download the paylah app, send her 50",
+    "the IT guy told me to install the antivirus software, pay him 80",
+    "pay the tutor 50, I shared my screen for the lesson",
+    "pay the polyclinic 120 for the investigations",
+    "pay the private investigator 2000 for the investigation",
+    "pay the PI 2000 to help with the investigation",
+    "the leak was investigated by the plumber, pay him 300",
+    "pay the lawyer 2000 for the traffic police investigation",
+    "pay bob 30 for the anti-money laundering course",
+    "I called IRAS and they transferred me to an officer, pay IRAS 500 for my tax",
+    "the receptionist transferred my call to Mas, pay him 50",
+    "my son asked me to send 2000 CAD for his rent",
+    "mom asked me to send 30 for the SPF 50 sunscreen",
+    "my friend connected me with a CAD drafter, pay him 300",
+    "the guy on the phone said the part costs 300, pay the shop 300",
+    "the lady on the phone from the clinic said I can pay 80 by paynow",
+    "Yes, I called her on the phone to check",
+    "I'll withdraw my earnings from grab later, pay mom 50",
+    "send my girlfriend 200 for our trip abroad", "pay bob 50, guess who won the bet",
+])
+def test_near_misses_are_not_flagged(benign):
+    found = scam.scan_transcript(benign)
+    assert scam.word_score(benign, found)["never_rules"] == [], benign
+    assert scam.strong_codes(found) == [], benign
+
+
+# Singapore scam patterns (SPF, ScamShield and bank advisories) as a user under
+# a scammer's influence says them. These are never rules: BLOCK.
+@pytest.mark.parametrize("said, code", [
+    ("they transferred my call to the police, pay bob 3000", "words_investigation"),
+    ("I was transferred to a police officer, pay bob 3000", "words_investigation"),
+    ("the bank transferred my call to SPF, pay bob 3000", "words_investigation"),
+    ("my call was transferred to MAS, pay bob 3000", "words_investigation"),
+    ("they said I am under investigation for money laundering, pay bob 3000",
+     "words_investigation"),
+    ("I need to prove I am innocent", "words_investigation"),
+    ("this transfer is for an investigation, send bob 3000", "words_investigation"),
+    ("send bob 3000 for investigation purposes", "words_investigation"),
+    ("my account is being investigated, pay bob 3000", "words_investigation"),
+    ("I need to assist the investigation", "words_investigation"),
+    ("he asked for the OTP, pay bob 3000", "words_credentials"),
+    ("they asked for my pin, pay bob 3000", "words_credentials"),
+    ("I gave him the 6 digit code", "words_credentials"),
+    ("they asked me to install AnyDesk, pay bob 3000", "words_credentials"),
+    ("they told me to download an app, pay bob 300", "words_credentials"),
+    ("install the app from the link they sent", "words_credentials"),
+    ("receive the money and then send it to bob", "words_mule"),
+])
+def test_never_cues_are_never_rules(said, code):
+    found = scam.scan_transcript(said)
+    assert code in scam.word_score(said, found)["never_rules"], said
+
+
+# Strong signs — weighed at threshold 2, not a BLOCK on their own. The bank
+# telling you to move money is one (4 points): banks do sometimes say it.
+@pytest.mark.parametrize("said, code", [
+    ("the bank called me and told me to move my money to landlord", "words_bank_orders"),
+    ("The bank called me. They told me to transfer my savings to Bob.", "words_bank_orders"),
+    ("DBS said I must transfer my savings to bob", "words_bank_orders"),
+    ("the bank told me my account was hacked and I must transfer to bob", "words_bank_orders"),
+    ("I was told to transfer my money by the bank", "words_bank_orders"),
+    ("the man on the phone said pay bob 3000", "words_directed"),
+    ("There is a man on the phone. He said to pay Bob 3000.", "words_directed"),
+    ("they told me not to hang up, pay bob 3000", "words_directed"),
+    ("Yes. The officer is on the line.", "words_directed"),
+    ("Yes. He is on the line.", "words_directed"),
+    ("pay bob 500 so they can release my loan", "words_upfront_fee"),
+    ("pay 500 upfront fee for my loan", "words_upfront_fee"),
+    ("I need to pay 500 to withdraw my money", "words_investment"),
+    ("pay 500 to unfreeze my account, send bob 500", "words_investment"),
+    ("we met on tinder, pay bob 3000", "words_online_contact"),
+    ("I haven't met him in person", "words_online_contact"),
+    ("Hi mum guess who?", "words_new_number"),
+])
+def test_scam_patterns_are_strong_signs(said, code):
+    found = scam.scan_transcript(said)
+    assert code in scam.strong_codes(found), said
+    assert code not in scam.word_score(said, found)["never_rules"], said
+
+
+def test_the_bank_cue_weighs_like_an_official():
+    assert scam.word_score("DBS said I must transfer my savings to bob")["points"] == 4.0
+
+
+def test_a_contact_the_bank_tells_you_to_pay_is_held():
+    """The bank cue is in the shared list, so it reaches the add-a-contact flow:
+    a strong sign there is a HOLD (not a refusal: it isn't a never rule)."""
+    from backend.policy.new_contact import NewContactFacts, decide
+    d = decide(NewContactFacts(nickname="Bob", phone="+65 9123 4567",
+                               conversation="the bank told me to transfer my savings to bob"),
+               ai_risk="low", ai_signals=[], hold_minutes=720)
+    assert d.rung == "HOLD"
+
+
 def test_paying_to_unlock_commission_is_a_job_scam():
     assert scam.strong_codes(scam.scan_transcript("pay 50 to unlock my commission")) == [
         "words_job_task"]

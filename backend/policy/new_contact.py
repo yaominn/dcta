@@ -119,6 +119,24 @@ class ContactDecision:
 # --------------------------------------------------------------------------- what the user said
 # Conservative on purpose: supporting evidence, not a classifier. Each pattern
 # is a phrase a scam script uses and an ordinary "add Bob, 9123 4567" does not.
+# The bank as the one speaking ("the bank called me. They told me…") — not a
+# bank merely named ("pay jess 50 to her UOB").
+_BANK_WHO = (r"(?:(?:the|my|our)\s+bank|DBS|POSB|OCBC|UOB|Citi(?:bank)?|HSBC|Maybank"
+             r"|Standard\s+Chartered|Trust\s+Bank|GXS)"
+             r"(?:\s+(?:staff|officer|officers|people|person|guy|lady|man|woman|hotline"
+             r"|customer\s+service|fraud\s+team))?")
+_CONTACTED = (r"(?:\s+(?:called|phoned|rang|messaged|texted|whatsapped|emailed|contacted)"
+              r"(?:\s+(?:me|us))?(?:\s*(?:,|\.|and|then)\s*(?:then\s+)?(?:they|he|she|it)?)?)?")
+# Moving money away — not "pay my card bill", "send my payslip", "move my
+# appointment", "transfer it to my new account".
+_MONEY_ACT = (r"(?:(?:transfer|send|move)\s+(?:(?:all\s+(?:of\s+)?)?(?:my|our|the|his|her)\s+)?"
+              r"(?:money|funds|savings|cash|everything|balance|\$?\d[\d,.]*k?)\b"
+              r"|(?:transfer|send|move)\s+(?:it\s+)?to\b(?!\s+(?:my|our)\s+(?:new|own|other"
+              r"|savings|current)\b)|withdraw\s+(?:all|everything|my\s+(?:money|savings|funds)|\$?\d))")
+# A stranger on a live call — not "mom is on the phone".
+_ON_CALL = (r"(?:(?:the|a|this|some)\s+(?:man|woman|person|guy|lady|gentleman|people)"
+            r"|someone|somebody)\s+on\s+the\s+(?:phone|line|call)")
+_PAY_ACT = r"(?:pay|transfer|send|move|withdraw)"
 _WORDS: list[tuple[str, str, re.Pattern, str]] = [
     # --- things no real bank or official ever asks for (docs/SCAM_WORD_WEIGHTS.md):
     #     refuse-grade here, and a payment that mentions one gets the strictest
@@ -138,17 +156,42 @@ _WORDS: list[tuple[str, str, re.Pattern, str]] = [
      "An official seems to be telling you to pay someone. Real officers never ask "
      "you to transfer money — this is how government-impersonation scams work."),
     ("words_investigation", "refuse", re.compile(
-        r"\b(?:for|assist(?:ing)?\s+(?:with|in))\s+(?:an?\s+|the\s+|their\s+|police\s+)?investigations?\b"
-        r"|\bunder\s+investigation\b|\bmoney\s+laundering\b"
-        r"|\bprove\s+(?:my|our|his|her|their)\s+innocence\b|\bfinancial\s+inspection\b"
+        r"\bfor\s+an\s+investigation\b|\bfor\s+(?:their|police|the\s+police)\s+investigations?\b"
+        r"|\bfor\s+investigation\s+purposes?\b"
+        r"|\bassist(?:ing)?\s+(?:with\s+|in\s+)?(?:an?\s+|the\s+|their\s+|police\s+)?investigations?\b"
+        r"|\bunder\s+investigation\b|(?<!anti-)(?<!anti )\bmoney[- ]?laundering\b"
+        r"|\b(?:my|our)\s+(?:bank\s+)?accounts?\s+(?:is|are|was|were|has\s+been|have\s+been)\s+"
+        r"(?:being\s+)?investigated\b|\b(?:i|we)\s+(?:am|are|was|were|'m|'re)\s+being\s+investigated\b"
+        r"|\bprove\s+(?:my|our|his|her|their)\s+innocence\b"
+        r"|\bprove\s+(?:that\s+)?(?:i|we)(?:'m|\s+am|\s+are|'re)\s+innocent\b|\bfinancial\s+inspection\b"
         r"|\b(?:call|line)\s+(?:was\s+)?transferred\s+to\s+(?:the\s+|an?\s+)?"
-        r"(?:police|mas|officer|investigator)\b", re.I),
+        r"(?:police|mas|officer|investigator)\b"
+        r"|\b(?:transferred|put|passed)\s+(?:me|my\s+call|the\s+call)\s+(?:through\s+)?to\s+"
+        r"(?:the\s+|an?\s+)?(?:police|(?-i:SPF|MAS))\b"
+        r"|\b(?:was|got|been)\s+(?:transferred|put\s+through|passed\s+on)\s+to\s+"
+        r"(?:the\s+|an?\s+)?(?:police|(?-i:SPF|MAS))\b", re.I),
      "Banks, the police and government agencies never ask you to move money as part "
      "of an investigation, and a bank never transfers your call to the police."),
+    ("words_bank_orders", "strong", re.compile(
+        rf"\b{_BANK_WHO}{_CONTACTED}\s+(?:told|asked|instructed|ordered|wants?|wanted|needs?"
+        rf"|needed)\s+(?:me|us)\s+to\s+{_MONEY_ACT}"
+        rf"|\b{_BANK_WHO}{_CONTACTED}\s+(?:said|says)\s+(?:that\s+)?(?:(?:i|we)\s+(?:must|need\s+to"
+        rf"|have\s+to|should)\s+|to\s+){_MONEY_ACT}"
+        rf"|\b{_BANK_WHO}{_CONTACTED}\s+(?:said|says|told\s+(?:me|us))\s+(?:that\s+)?(?:my|our)\s+"
+        rf"(?:account|card|savings)\s+(?:is|was|has\s+been|had\s+been|got)\s+(?:hacked|compromised"
+        rf"|at\s+risk|frozen|blocked)\b[^?!]{{0,40}}?\b{_MONEY_ACT}"
+        rf"|\btold\s+to\s+{_MONEY_ACT}[^.?!]{{0,40}}\bby\s+(?:the|my)\s+bank\b", re.I),
+     "Your bank seems to be telling you to move money. Banks never ask you to transfer "
+     "money to another account — call the number on the back of your card to check."),
     ("words_credentials", "refuse", re.compile(
         r"\botp\b|\bone[- ]time\s+(?:password|pin|code)\b|\bmy\s+(?:pin|password|login)\b"
         r"|\btoken\s+approval\b|\bapprove\s+(?:the\s+|my\s+)?(?:digital\s+)?token\b"
-        r"|\banydesk\b|\bteamviewer\b|\bscreen[- ]?shar(?:e|ing)\b|\bremote\s+(?:access|control)\b"
+        r"|\banydesk\b|\bteamviewer\b|\bscreen[- ]?shar(?:e|ing)\b|\bremote\s+access\b"
+        r"|\bremote[- ]control\s+(?:app|software|my\s+(?:phone|computer|laptop))\b"
+        r"|\b(?:install|download)(?:ed|ing)?\s+(?:an|this|their)\s+app\b"
+        r"|\b(?:install|download)(?:ed|ing)?\s+(?:the\s+)?app\s+from\s+(?:the\s+|a\s+|this\s+|their\s+)?link\b"
+        r"|\b(?:gave|give|send|sent|read|tell|told)\s+(?:him|her|them|the\s+\w+)\s+(?:the|my)\s+"
+        r"(?:6|six)[- ]digit\s+code\b"
         r"|\binstall\s+(?:an?|the|this|their)\s+app\b|\bapk\b|\bplay\s+protect\b", re.I),
      "No real bank or official asks for your OTP, PIN or token approval, asks you to "
      "install an app, or asks to share your screen."),
@@ -160,7 +203,7 @@ _WORDS: list[tuple[str, str, re.Pattern, str]] = [
      "payment — the bank is on your side."),
     # --- strong signs
     ("words_mule", "strong", re.compile(
-        r"\breceive\s+(?:the\s+|some\s+)?(?:money|funds|payments?)\s+(?:and|then)\s+"
+        r"\breceive\s+(?:the\s+|some\s+)?(?:money|funds|payments?)\s+(?:and\s+then|and|then)\s+"
         r"(?:send|transfer|forward|pass|move)\b|\bforward\s+(?:the|this|that)\s+(?:money|funds|payment)\b"
         r"|\buse\s+my\s+(?:bank\s+)?account\s+(?:for|to\s+receive)\b"
         r"|\b(?:rent|sell|lend)\s+(?:out\s+)?my\s+(?:bank\s+)?account\b"
@@ -176,20 +219,33 @@ _WORDS: list[tuple[str, str, re.Pattern, str]] = [
     ("words_directed", "strong", re.compile(
         r"\bdon'?t\s+hang\s+up\b|\bstill\s+on\s+the\s+(?:line|phone|call)\b"
         r"|\b(?:he|she|they)\s*(?:'s|'re|is|are)\s+(?:still\s+)?(?:on\s+the\s+(?:line|phone|call)"
-        r"|waiting\s+for\s+me)\b|\btold\s+me\s+what\s+to\s+say\b", re.I),
+        r"|waiting\s+for\s+me)\b|\btold\s+me\s+what\s+to\s+say\b"
+        rf"|\b{_ON_CALL}\b[^?!]{{0,60}}?\b(?:(?:told|asked|instructed|wants?|wanted|needs?|needed)"
+        rf"\s+(?:me|us)\s+to\s+{_PAY_ACT}|(?:said|says)\s+(?:that\s+)?(?:(?:i|we)\s+(?:must|need\s+to"
+        rf"|have\s+to|should)\s+|to\s+)?{_PAY_ACT})\b"
+        r"|\b(?:told|asked|instructed|warned)\s+(?:me|us)\s+(?:not\s+to|never\s+to|to\s+never)\s+"
+        r"hang\s+up\b"
+        r"|\bthe\s+(?:officer|caller|man|woman|lady|guy|person|agent)\s+(?:is|'s)\s+(?:still\s+)?"
+        r"on\s+the\s+(?:line|phone|call)\b", re.I),
      "Someone seems to be directing you right now. Hang up, then call your bank or "
      "1799 on a number you look up yourself."),
     ("words_new_number", "strong", re.compile(
         r"\bnew\s+(?:phone\s+)?number\b|\bchanged\s+(?:my|his|her|their)\s+number\b"
         r"|\blost\s+(?:my|his|her|their)\s+phone\b|\bphone\s+(?:is\s+)?broken\b"
-        r"|\bguess\s+who\b", re.I),
+        r"|\bguess\s+who\b(?!\s+(?:won|got|came|lost|scored|called|did|has|had|was|just))", re.I),
      "A “new number” is the classic opening of family-impersonation scams. "
      "Call them on the number you already have to check it's really them."),
     ("words_online_contact", "strong", re.compile(
         r"\bonline\s+(?:friend|boyfriend|girlfriend|partner)\b|\bmet\s+(?:him|her|them)\s+online\b"
         r"|\bnever\s+met\s+(?:him|her|them)\b"
         r"|\b(?:boyfriend|girlfriend|fianc[eé]e?|partner)\s+(?:overseas|abroad)\b"
-        r"|\bproof\s+of\s+(?:my|our)\s+love\b|\bdating\s+app\b", re.I),
+        r"|\bproof\s+of\s+(?:my|our)\s+love\b|\bdating\s+app\b"
+        r"|\b(?:we|i)\s+met\s+(?:online|(?:on|through|via)\s+(?:an?\s+)?(?:app|tinder|bumble|hinge"
+        r"|facebook|instagram|wechat|telegram|whatsapp))\b"
+        r"|\bmet\s+(?:him|her|them)\s+(?:on|through|via)\s+(?:an?\s+)?(?:app|tinder|bumble|hinge"
+        r"|facebook|instagram|wechat|telegram|whatsapp)\b"
+        r"|\b(?:never|not|haven'?t|have\s+not|hasn'?t|has\s+not)\s+(?:yet\s+)?met\s+"
+        r"(?:(?:him|her|them)\s+)?in\s+person\b", re.I),
      "You may only know this person online. Scammers build a relationship, then ask "
      "for money — check who they are before you pay."),
     ("words_investment", "strong", re.compile(
@@ -197,7 +253,12 @@ _WORDS: list[tuple[str, str, re.Pattern, str]] = [
         r"|\btrading\s+platform\b|\bdouble\s+(?:my|your)\s+money\b"
         r"|\b(?:withdrawal\s+fee|fee\s+to\s+withdraw|tax(?:es)?\s+to\s+withdraw)\b"
         r"|\brelease\s+(?:my\s+|the\s+)?profits?\b|\btrading\s+signals?\b"
-        r"|\binvestment\s+(?:group|lessons?|class|community)\b", re.I),
+        r"|\binvestment\s+(?:group|lessons?|class|community)\b"
+        r"|\b(?:pay|paid|send|sent|fees?|tax(?:es)?|deposit)\b[^.?!]{0,30}\b(?:to|before|so\s+(?:i|we)"
+        r"\s+can)\s+(?:withdraw|release|unlock|cash\s+out|access)\s+(?:my|the|our)\s+"
+        r"(?:money|funds|profits?|earnings|returns|winnings|gains|account|balance)\b"
+        r"|\b(?:pay|paid|send|sent)\b[^.?!]{0,30}\bto\s+unfreeze\s+(?:my|the|our)\s+"
+        r"(?:account|funds|money)\b", re.I),
      "It involves an investment promise. Guaranteed or unusually high returns, or a fee "
      "to withdraw your profits, are hallmarks of investment scams."),
     ("words_job_task", "strong", re.compile(
@@ -212,7 +273,10 @@ _WORDS: list[tuple[str, str, re.Pattern, str]] = [
         r"|\bloan\s+(?:approval|activation|processing)\b"
         r"|\bclaim\s+(?:my|the)\s+(?:prize|reward|winnings)\b"
         r"|\bwon\s+(?:a|the)\s+(?:prize|lottery|lucky\s+draw)\b"
-        r"|\brecover\s+my\s+(?:money|funds|losses)\b|\bfund\s+recovery\b", re.I),
+        r"|\brecover\s+my\s+(?:money|funds|losses)\b|\bfund\s+recovery\b"
+        r"|\b(?:pay|paid|send|sent|fees?|deposit)\b[^.?!]{0,30}\b(?:to|before|so\s+(?:they|he|she"
+        r"|i|we)\s+can)\s+(?:release|disburse|approve|get|activate|unlock|receive)\s+"
+        r"(?:my|the|our|a|this)\s+loans?\b|\b(?:upfront|disbursement)\s+fees?\b", re.I),
      "You're being asked to pay a fee before you receive something (a loan, a prize, a "
      "parcel or lost money). Real ones don't work that way."),
     # --- mild signs

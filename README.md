@@ -217,8 +217,12 @@ number"), never the old, trusted one.
 never the model. Full details: [`docs/SCAM_DECISION_FLOW.md`](docs/SCAM_DECISION_FLOW.md).
 
 - **Never rules** in the user's words (a "safe account", an OTP, "for an
-  investigation", "don't tell the bank", passing money on) → **BLOCK**: nothing
-  to sign, call the bank.
+  investigation", a call "transferred to the police", installing an app from a
+  link, "don't tell the bank", passing money on) → **BLOCK**: nothing to sign,
+  call the bank. Because a never rule blocks outright, its patterns skip
+  ordinary near misses: "pay the polyclinic for the investigations" (medical
+  tests), "the aircon remote control", "anti-money laundering course", "Mas"
+  (a name) — `tests/test_scam_protection.py` pins 41 of them.
 - **Threshold 1, the facts** (no words): amount (at most 5), first payment 2,
   number changed < 24 h 5 (contact added 3), 3+ new payees in 30 min 4, new
   passkey 4, freeze turned off 4, midnight–5am 1, and **earlier attempts**
@@ -233,6 +237,9 @@ never the model. Full details: [`docs/SCAM_DECISION_FLOW.md`](docs/SCAM_DECISION
   under 7) → sign; 2+ or facts 7+ → **DELAY**, a 60-second wait after signing
   that can be cancelled — words 4+ or facts 7+ make it **HOLD_STEP_UP** (+ a
   30-second hold, a phone code and typing the payee's name); 6+ → **BLOCK**.
+  The bank telling you to move money ("The bank called me. They told me to
+  transfer my savings…") scores 4 like an official, but isn't a never rule:
+  banks do sometimes ask you to move money to an account of your own.
 
 **Typing the name is checked by the server**, not only by the page. The page
 sends the typed name with the signed payment, and the gateway refuses it
