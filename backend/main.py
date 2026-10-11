@@ -17,6 +17,8 @@ import threading
 from contextlib import asynccontextmanager
 import time
 
+from typing import Literal
+
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -61,7 +63,17 @@ from backend.drafts import Draft, DraftStore
 from backend.narrate import narrate
 from backend.policy import attempts, safety, scam
 from backend.trace import RecordingProvider, TraceStore
-from backend.display import add_summary, change_summary, cents_to_display, plan_summary
+from backend.display import (account_label, add_summary, change_summary, cents_to_display,
+                             plan_summary)
+from backend.data import billers as _billers
+from backend.models.mandates import DEFAULT_TIMEZONE, RecurringBillMandate
+from backend.recurring import approve as recurring_approve
+from backend.recurring import clock as recurring_clock
+from backend.recurring import parse as recurring_parse
+from backend.recurring import schedule as recurring_schedule
+from backend.recurring import store as recurring_store
+from backend.recurring import terms as recurring_terms
+from backend.recurring.scheduler import run_due
 
 from pathlib import Path
 
@@ -206,7 +218,7 @@ def headline_arithmetic():
 
 _signer = MockSigner()
 _credentials = MockCredentialStore()
-_credentials.register("cred_alice", _signer.public_key)   # MOCK demo credential
+_credentials.register("cred_alice", _signer.public_key, user_id="u_alice")   # MOCK demo credential
 
 
 # The three routes below that use _signer/_gateway are the MOCK path: a
@@ -363,6 +375,13 @@ def issue_nonce(draft_id: str = Query(...)):
         _traces.event(draft_id, "nonce", issued=False, reason="payments frozen")
         raise HTTPException(status_code=409, detail={
             "error": "payments are frozen", "draft_id": draft_id, "frozen": True})
+    # A recurring occurrence's approval: only while its mandate still allows it
+    # (not paused, cancelled or changed). The executor re-checks under its lock.
+    occ_refusal = _occurrence_refusal(draft)
+    if occ_refusal is not None:
+        _traces.event(draft_id, "nonce", issued=False, reason=occ_refusal)
+        raise HTTPException(status_code=409, detail={
+            "error": occ_refusal, "draft_id": draft_id, "rejection": "MANDATE"})
     hold = safety.get_hold(draft_id)
     if hold and hold["status"] == "CANCELLED":
         _traces.event(draft_id, "nonce", issued=False, reason="hold cancelled")
@@ -799,6 +818,10 @@ class DraftRequest(BaseModel):
     # missing its number). The server reads the name and any waiting payment
     # from ITS copy of that draft, never from the client.
     new_contact_for: str | None = None
+    # The user's answer to "one payment, or a recurring one?" (asked for a bare
+    # "pay my bill"). Only ever narrows: "once" can't create a mandate, and
+    # "recurring" only opens the setup form, which needs its own signature.
+    recurrence: Literal["once", "recurring"] | None = None
 
 
 class ClarifyAnswer(BaseModel):
@@ -1028,6 +1051,21 @@ def create_draft(req: DraftRequest):
     # An answer to "what's Bob's number?" continues the new contact it belongs to.
     origin = _new_contact_origin(req) if req.new_contact_for else None
     route = "contact_add" if origin else classify_request(req.transcript)
+    if route == "bill_ambiguous" and req.recurrence:
+        route = "recurring_bill" if req.recurrence == "recurring" else "payment"
+    elif req.recurrence == "recurring" and route == "payment":
+        route = "recurring_bill"
+    if route == "bill_ambiguous":
+        # Never assumed either way: a one-time instruction is never ongoing
+        # consent, and an ongoing one is never paid as a one-off.
+        return {"status": "clarify", "kind": "recurrence", "draft_id": None,
+                "field": "recurrence", "transcript": req.transcript,
+                "question": "Is this a one-time payment, or do you want to set up a recurring "
+                            "payment for this bill?",
+                "choices": [{"id": "once", "display": "Just this once"},
+                            {"id": "recurring", "display": "Set up a recurring payment"}]}
+    if route == "recurring_bill":
+        return _recurring_setup_start(req)
     if route == "contact_list":
         view = _contacts_view(req.user_id)
         tid = "list-" + DraftStore.new_id()
@@ -1479,12 +1517,20 @@ def release_status(draft_id: str):
 
 
 def _release_loop(stop: threading.Event) -> None:
-    """Send scheduled (large) payments when their wait is over."""
+    """Send scheduled (large) payments when their wait is over, and run any
+    recurring bill that has fallen due (every RECURRING_TICK_S)."""
+    last_recurring = 0.0
     while not stop.wait(2):
         try:
             _gateway.release_due()
         except Exception:
             logging.exception("release loop failed; retrying")
+        if time.time() - last_recurring >= RECURRING_TICK_S:
+            last_recurring = time.time()
+            try:
+                _recurring_tick()
+            except Exception:
+                logging.exception("recurring run failed; nothing was paid by the failed run")
 
 
 class PurposeAnswer(BaseModel):
@@ -1769,6 +1815,8 @@ def get_draft(draft_id: str):
         "transcript": draft.transcript,
         "contact_change": (draft.resolved_change.model_dump(mode="json")
                            if draft.resolved_change else None),
+        "mandate": (draft.resolved_mandate.model_dump(mode="json")
+                    if draft.resolved_mandate else None),
         "resolved_plan": (draft.resolved_plan.model_dump(mode="json")
                           if draft.resolved_plan else None),
         "policy": draft.policy, "validation": draft.validation,
@@ -1855,6 +1903,488 @@ def contacts_add_webauthn(req: ContactAddWebAuthnRequest):
     return _traced_gateway(req.contact_add.draft_id, "WebAuthn",
                            _webauthn_gateway.submit_contact_add(req.contact_add, req.assertion,
                                                                 req.nonce, req.credential_id))
+
+
+# --------------------------------------------------------------------------- recurring bill payments
+# docs/RECURRING_BILLS.md. Setup is read by rules (backend/recurring/parse.py,
+# never the model) and confirmed field by field on a form; the terms are a
+# RecurringBillMandate the user signs with their passkey. The first payments
+# are ordinary one-payment drafts the user signs one by one; later ones — only
+# if the signed terms say so — are paid by Gateway.run_mandate_occurrence().
+RECURRING_TICK_S = 10
+_mirrored_notification = 0      # the last notification already sent to the demo phone
+
+
+def _recurring_tick() -> list[dict]:
+    """Run what has fallen due (the recurring clock: real time unless the demo
+    clock is on), then copy new notifications to the demo phone."""
+    events = run_due(recurring_clock.now(), gateway=_webauthn_gateway)
+    _mirror_notifications()
+    return events
+
+
+def _mirror_notifications() -> None:
+    """# MOCK: the durable notifications, also delivered to the simulated phone
+    (its drop-down banner). Text only — no link in a notification approves
+    anything; the pending payment is approved in the app, with the passkey."""
+    global _mirrored_notification
+    conn = get_conn()
+    try:
+        rows = conn.execute("SELECT id, user_id, title, body FROM notifications WHERE id>? "
+                            "ORDER BY id", (_mirrored_notification,)).fetchall()
+    finally:
+        conn.close()
+    for r in rows:
+        _phone.deliver(r["user_id"], f"DCTA: {r['title']}. {r['body']}")
+        _mirrored_notification = r["id"]
+
+
+def _start_mirror_after_existing() -> None:
+    """Startup: don't replay old notifications to the phone."""
+    global _mirrored_notification
+    conn = get_conn()
+    try:
+        row = conn.execute("SELECT COALESCE(MAX(id), 0) AS n FROM notifications").fetchone()
+        _mirrored_notification = int(row["n"])
+    finally:
+        conn.close()
+
+
+_start_mirror_after_existing()
+
+
+def _occurrence_refusal(draft: Draft) -> str | None:
+    """For a recurring occurrence's approval draft: why it can't be signed now
+    (the executor's own check, read-only), else None."""
+    if draft.kind != "payment" or draft.resolved_plan is None:
+        return None
+    conn = get_conn()
+    try:
+        occ = recurring_store.occurrence_for_draft(conn, draft.draft_id)
+        if occ is None:
+            return None
+        return recurring_store.execution_refusal(conn, occ, draft.resolved_plan,
+                                                 authority=recurring_store.SIGNATURE,
+                                                 now=recurring_clock.now())
+    finally:
+        conn.close()
+
+
+def _setup_options(conn, user_id: str) -> dict:
+    """The choices the setup form offers — ids the server issued, labels from
+    the DB (billers' references masked to digits; never the raw text)."""
+    return {
+        "billers": [{"id": b.biller_id, "name": b.name, "reference": b.masked}
+                    for b in _billers.all_billers(conn)],
+        "accounts": [{"id": r["id"], "label": account_label(r["id"])} for r in conn.execute(
+            "SELECT id FROM accounts WHERE user_id=? AND type IN ('savings','joint') ORDER BY id",
+            (user_id,))],
+        "frequencies": [{"id": recurring_schedule.MONTHLY, "label": "Monthly"},
+                        {"id": recurring_schedule.WEEKLY, "label": "Weekly"}],
+        "max_occurrences": recurring_terms.MAX_OCCURRENCES,
+        "approvals": recurring_terms.SUPERVISED_APPROVALS,
+    }
+
+
+def _setup_body(draft: Draft, *, errors: dict | None = None) -> dict:
+    setup = draft.setup or {}
+    fields = setup.get("fields", {})
+    missing = setup.get("missing", [])
+    now = recurring_clock.now()
+    conn = get_conn()
+    try:
+        options = _setup_options(conn, draft.user_id)
+    finally:
+        conn.close()
+    return {"status": "recurring_setup", "kind": "recurring_setup", "draft_id": draft.draft_id,
+            "transcript": draft.transcript, "fields": fields, "missing": missing,
+            "questions": [recurring_parse.QUESTIONS[m] for m in missing],
+            "notes": setup.get("notes", []), "errors": errors or {}, "options": options,
+            "timezone": DEFAULT_TIMEZONE, "due_time": recurring_schedule.DUE_LOCAL_TIME,
+            "today": recurring_schedule.local_date(now, DEFAULT_TIMEZONE).isoformat()}
+
+
+def _recurring_setup_start(req: DraftRequest) -> dict:
+    """A recurring request: read what the rules can, and ask for the rest on a
+    form. No model, no terms yet, nothing to sign."""
+    now = recurring_clock.now()
+    conn = get_conn()
+    try:
+        billers = _billers.all_billers(conn)
+        nicknames = [r["nickname"] for r in conn.execute(
+            "SELECT nickname FROM payees WHERE user_id=?", (req.user_id,))]
+    finally:
+        conn.close()
+    fields = recurring_parse.extract(req.transcript, billers=billers,
+                                     today=recurring_schedule.local_date(now, DEFAULT_TIMEZONE))
+    tid = DraftStore.new_id()
+    _traces.start(tid, transcript=req.transcript, route="recurring_bill", user_id=req.user_id)
+    _traces.event(tid, "recurring_parse", note="rules only; the model is not called",
+                  fields=fields.to_dict(), missing=fields.missing())
+    import re as _re
+    if fields.biller_id is None and any(
+            _re.search(r"\b" + _re.escape(n) + r"\b", req.transcript, _re.I) for n in nicknames):
+        # Recurring transfers to people aren't offered: a bill's destination
+        # is a registered biller; a person's number can change under you.
+        return {"status": "info", "kind": "recurring_unsupported",
+                "message": "I can set up recurring payments for bills only. A payment to a "
+                           "person has to be made, and approved, each time."}
+    draft = _drafts.put(Draft(
+        draft_id=tid, user_id=req.user_id, transcript=req.transcript, intent_plan={},
+        created_at=time.time(), kind="recurring_setup", status="clarify",
+        setup={"fields": fields.to_dict(), "missing": fields.missing(), "notes": fields.notes,
+               "mandate_id": recurring_terms.new_mandate_id()}))
+    _audit.append(AuditEntryType.TRANSCRIPT, {
+        "draft_id": draft.draft_id, "transcript_hash": hash_transcript(req.transcript),
+        "chars": len(req.transcript), "parser_provider": "rules", "user_id": req.user_id,
+        "kind": "recurring_setup"})
+    return _setup_body(draft)
+
+
+class RecurringSetupForm(BaseModel):
+    """The user's confirmed choices. Ids are ones the setup form offered; the
+    server checks every one against the ledger (backend/recurring/terms.py)."""
+    biller_id: str | None = Field(default=None, max_length=64)
+    source_account: str | None = Field(default=None, max_length=64)
+    amount: str | None = Field(default=None, max_length=20)
+    frequency: str | None = Field(default=None, max_length=16)
+    start_date: str | None = Field(default=None, max_length=10)
+    occurrence_count: int | None = None
+    end_date: str | None = Field(default=None, max_length=10)
+    # No default on purpose: missing is an error, never "no" and never "yes".
+    auto_after_supervised: bool | None = None
+
+
+@app.post("/api/recurring/setup/{draft_id}", response_model=None)
+def recurring_setup(draft_id: str, form: RecurringSetupForm):
+    """Confirmed setup fields -> the terms to review and sign, or the form
+    again with what's wrong."""
+    draft = _drafts.get(draft_id)
+    if draft is None or draft.kind not in ("recurring_setup", "mandate"):
+        raise HTTPException(404, {"error": "that setup has expired — please ask again",
+                                  "draft_id": draft_id})
+    if draft.status in FINAL_STATUSES:
+        raise HTTPException(409, {"error": f"this setup is {draft.status}", "draft_id": draft_id})
+    conn = get_conn()
+    try:
+        terms, errors = recurring_terms.build(
+            form.model_dump(), conn=conn, user_id=draft.user_id, draft_id=draft_id,
+            mandate_id=draft.setup["mandate_id"], transcript=draft.transcript,
+            now=recurring_clock.now(), sign_now=int(time.time()))
+    finally:
+        conn.close()
+    _traces.event(draft_id, "recurring_terms", ok=terms is not None, errors=errors)
+    if terms is None:
+        draft.kind, draft.status, draft.resolved_mandate = "recurring_setup", "clarify", None
+        draft.setup = {**draft.setup, "fields": {**draft.setup["fields"],
+                                                 **{k: v for k, v in form.model_dump().items()
+                                                    if v is not None}},
+                       "missing": []}
+        return _setup_body(draft, errors=errors)
+    draft.kind, draft.status, draft.resolved_mandate = "mandate", "ready", terms
+    p_hash = payload_hash(terms)
+    _audit.append(AuditEntryType.DRAFT, {"draft_id": draft_id, "kind": "mandate",
+                                         "payload_hash": p_hash, "mandate_id": terms.mandate_id})
+    return {"status": "ready", "kind": "mandate", "draft_id": draft_id,
+            "mandate": terms.model_dump(mode="json"), "payload_hash": p_hash,
+            "preview": recurring_terms.preview(terms), "transcript": draft.transcript}
+
+
+class MandateEnrollRequest(BaseModel):
+    """Mock-signer path (tests / red-team only, like /api/gateway/execute)."""
+    mandate: RecurringBillMandate
+    signature: str | None = None
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/recurring/mandates/enroll", **_MOCK_ONLY)
+def recurring_enroll(req: MandateEnrollRequest):
+    return _traced_gateway(req.mandate.draft_id, "mock signer",
+                           _gateway.submit_mandate(req.mandate, req.signature, req.nonce,
+                                                   req.credential_id))
+
+
+class MandateEnrollWebAuthnRequest(BaseModel):
+    mandate: RecurringBillMandate
+    assertion: dict
+    nonce: str
+    credential_id: str
+
+
+@app.post("/api/recurring/mandates/enroll-webauthn")
+def recurring_enroll_webauthn(req: MandateEnrollWebAuthnRequest):
+    """The only route by which a recurring arrangement is created."""
+    out = _webauthn_gateway.submit_mandate(req.mandate, req.assertion, req.nonce,
+                                           req.credential_id)
+    _mirror_notifications()
+    return _traced_gateway(req.mandate.draft_id, "WebAuthn", out)
+
+
+def _mandate_view(m: dict, occs: list[dict], now: int) -> dict:
+    """An arrangement as the detail page shows it — from the signed terms and
+    the server's own counters."""
+    terms = recurring_store.load_terms(m)
+    if terms is None:
+        return {"mandate_id": m["mandate_id"], "status": m["status"], "broken": True,
+                "status_reason": "this arrangement's record doesn't match what you signed"}
+    tz = terms.timezone
+    left = max(0, terms.supervised_approvals - m["supervised_successes"])
+    if not terms.auto_after_supervised:
+        auto = "Never — you approve every payment yourself."
+    elif m["mode"] == "AUTO":
+        auto = "On — payments are made automatically on their due date."
+    else:
+        auto = (f"After {left} more approved payment{'s' if left != 1 else ''}, the rest are "
+                f"paid automatically.")
+    upcoming = next((o for o in occs if o["status"] in recurring_store.OPEN), None)
+    return {
+        "mandate_id": m["mandate_id"], "version": m["version"], "status": m["status"],
+        "status_reason": m["status_reason"], "mode": m["mode"],
+        "biller": terms.biller_display, "reference": terms.biller_reference_masked,
+        "account": terms.source_display, "amount_cents": terms.amount_cents,
+        "amount_display": "$" + cents_to_display(terms.amount_cents),
+        "frequency": terms.frequency, "count": terms.occurrence_count,
+        "paid_count": m["paid_count"],
+        "paid_total_display": "$" + cents_to_display(m["paid_total_cents"]),
+        "total_cap_display": "$" + cents_to_display(terms.total_cap_cents),
+        "auto_after_supervised": terms.auto_after_supervised,
+        "supervised_successes": m["supervised_successes"],
+        "approvals_left": left if terms.auto_after_supervised and m["mode"] != "AUTO" else None,
+        "automatic": auto,
+        "next_due": (recurring_schedule.label(recurring_schedule.parse_date(upcoming["due_date"]))
+                     if upcoming else None),
+        "timezone": tz, "due_time": terms.due_local_time,
+        "start_date": recurring_schedule.label(recurring_schedule.parse_date(terms.start_date)),
+        "final_date": recurring_schedule.label(recurring_schedule.parse_date(terms.end_date)),
+        "occurrences": [{
+            "seq": o["seq"], "due": recurring_schedule.label(recurring_schedule.parse_date(o["due_date"])),
+            "status": o["status"], "phase": o["phase"], "reason": o["reason"],
+            "approvable": (m["status"] == "ACTIVE" and o["status"] in recurring_store.APPROVABLE
+                           and o["due_at"] <= now <= o["review_until"]),
+            "review_until": recurring_schedule.label(
+                recurring_schedule.local_date(o["review_until"], tz)),
+        } for o in occs],
+    }
+
+
+@app.get("/api/recurring/mandates", response_model=None)
+def recurring_list(user_id: str = Query(DEMO_USER_ID)):
+    now = recurring_clock.now()
+    conn = get_conn()
+    try:
+        out = [_mandate_view(m, recurring_store.occurrences(conn, m["mandate_id"]), now)
+               for m in recurring_store.mandates_for(conn, user_id)]
+    finally:
+        conn.close()
+    return {"user_id": user_id, "mandates": out}
+
+
+@app.get("/api/recurring/mandates/{mandate_id}", response_model=None)
+def recurring_detail(mandate_id: str, user_id: str = Query(DEMO_USER_ID)):
+    now = recurring_clock.now()
+    conn = get_conn()
+    try:
+        m = recurring_store.get_mandate(conn, mandate_id)
+        if m is None or m["user_id"] != user_id:
+            raise HTTPException(404, {"error": "no such recurring payment"})
+        view = _mandate_view(m, recurring_store.occurrences(conn, mandate_id), now)
+        view["activity"] = [n for n in recurring_store.notifications(conn, user_id, limit=200)
+                            if n["mandate_id"] == mandate_id][:30]
+    finally:
+        conn.close()
+    return view
+
+
+class MandateAction(BaseModel):
+    user_id: str = DEMO_USER_ID
+
+
+def _mandate_action(mandate_id: str, user_id: str, action) -> dict:
+    out = action(mandate_id, user_id, now=recurring_clock.now())
+    if out is None:
+        raise HTTPException(404, {"error": "no such recurring payment"})
+    _audit.append(AuditEntryType.MANDATE_STATUS, {"mandate_id": mandate_id,
+                                                  "status": out["status"], "by": "user"})
+    _mirror_notifications()
+    return {"mandate_id": mandate_id, "status": out["status"]}
+
+
+@app.post("/api/recurring/mandates/{mandate_id}/pause", response_model=None)
+def recurring_pause(mandate_id: str, req: MandateAction = MandateAction()):
+    """Pause at once: nothing is paid while paused, and what falls due is
+    skipped, not paid later. No signature — making things safer is easy."""
+    return _mandate_action(mandate_id, req.user_id, recurring_store.pause)
+
+
+@app.post("/api/recurring/mandates/{mandate_id}/cancel", response_model=None)
+def recurring_cancel(mandate_id: str, req: MandateAction = MandateAction()):
+    """Cancel for good. No signature needed."""
+    return _mandate_action(mandate_id, req.user_id, recurring_store.cancel)
+
+
+def _resume_id(mandate_id: str) -> str:
+    return f"mandate-resume:{mandate_id}"
+
+
+@app.post("/api/recurring/mandates/{mandate_id}/resume/begin", response_model=None)
+def recurring_resume_begin(mandate_id: str, req: MandateAction = MandateAction()):
+    """Resuming switches payments back on, so — like unfreezing — it takes a
+    code sent to the user's phone, not one tap someone steering the page could
+    make."""
+    conn = get_conn()
+    try:
+        m = recurring_store.get_mandate(conn, mandate_id)
+    finally:
+        conn.close()
+    if m is None or m["user_id"] != req.user_id:
+        raise HTTPException(404, {"error": "no such recurring payment"})
+    if m["status"] != "PAUSED":
+        raise HTTPException(409, {"error": f"this arrangement is {m['status'].lower()}"})
+    code = _step_up.issue(_resume_id(mandate_id), "resume")
+    _phone.deliver(req.user_id, f"DCTA: to resume your recurring payment, enter code {code}. "
+                                f"Valid 5 min. If you didn't ask for this, ignore it.")
+    return {"code_sent": True, "channel": "your registered phone"}
+
+
+class MandateResume(BaseModel):
+    user_id: str = DEMO_USER_ID
+    code: str
+
+
+@app.post("/api/recurring/mandates/{mandate_id}/resume", response_model=None)
+def recurring_resume(mandate_id: str, req: MandateResume):
+    try:
+        _step_up.confirm(_resume_id(mandate_id), req.code)
+    except StepUpError as exc:
+        raise HTTPException(400, {"error": str(exc), "attempts_left": exc.attempts_left})
+    _step_up.consume(_resume_id(mandate_id))
+    return _mandate_action(mandate_id, req.user_id, recurring_store.resume)
+
+
+def _pending_view(conn, occ: dict) -> dict:
+    m = recurring_store.get_mandate(conn, occ["mandate_id"])
+    terms = recurring_store.load_terms(m)
+    return {"mandate_id": occ["mandate_id"], "seq": occ["seq"], "status": occ["status"],
+            "reason": occ["reason"], "biller": terms.biller_display if terms else None,
+            "count": terms.occurrence_count if terms else None,
+            "amount_display": "$" + cents_to_display(terms.amount_cents) if terms else None,
+            "account": terms.source_display if terms else None,
+            "due": recurring_schedule.label(recurring_schedule.parse_date(occ["due_date"])),
+            "review_until": recurring_schedule.label(recurring_schedule.local_date(
+                occ["review_until"], terms.timezone if terms else DEFAULT_TIMEZONE))}
+
+
+@app.get("/api/recurring/pending", response_model=None)
+def recurring_pending(user_id: str = Query(DEMO_USER_ID)):
+    """Bills waiting for the user's approval. Durable: they stay here when the
+    app was closed when they fell due."""
+    now = recurring_clock.now()
+    conn = get_conn()
+    try:
+        return {"user_id": user_id, "pending": [
+            _pending_view(conn, o) for o in recurring_store.pending_for(conn, user_id, now)]}
+    finally:
+        conn.close()
+
+
+@app.post("/api/recurring/occurrences/{mandate_id}/{seq}/review", response_model=None)
+def recurring_review(mandate_id: str, seq: int, req: MandateAction = MandateAction()):
+    """Open a pending bill: a fresh one-payment draft built from the mandate,
+    checked like any payment, for the user to approve with their passkey (the
+    normal /api/auth/nonce + /api/gateway/execute-webauthn flow)."""
+    try:
+        draft, terms, verdicts, assessment = recurring_approve.build_draft(
+            mandate_id, seq, user_id=req.user_id, db_path=DB_PATH, now=recurring_clock.now(),
+            recent_change_hours=settings.recent_change_hours,
+            cooling_hours=settings.credential_cooling_hours, executor=_executor)
+    except recurring_approve.NotApprovable as exc:
+        raise HTTPException(exc.status, exc.detail)
+    _audit.append(AuditEntryType.POLICY, verdicts.to_audit_payload(draft.draft_id))
+    _audit.append(AuditEntryType.SCAM_ASSESSMENT, {"stage": "recurring_review",
+                                                   **assessment.to_audit()})
+    _traces.start(draft.draft_id, transcript=draft.transcript, route="recurring_review",
+                  user_id=req.user_id)
+    _traces.event(draft.draft_id, "recurring_review", status=draft.status,
+                  policy=draft.policy, scam=assessment.outcome)
+    info = {"mandate_id": mandate_id, "seq": seq, "count": terms.occurrence_count,
+            "biller": terms.biller_display}
+    if draft.status != "ready":
+        reasons = verdicts.reasons() or list(assessment.warnings) or [
+            "This payment needs extra checks that a recurring approval can't do."]
+        return {"status": "blocked", "kind": "recurring_review", "draft_id": draft.draft_id,
+                "recurring": info, "reasons": reasons,
+                "message": "This payment wasn't paid. If you still want to pay it, make it as a "
+                           "one-time payment, where every check runs in full."}
+    _drafts.put(draft)
+    p_hash = payload_hash(draft.resolved_plan)
+    _audit.append(AuditEntryType.MANDATE_OCCURRENCE, {
+        "mandate_id": mandate_id, "seq": seq, "draft_id": draft.draft_id,
+        "payload_hash": p_hash, "stage": "review_drafted"})
+    return {"status": "ready", "kind": "payment", "draft_id": draft.draft_id,
+            "transcript": draft.transcript, "narration": None,
+            "scam": _public_scam(assessment, None, draft.scam),
+            "resolved_plan": draft.resolved_plan.model_dump(mode="json"),
+            "payload_hash": p_hash, "policy": draft.policy, "validation": draft.validation,
+            "requires_extra_confirmation": False, "confirmation": None, "recurring": info}
+
+
+@app.get("/api/recurring/notifications", response_model=None)
+def recurring_notifications(user_id: str = Query(DEMO_USER_ID), after_id: int = Query(0)):
+    conn = get_conn()
+    try:
+        return {"user_id": user_id,
+                "notifications": recurring_store.notifications(conn, user_id, after_id=after_id)}
+    finally:
+        conn.close()
+
+
+@app.post("/api/recurring/run-due", response_model=None)
+def recurring_run_due():
+    """Run whatever has fallen due NOW, by the server's clock — the same thing
+    the background loop and `python -m backend.recurring run-due` do. Nothing
+    can be run early from here: there is no `now` to pass."""
+    return {"events": _recurring_tick(), "now": recurring_clock.now()}
+
+
+@app.get("/api/recurring/clock", response_model=None)
+def recurring_clock_state():
+    now = recurring_clock.now()
+    return {"demo": recurring_clock.demo_enabled(), "now": now,
+            "offset_s": recurring_clock.offset(),
+            "today": recurring_schedule.label(recurring_schedule.local_date(now, DEFAULT_TIMEZONE))}
+
+
+def _require_demo_clock(request: Request) -> None:
+    if not recurring_clock.demo_enabled():
+        logging.warning("blocked call to disabled demo-clock route %s", request.url.path)
+        raise HTTPException(status_code=404, detail="Not Found")
+
+
+class ClockAdvance(BaseModel):
+    user_id: str = DEMO_USER_ID
+
+
+@app.post("/api/recurring/clock/advance", dependencies=[Depends(_require_demo_clock)],
+          include_in_schema=False)
+def recurring_clock_advance(req: ClockAdvance = ClockAdvance()):
+    """DEMO ONLY (RECURRING_DEMO_CLOCK=1; 404 otherwise): jump the recurring
+    clock to the user's next due payment and run it."""
+    now = recurring_clock.now()
+    conn = get_conn()
+    try:
+        row = conn.execute(
+            "SELECT MIN(o.due_at) AS t FROM mandate_occurrences o JOIN mandates m "
+            "USING (mandate_id) WHERE m.user_id=? AND m.status IN ('ACTIVE','PAUSED') "
+            "AND o.status='SCHEDULED'", (req.user_id,)).fetchone()
+    finally:
+        conn.close()
+    if row is None or row["t"] is None:
+        raise HTTPException(409, {"error": "no payment is waiting to fall due"})
+    recurring_clock.advance_to(max(int(row["t"]), now))
+    return {"events": _recurring_tick(), "now": recurring_clock.now(),
+            "today": recurring_schedule.label(recurring_schedule.local_date(
+                recurring_clock.now(), DEFAULT_TIMEZONE))}
 
 
 # Serve frontend assets (canonical.js, app.js, style.css). Mounted LAST so the

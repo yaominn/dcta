@@ -54,11 +54,15 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #   - validator must not reach gateway/ or auth/  (M6: the validator is read-only
 #     by construction — it can freeze a draft, never execute one. Enforced, not
 #     asserted in a docstring.)
+#   - recurring must not reach agent/           (a recurring payment's terms,
+#     its schedule and every check before an automatic debit come from rules
+#     and the user's own confirmations — never from model output)
 BOUNDARIES = [
     ("backend.agent", ("backend.gateway", "backend.auth")),
     ("backend.resolver", ("backend.agent",)),
     ("backend.policy", ("backend.agent",)),
     ("backend.validator", ("backend.gateway", "backend.auth")),
+    ("backend.recurring", ("backend.agent",)),
 ]
 
 
