@@ -43,15 +43,18 @@ def parse_amount(value) -> int | None:
 
 
 def build(form: dict, *, conn, user_id: str, draft_id: str, mandate_id: str,
-          transcript: str, now: int, tz: str = DEFAULT_TIMEZONE) -> tuple[RecurringBillMandate | None, dict]:
+          transcript: str, now: int, sign_now: int | None = None,
+          tz: str = DEFAULT_TIMEZONE) -> tuple[RecurringBillMandate | None, dict]:
     """(terms, {}) when every field is valid, else (None, {field: message}).
+
+    `now` is the recurring clock (what "today" and "in the future" mean for the
+    schedule); `sign_now` is real time, for the signing window (default: now).
 
     `form` holds the user's confirmed values: biller_id, source_account,
     amount (string or cents), frequency, start_date, and either
     occurrence_count or end_date, plus `auto_after_supervised` — True/False,
     with no default: leaving it out is an error, never "no"."""
     errors: dict[str, str] = {}
-    today = schedule.local_date(now, tz)
 
     biller = _billers.current(conn, str(form.get("biller_id") or ""))
     if biller is None:
@@ -135,7 +138,8 @@ def build(form: dict, *, conn, user_id: str, draft_id: str, mandate_id: str,
         supervised_approvals=SUPERVISED_APPROVALS, auto_after_supervised=auto,
         valid_until=schedule.review_until(dates[-1], tz),
         transcript_hash=hash_transcript(transcript),
-        created_at=now, expires_at=now + MAX_AUTH_WINDOW_S)
+        created_at=sign_now if sign_now is not None else now,
+        expires_at=(sign_now if sign_now is not None else now) + MAX_AUTH_WINDOW_S)
     return terms, {}
 
 

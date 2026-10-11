@@ -248,6 +248,8 @@ class Gateway:
             return self._already_final(draft_id, p_hash, exc.prior)
         except DestinationChanged:         # a new number landed after step 3e
             return self._reject(draft_id, p_hash, "SUPERSEDED", _SUPERSEDED)
+        except MandateRefused as exc:      # a recurring occurrence its mandate no longer allows
+            return self._reject(draft_id, p_hash, "MANDATE", exc.reason + " — nothing was sent")
         if self.step_up is not None:
             self.step_up.consume(draft_id)
         safety.release_hold(draft_id, db_path=self.executor.db_path)   # a served hold is done
@@ -723,6 +725,8 @@ class Gateway:
                     continue
                 except DestinationChanged:
                     stop = "the payee's number changed"
+                except MandateRefused as exc:
+                    stop = exc.reason
                 else:
                     safety.set_release_status(draft_id, ("RUNNING",), "SENT", db_path=db)
                     attempts.mark(draft_id, attempts.SENT, now=now, db_path=db)
