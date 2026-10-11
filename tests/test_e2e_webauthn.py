@@ -94,8 +94,8 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             # 3b. the assistant's reply (what it worked out) and the card's
             #     evidence: the user's own words, quoted from the transcript.
             reply = page.locator(".msg.bot").last.inner_text()
-            assert "$500.00 to Mom from your Savings account" in reply, reply
-            assert "in line with what you usually send Mom" in reply, reply
+            assert "$500.00 to Mom from Savings." in reply, reply
+            assert "Your usual amount for Mom." in reply, reply
             assert "You said: \u201ctransfer five hundred from my savings to mom\u201d" in plan_text
             assert "\u201cfive hundred\u201d \u00b7 \u201cmom\u201d \u00b7 \u201csavings\u201d" in plan_text, plan_text
 

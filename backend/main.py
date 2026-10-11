@@ -1146,7 +1146,7 @@ def _rescore(draft: Draft, plan: ResolvedPlan, now: int):
                          transcript=draft.scam_text,
                          recent_change_hours=settings.recent_change_hours,
                          cooling_hours=settings.credential_cooling_hours,
-                         draft_id=draft.draft_id)
+                         draft_id=draft.draft_id, unanswered=draft.unanswered)
 
 
 def _public_scam(assessment, hold_release: int | None, stored: dict | None) -> dict | None:
@@ -1177,7 +1177,11 @@ def _with_debug(out: dict, draft: Draft, llm_calls: list) -> dict:
     assessed = getattr(draft, "scam", None)
     if assessed:
         assessed = {**assessed, "thresholds": {
-                        "facts_ask": scam.FACTS_ASK_FROM, "facts_fail": scam.FACTS_FAIL_FROM,
+                        "facts_ask": assessed.get("ask_from", scam.FACTS_ASK_FROM),
+                        "facts_ask_lines": {"doubt": scam.FACTS_ASK_DOUBT_FROM,
+                                            "usual": scam.FACTS_ASK_FROM,
+                                            "small": scam.FACTS_ASK_SMALL_FROM},
+                        "facts_fail": scam.FACTS_FAIL_FROM,
                         "facts_call_bank": scam.FACTS_CALL_BANK_FROM,
                         "words_fail": scam.WORDS_FAIL_FROM, "words_serious": scam.WORDS_SERIOUS_FROM,
                         "words_call_bank": scam.WORDS_CALL_BANK_FROM},
@@ -1502,8 +1506,21 @@ def answer_purpose(draft_id: str, body: PurposeAnswer):
     if (draft.question or {}).get("kind") != "purpose" or not body.answer.strip():
         raise HTTPException(409, {"error": "this draft isn't waiting for what the payment "
                                            "is for", "draft_id": draft_id})
-    draft.purpose = body.answer.strip()
-    _traces.event(draft_id, "answer", field="purpose", answer=draft.purpose)
+    reply = body.answer.strip()
+    draft.replies.append(reply)
+    _traces.event(draft_id, "answer", field="purpose", answer=reply)
+    # A reply that doesn't answer ("no", "ok") is asked again, never taken as
+    # a calm answer; out of tries, the missing answer is scored as risk. One
+    # with scam wording in it is scored now: it has said enough.
+    missing = scam.unanswered(draft.question["questions"], reply)
+    out_of_tries = len(draft.replies) >= scam.ANSWER_TRIES
+    if missing and not out_of_tries and not scam.word_score(reply)["points"]:
+        draft.question = {**draft.question, "question": " ".join(missing),
+                          "questions": list(missing), "note": scam.REASK_NOTE}
+        _traces.event(draft_id, "scam", asked_again=list(missing), tries=len(draft.replies))
+        return {"status": "clarify", "draft_id": draft_id, **draft.question}
+    draft.purpose = "\n".join(draft.replies)
+    draft.unanswered = bool(missing) and out_of_tries
     return _with_debug(_run(draft), draft, getattr(draft, "llm_calls", []))
 
 

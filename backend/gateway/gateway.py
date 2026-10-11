@@ -505,7 +505,9 @@ class Gateway:
         transcript = getattr(self.drafts, "transcript_of", lambda _d: "")(draft_id) or ""
         assessment = scam.reassess(plan, owner, db_path=db, now=now, transcript=transcript,
                                    recent_change_hours=self.recent_change_hours,
-                                   cooling_hours=self.cooling_hours, draft_id=draft_id)
+                                   cooling_hours=self.cooling_hours, draft_id=draft_id,
+                                   unanswered=getattr(self.drafts, "unanswered_of",
+                                                      lambda _d: False)(draft_id))
         self.audit.append(AuditEntryType.SCAM_ASSESSMENT,
                           {"stage": "gateway", "payload_hash": p_hash, **assessment.to_audit()})
         outcome = scam.stricter(drafted, assessment.outcome)

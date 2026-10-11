@@ -26,9 +26,11 @@ attempts in [`backend/policy/attempts.py`](../backend/policy/attempts.py).
    user's words mean **call the bank**, whatever else.
 3. **Threshold 1, the facts:** amount, payee, time, account changes and earlier
    attempts.
-   - Under 3: authorised, no questions.
+   - Under the ask line: authorised, no questions. The line is 4; 5 for a
+     small payment (under $500, no amount fact); 3 when the request's words
+     already look like a scam.
    - 10 or more: call the bank.
-   - 3 to 9.9: the app asks a question picked by the riskiest fact.
+   - The ask line to 9.9: the app asks a question picked by the riskiest fact.
 4. **Threshold 2, the words** of the request and the answer, in 10 categories:
    - under 2 (and facts under 7): authorised;
    - 2–5.9, or facts 7+: a fail (a 60-second wait after signing);

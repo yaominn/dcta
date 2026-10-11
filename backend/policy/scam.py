@@ -12,10 +12,12 @@ pattern and slowing them down. So, before a draft can be signed
               investigation"...) -> BLOCK: nothing to sign, call the bank
   THRESHOLD 1 the FACTS score: amount, payee, time, account changes and earlier
               attempts (WEIGHTS; the amount facts together at most AMOUNT_MAX)
-                facts < 3         PASS: sign as normal (a warning if there's one)
-                facts 3-9.9       ASK what it's for (questions picked by the
+                facts < line      PASS: sign as normal (a warning if there's one)
+                facts line-9.9    ASK what it's for (questions picked by the
                                   highest-scoring fact), then threshold 2
                 facts 10+         BLOCK
+              The line (ask_from()): 4; 5 for a small payment (under $500, no
+              amount fact); 3 when the request's words already score 2+.
   THRESHOLD 2 the WORDS score: the request and the answers, in 10 categories
               (word_score(), 0-8)
                 words < 2, facts < 7      PASS
@@ -98,8 +100,13 @@ WEEK_S = 7 * 86400                   # escalating amounts, warnings ignored
 SPLIT_TOTAL_CENTS = 100_000          # $1,000
 SGT_OFFSET_S = 8 * 3600              # Singapore time, for UNUSUAL_HOUR
 
-# The two thresholds (docs/SCAM_DECISION_FLOW.md).
-FACTS_ASK_FROM = 3.0
+# The two thresholds (docs/SCAM_DECISION_FLOW.md). Threshold 1's line moves
+# with how much reason there is to doubt the payment (ask_from()): a first
+# payment after midnight (2 + 1) is no reason to question $200 to an uncle.
+FACTS_ASK_FROM = 4.0
+FACTS_ASK_DOUBT_FROM = 3.0           # the request's own words already fail threshold 2
+FACTS_ASK_SMALL_FROM = 5.0           # a small payment, no amount fact
+SMALL_PAYMENT_CENTS = 50_000         # $500, sent to other people by the whole plan
 FACTS_FAIL_FROM = 7.0                # fail even when the words pass
 FACTS_CALL_BANK_FROM = 10.0
 WORDS_FAIL_FROM = 2.0
@@ -177,11 +184,20 @@ def facts_points(signals) -> float:
     return other + min(AMOUNT_MAX, amount)
 
 
-def decide(facts: float, words: float, never_rules) -> tuple[str, str]:
+def ask_from(words: float, *, small: bool = False) -> float:
+    """Threshold 1's line: the facts score from which the app asks. Lower when
+    the request's words already give reason to doubt it; higher for a small
+    payment (`small`: under SMALL_PAYMENT_CENTS, and no amount fact)."""
+    if words >= WORDS_FAIL_FROM:
+        return FACTS_ASK_DOUBT_FROM
+    return FACTS_ASK_SMALL_FROM if small else FACTS_ASK_FROM
+
+
+def decide(facts: float, words: float, never_rules, *, small: bool = False) -> tuple[str, str]:
     """(decision, outcome) from the two thresholds."""
     if never_rules or facts >= FACTS_CALL_BANK_FROM:
         return CALL_BANK, BLOCK
-    if facts < FACTS_ASK_FROM:
+    if facts < ask_from(words, small=small):
         return PASS, ALLOW
     if words >= WORDS_CALL_BANK_FROM:
         return CALL_BANK, BLOCK
@@ -213,7 +229,7 @@ _RULE_TEXT = {
     "ESCALATING_AMOUNTS": "3+ payments to one payee in 7 days, each bigger",
     "WARNINGS_IGNORED": "2+ warned payments sent in 7 days",
     "SOCIAL_ENGINEERING_LANGUAGE": "the user's words in 10 scam categories, strongest first "
-                                   "at 100%, 80%, 64%... (at most 8); weighed from facts 3",
+                                   "at 100%, 80%, 64%... (at most 8); weighed from the ask line",
 }
 
 
@@ -305,6 +321,7 @@ def scan_transcript(transcript: str) -> list:
 # NEVER RULES: things no real bank or official ever asks for. One of them in
 # the user's words (the request or what they said it's for) gives the payment
 # the strictest safeguards whatever the score (NEVER_RULE_OUTCOME).
+NO_ANSWER_POINTS = 4.0               # the questions asked ANSWER_TRIES times, no answer
 CATEGORIES = (
     # name, what it means, {phrase code: points}
     ("official", "An official or the bank directing the payment",
@@ -321,6 +338,7 @@ CATEGORIES = (
      {"words_upfront_fee": 2.0, "words_parcel_refund": 0.5}),
     ("pressure", "Being rushed or directed live", {"words_directed": 2.0}),   # + urgency words
     ("app", "Wording aimed at the app", {"words_instruction_override": 2.0}),
+    ("no_answer", "No real answer to the questions", {"no_answer": NO_ANSWER_POINTS}),
 )
 NEVER_RULES = frozenset({"words_official_orders", "words_investigation", "words_safe_account",
                          "words_credentials", "words_hide_from_bank", "words_mule"})
@@ -348,13 +366,62 @@ ASK_QUESTIONS = True                 # False: score the request alone, never ask
 PURPOSE_QUESTION = "What is this payment for?"
 CALL_QUESTION = "Is anyone on a call or chat with you about it right now?"
 
+# A reply that answers nothing ("no", "ok", "idk") scores no words, so it would
+# pass as a calm one. Each open question ("What is it for?") needs a reason in
+# the reply, each yes/no question a yes or a no. What is missing is asked
+# again, up to ANSWER_TRIES replies in all; still missing, it scores
+# NO_ANSWER_POINTS of words (a fail with the phone code: WORDS_SERIOUS_FROM).
+ANSWER_TRIES = 3
+REASK_NOTE = "I still need an answer to this before I can go on:"
+_YES_NO_QUESTION = re.compile(r"^(?:did|do|does|has|have|is|are|was|were|can|will)\b", re.I)
+_YES_NO = re.compile(r"\b(?:yes|yeah|yep|yup|no|nope|nah|nobody|none|alone|myself|i\s+did"
+                     r"|i\s+didn'?t|did\s+not|i\s+have|i\s+haven'?t|it\s+was|it\s+wasn'?t)\b", re.I)
+# Words that are no reason by themselves: yes/no, filler, the question's own
+# words, and the usual ways of not saying.
+_NOT_A_REASON = frozenset("""
+    yes yeah yep yup no nope nah not none nothing nobody one ok okay sure fine alright right
+    um uh hmm erm the and but for its this that what who why how with about from just
+    you your my mine me our they them their his her him she was are is be been have has had
+    did does dont didnt any all some can will would should could there here
+    idk dunno know knows knew whatever stuff things thing something anything reason reasons
+    personal private secret business because cause cos coz skip pass test testing
+    pay paying paid payment payments money transfer transferring send sending sent cash
+    asdf blah etc nil lol haha call chat now
+""".split())
 
-def word_score(transcript: str, found=None) -> dict:
+
+def _is_yes_no(question: str) -> bool:
+    """A question answered by yes or no: its last sentence starts "Did", "Is"..."""
+    last = re.split(r"(?<=[.?!])\s+", question.strip())[-1]
+    return bool(_YES_NO_QUESTION.match(last))
+
+
+def _gives_a_reason(reply: str) -> bool:
+    """At least one real word that is not a yes/no, filler or evasion."""
+    for w in re.findall(r"[a-z']+", (reply or "").lower()):
+        w = w.replace("'", "")                       # "it's" -> "its", "don't" -> "dont"
+        if (len(w) >= 3 and w not in _NOT_A_REASON and re.search(r"[aeiouy]", w)
+                and not re.search(r"(.)\1\1", w)):
+            return True
+    return False
+
+
+def unanswered(questions, reply: str) -> tuple:
+    """The questions `reply` does not answer. A rule, never the model: a coached
+    victim's answer must not be judged by text a scammer can steer."""
+    yes_no = bool(_YES_NO.search(reply or ""))
+    reason = _gives_a_reason(reply)
+    return tuple(q for q in questions if not (yes_no if _is_yes_no(q) else reason))
+
+
+def word_score(transcript: str, found=None, *, unanswered: bool = False) -> dict:
     """What the user's own words add, itemised (the browser console prints it).
-    `found`: scan_transcript()'s matches, if already run. A rule, never the model."""
+    `found`: scan_transcript()'s matches, if already run. `unanswered`: the
+    questions were asked ANSWER_TRIES times without an answer. A rule, never
+    the model."""
     text = transcript or ""
     found = scan_transcript(text) if found is None else found
-    codes = {w.code for w in found}
+    codes = {w.code for w in found} | ({"no_answer"} if unanswered else set())
     urgent, seen = [], {}
     for m in _URGENT_WORD.finditer(text):
         word = re.sub(r"\s+", " ", m.group(0).lower())
@@ -433,13 +500,14 @@ class ScamAssessment:
     words: float = 0.0                                 # threshold 2 (0 when not weighed)
     words_weighed: bool = False
     decision: str = PASS                               # PASS / FAIL / CALL_BANK
-    asks: bool = False                                 # facts 3-9.9: ask before drafting
+    asks: bool = False                                 # facts ask_from-9.9: ask first
     questions: tuple = ()                              # what to ask, if it asks
+    ask_from: float = FACTS_ASK_FROM                   # threshold 1's line for this payment
 
     def to_dict(self) -> dict:
         return {"draft_id": self.draft_id, "score": self.score, "outcome": self.outcome,
                 "facts": self.facts, "words": self.words, "words_weighed": self.words_weighed,
-                "decision": self.decision,
+                "decision": self.decision, "ask_from": self.ask_from,
                 "signals": [{"code": s.code, "weight": s.weight, "detail": s.detail,
                              "leg": s.leg} for s in self.signals],
                 "warnings": list(self.warnings), "phrase_codes": self.phrase_codes,
@@ -473,6 +541,7 @@ class ScamContext:
     asked_at: int | None = None   # when the user asked (UNUSUAL_HOUR); default: now
     attempts: list = field(default_factory=list)   # earlier attempts (policy/attempts.py)
     freeze_released_at: int | None = None          # when the freeze was last turned off
+    unanswered: bool = False      # the questions were asked ANSWER_TRIES times, no answer
 
 
 def _tenths(points: float) -> int:
@@ -706,11 +775,14 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
     # --- threshold 1, the words, threshold 2
     facts_score = round(facts_points((f.code, f.weight) for f in facts), 1)
     found = scan_transcript(ctx.transcript)
-    words = word_score(ctx.transcript, found)
+    words = word_score(ctx.transcript, found, unanswered=ctx.unanswered)
     never = tuple(words["never_rules"])
-    weighed = facts_score >= FACTS_ASK_FROM or bool(never)
+    small = (sum(sent_out.values()) < SMALL_PAYMENT_CENTS
+             and not any(f.code in AMOUNT_CODES for f in facts))
+    line = ask_from(words["points"], small=small)
+    weighed = facts_score >= line or bool(never)
     words_points = words["points"] if weighed else 0.0
-    decision, outcome = decide(facts_score, words_points, never)
+    decision, outcome = decide(facts_score, words_points, never, small=small)
 
     signals = list(facts)
     if weighed and words["points"] > 0:
@@ -733,7 +805,7 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
     if outcome == ALLOW and warnings:
         outcome = WARN                                # a warning to read, no other friction
 
-    asks = (FACTS_ASK_FROM <= facts_score < FACTS_CALL_BANK_FROM and not never
+    asks = (line <= facts_score < FACTS_CALL_BANK_FROM and not never
             and decision != CALL_BANK)
     questions: tuple = ()
     if asks:
@@ -746,8 +818,11 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
             if f.weight == askable[0].weight and kind not in {
                     "amount" if t.code in AMOUNT_CODES else t.code for t in top}:
                 top.append(f)
-        questions = (tuple(dict.fromkeys(f.ask for f in top[:2])) or (PURPOSE_QUESTION,)) \
-            + (CALL_QUESTION,)
+        questions = tuple(dict.fromkeys(f.ask for f in top[:2]))
+        if all(_is_yes_no(q) for q in questions):
+            # Always one question a bare "no" can't answer.
+            questions += (PURPOSE_QUESTION,)
+        questions += (CALL_QUESTION,)
 
     # HOLD_STEP_UP: type the name of the payee the risk points at, not simply
     # the first one in the plan (plan order breaks a tie).
@@ -764,12 +839,12 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
         riskiest_payee=riskiest, confirm_name=riskiest if outcome == HOLD_STEP_UP else None,
         new_destination_legs=frozenset(new_legs), never_rules=never,
         facts=facts_score, words=words_points, words_weighed=weighed, decision=decision,
-        asks=asks, questions=questions)
+        asks=asks, questions=questions, ask_from=line)
 
 
 def reassess(plan, user_id: str, *, db_path=None, now: int, transcript: str = "",
              recent_change_hours: int = 24, cooling_hours: int = 12,
-             draft_id: str | None = None) -> ScamAssessment:
+             draft_id: str | None = None, unanswered: bool = False) -> ScamAssessment:
     """Score `plan` against the ledger as it is NOW. The one entry point for the
     draft pipeline, the signing-challenge check and the gateway, so the three
     cannot drift. The hour judged is when the plan was drafted (its signed
@@ -779,6 +854,7 @@ def reassess(plan, user_id: str, *, db_path=None, now: int, transcript: str = ""
                             recent_change_hours=recent_change_hours, cooling_hours=cooling_hours,
                             draft_id=draft_id or getattr(plan, "draft_id", None))
     ctx.asked_at = getattr(plan, "created_at", None) or now
+    ctx.unanswered = unanswered
     return assess(plan, ctx, draft_id=draft_id)
 
 

@@ -565,7 +565,7 @@ def test_a_risky_payment_asks_before_anything_is_held(asking_client):
     assert "resolved_plan" not in d and safety.get_hold(d["draft_id"]) is None
     assert asking_client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]}).status_code == 409
     r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose",
-                           json={"answer": "her share of the rent"}).json()
+                           json={"answer": "yes I called her, it's her share of the rent"}).json()
     # facts 7+ fail however calm the answer: the code and the server hold
     assert r["status"] == "ready" and r["scam"]["outcome"] == "HOLD_STEP_UP" and r["scam"]["hold"]
 
@@ -602,6 +602,40 @@ def test_a_never_rule_skips_the_question_and_calls_the_bank(asking_client):
     assert "investigation" in d["reasons"][0]
 
 
+def test_a_reply_that_answers_nothing_is_asked_again(asking_client):
+    """"no" answers the call question, not what it's for: only that is asked
+    again, and nothing is drafted until it is answered."""
+    d = asking_client.post("/api/drafts", json={"transcript": "pay landlord 1500"}).json()
+    r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose", json={"answer": "no"}).json()
+    assert (r["status"], r["kind"]) == ("clarify", "purpose") and r["note"] == scam.REASK_NOTE
+    assert r["questions"] == [d["questions"][0]] and "resolved_plan" not in r
+    r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose", json={"answer": "rent"}).json()
+    assert r["status"] == "ready" and r["scam"]["outcome"] == "WARN"
+
+
+def test_no_answer_after_every_try_counts_as_risk(asking_client):
+    """Short replies can't add up to a pass: out of tries, the missing answer
+    scores NO_ANSWER_POINTS of words (facts 5 + words 4: the phone code)."""
+    d = asking_client.post("/api/drafts", json={"transcript": "pay landlord 1500"}).json()
+    for reply in ("no", "idk", "ok")[:scam.ANSWER_TRIES]:
+        r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose", json={"answer": reply}).json()
+    assert r["status"] == "ready" and r["scam"]["outcome"] == "HOLD_STEP_UP"
+    assert r["scam"]["words"] == scam.NO_ANSWER_POINTS
+
+
+@pytest.mark.parametrize("reply,missing", [
+    ("no", ["open"]), ("ok", ["open", "yes/no"]), ("idk", ["open", "yes/no"]),
+    ("no reason", ["open"]), ("it's personal, no", ["open"]), ("nope, money", ["open"]),
+    ("asdfff", ["open", "yes/no"]), ("rent", ["yes/no"]),
+    ("october rent, no one", []), ("a gift for my sister. nobody", []),
+])
+def test_what_counts_as_an_answer(reply, missing):
+    qs = ("This is your first payment to Bob, and it's $1,500.00. What is it for?",
+          scam.CALL_QUESTION)
+    assert [("yes/no" if q == scam.CALL_QUESTION else "open")
+            for q in scam.unanswered(qs, reply)] == missing
+
+
 def test_a_purpose_is_only_taken_when_asked(asking_client):
     d = asking_client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     r = asking_client.post(f"/api/drafts/{d['draft_id']}/purpose", json={"answer": "dinner"})
@@ -616,12 +650,35 @@ def test_the_question_follows_the_highest_scoring_fact():
     changed = destinations.Destination("payee_17", 2, "PAYNOW_MOBILE", "m", "h2", NOON_SGT - 3600)
     q = scam.assess(_plan(_mom(5000, version=2)), _ctx(mom=changed)).questions
     assert "Mom's number changed 1 hour ago" in q[0] and q[-1] == scam.CALL_QUESTION
-    assert "How do you know Mom" in _questions(now=TWO_AM_SGT, history=[])[0]   # first 2 > night 1
+    rushed = "pay mom 50 now, hurry, it is urgent"       # words 2.2: the doubt line, 3
+    assert "How do you know Mom" in _questions(now=TWO_AM_SGT, history=[],
+                                               transcript=rushed)[0]   # first 2 > night 1
     # a tie between different kinds of fact asks both
     both = _questions(creds=(NOON_SGT - 86400 * 30, NOON_SGT - 60),
                       freeze_released_at=NOON_SGT - 3600)
-    assert len(both) == 3 and "new device" in both[0] + both[1] and "freeze" in both[0] + both[1]
+    assert len(both) == 4 and "new device" in both[0] + both[1] and "freeze" in both[0] + both[1]
+    assert both[2] == scam.PURPOSE_QUESTION        # two yes/no questions: "no" can't answer all
     assert _questions() == ()                                       # facts 0: nothing to ask
+
+
+def test_the_ask_line_moves_with_the_reason_to_doubt():
+    """Threshold 1's line: 3 when the words already doubt it, 4 as a rule, 5 for
+    a small payment. A first payment after midnight (2 + 1) isn't questioned
+    unless something else points at a scam."""
+    calm = scam.assess(_plan(_mom(20000)), _ctx(now=TWO_AM_SGT, history=[]))
+    assert (calm.facts, calm.ask_from, calm.asks, calm.outcome) == (3, 5, False, "WARN")
+    assert "first payment" in calm.warnings[0]                   # still told to check the number
+    bigger = scam.assess(_plan(_mom(60000)), _ctx(now=TWO_AM_SGT, history=[]))
+    assert (bigger.ask_from, bigger.asks) == (4, False)          # not small, still under 4
+    rushed = scam.assess(_plan(_mom(20000)), _ctx(now=TWO_AM_SGT, history=[],
+                                                  transcript="pay mom 200 now, hurry, it is urgent"))
+    assert (rushed.ask_from, rushed.asks) == (3, True)
+    added = destinations.Destination("payee_17", 1, "PAYNOW_MOBILE", "m", "h", NOON_SGT - 3600)
+    new_contact = scam.assess(_plan(_mom(5000)), _ctx(mom=added, history=[]))
+    assert (new_contact.facts, new_contact.asks) == (5, True)    # small, but just added: asks
+    assert "You added Mom 1 hour ago" in new_contact.questions[0]
+    assert scam.decide(3.5, 2, ()) == ("FAIL", "DELAY")           # doubted: the line is 3
+    assert scam.decide(4.5, 2, (), small=True) == ("FAIL", "DELAY")
 
 
 # --------------------------------------------------------------------------- amounts, BLOCK
@@ -899,7 +956,7 @@ def test_the_reply_does_not_vouch_for_a_new_number(client):
     """$500 is Mom's usual amount — but never to this number."""
     _change_moms_number(client)
     reply = client.post("/api/drafts", json={"transcript": "pay mom 500"}).json()["narration"]["reply"]
-    assert "first payment to Mom at this number" in reply and "in line with" not in reply
+    assert "First payment to Mom at this number." in reply and "usual" not in reply
 
 
 def test_the_new_number_scam_end_to_end(client):
@@ -909,7 +966,7 @@ def test_the_new_number_scam_end_to_end(client):
     assert d["status"] == "ready" and d["scam"]["outcome"] in ("HOLD", "HOLD_STEP_UP")
     assert "PayNow number was changed" in d["scam"]["warnings"][0]
     assert d["scam"]["hold"]["seconds_left"] > 0
-    assert "paused this for 30 seconds" in d["narration"]["reply"]
+    assert "On hold for 30 seconds" in d["narration"]["reply"]
 
     before = _balance()
     held = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
@@ -1281,6 +1338,24 @@ def test_a_card_locks_confirm_from_the_moment_it_is_shown(page):
     unlocked Confirm before the phone code."""
     assert page["heldCard"]["signDisabled"] is True
     assert page["contactCard"] == {"atRender": True, "afterFailedCancel": True, "afterCode": False}
+
+
+def test_warned_held_and_stopped_cards_offer_a_call_for_help(page):
+    """One tap to the DBS Fraud Hotline and ScamShield, from one HELP_LINES
+    list: wherever there's a warning, a hold, a wait or a stop — and not on an
+    ordinary card. Plain tel: links that never touch the Confirm gate."""
+    help = page["help"]
+    for where in ("held", "warned", "delayedNoSentence", "stopped", "contactRefused", "scheduled",
+                  "retired"):                    # and on a card a newer one has retired
+        links = help[where]
+        assert [a["href"] for a in links] == ["tel:18003396963", "tel:1799"], where
+        assert [a["overseas"] for a in links] == ["tel:+6563396963", None], where
+        assert links[0]["label"] == "Call DBS Fraud Hotline \u00b7 1800 339 6963", where
+        assert links[0]["aria"] == "Call DBS Fraud Hotline, 1800 339 6963", where
+        assert links[1]["aria"] == "Call ScamShield, 1799", where
+        assert not any(a["disabled"] for a in links), where
+    assert help["allowed"] == []                         # no warning: no help buttons
+    assert help["heldSignDisabled"] is True              # the gate is unchanged
 
 
 def test_cancel_acts_on_the_card_it_is_on(page):

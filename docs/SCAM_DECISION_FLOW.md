@@ -39,11 +39,11 @@ user sees and how to try it is in [`SCAM_SCORING.md`](SCAM_SCORING.md).
  ║ attempts (tables below)                     ║
  ╚═════════════════════════════════════════════╝
             │
-            ├──── facts 0–2.9 ───────────────────────▶ AUTHORISE
+            ├──── facts under the ask line ──────────▶ AUTHORISE
             │                                          (a warning may show)
             ├──── facts 10+ ─────────────────────────▶ CALL THE BANK
             │                                          (too risky to ask)
-            ▼ facts 3–9.9
+            ▼ facts from the ask line to 9.9
  ┌─────────────────────────────────────────────┐
  │ ASK: the question for the highest-scoring   │
  │ fact (two if a different kind ties), plus   │
@@ -93,6 +93,20 @@ user sees and how to try it is in [`SCAM_SCORING.md`](SCAM_SCORING.md).
 ## Threshold 1: the facts score
 
 Each fact counts once per payment.
+
+**The ask line** moves with how much reason there is to doubt the payment
+(`ask_from()`):
+
+| The payment | Asks from |
+|---|---|
+| The request's own words already score 2+ (they'd fail threshold 2) | 3 |
+| Usually | 4 |
+| Small: under $500 to other people in total, and no amount fact | 5 |
+
+So "send 200 to uncle bob" after midnight — a first payment (2) at night (1),
+facts 3 — goes through with the first-payment warning, not questions. The same
+words with "hurry, it's urgent" are asked. A small first payment to a contact
+added an hour ago (2 + 3 = 5) is still asked.
 
 ### Amount (together at most 5)
 
@@ -150,7 +164,17 @@ facts: a fail with the phone code, whatever the answer.
 
 The question for the **highest-scoring fact**, plus a second if a different
 kind of fact ties, and always: *"Is anyone on a call or chat with you about it
-right now?"* `{…}` is filled in from the payment.
+right now?"* If every fact's question is a yes/no one, *"What is this payment
+for?"* is added, so a bare "no" can never answer them all. `{…}` is filled in
+from the payment.
+
+**A reply has to answer.** An open question ("What is it for?") needs a real
+word in the reply, not a yes/no, filler or "idk"/"personal"/"money"; a yes/no
+question needs a yes or a no. What's missing is asked again ("I still need an
+answer to this…"), up to 3 replies in all. Still unanswered, the missing answer
+scores **4 words points** (a fail with the phone code), so short replies can't
+slip through as calm ones. A reply with scam wording in it is scored at once,
+never asked again.
 
 | Highest-scoring fact | Question |
 |---|---|
@@ -199,9 +223,10 @@ All in [`scam.py`](../backend/policy/scam.py):
 
 | What | Setting |
 |---|---|
-| The thresholds | `FACTS_ASK_FROM` (3), `FACTS_FAIL_FROM` (7), `FACTS_CALL_BANK_FROM` (10), `WORDS_FAIL_FROM` (2), `WORDS_SERIOUS_FROM` (4), `WORDS_CALL_BANK_FROM` (6) |
+| The thresholds | `FACTS_ASK_FROM` (4; `FACTS_ASK_DOUBT_FROM` 3, `FACTS_ASK_SMALL_FROM` 5 under `SMALL_PAYMENT_CENTS` $500), `FACTS_FAIL_FROM` (7), `FACTS_CALL_BANK_FROM` (10), `WORDS_FAIL_FROM` (2), `WORDS_SERIOUS_FROM` (4), `WORDS_CALL_BANK_FROM` (6) |
 | Fact points | `WEIGHTS`, `NEW_CONTACT_POINTS`, `AMOUNT_MAX` (5) |
 | Amount limits | `LARGE_FIRST_CENTS` ($1,000), `DRAIN_PERCENT` (80), `LARGE_SHARE_PERCENT` (50), `LARGE_AMOUNT_CENTS` ($5,000), `USUAL_MAX_FACTOR` and `PAYEE_MAX_FACTOR` (3) |
 | Time windows | `ATTEMPT_WINDOW_S` (24 h), `WEEK_S`, `FREEZE_RECENT_S`, `DORMANT_S` (90 days) |
 | The wait after signing on a fail | `RELEASE_DELAY_SECONDS` (60; 0 turns it off) |
 | Asking at all | `ASK_QUESTIONS` (off in tests) |
+| Replies that don't answer | `ANSWER_TRIES` (3), `NO_ANSWER_POINTS` (4) |

@@ -87,6 +87,10 @@ class Draft:
     # The answer to "what is this payment for?" (scam.PURPOSE_QUESTION), asked
     # once when the score is high. Scored by the rules; never sent to the model.
     purpose: str | None = None
+    # The replies so far while the questions are asked again (scam.ANSWER_TRIES),
+    # and whether they ran out without an answer (scored as scam.NO_ANSWER_POINTS).
+    replies: list = field(default_factory=list)
+    unanswered: bool = False
 
     @property
     def scam_text(self) -> str:
@@ -168,6 +172,11 @@ class DraftStore:
         """The user's answer to the threshold-1 questions, if they were asked."""
         draft = self.get(draft_id)
         return draft.purpose if draft is not None else None
+
+    def unanswered_of(self, draft_id: str) -> bool:
+        """The questions were asked ANSWER_TRIES times without an answer."""
+        draft = self.get(draft_id)
+        return draft.unanswered if draft is not None else False
 
     def scam_outcome_of(self, draft_id: str) -> str | None:
         """The strictest scam outcome the draft was shown with (None: never assessed)."""

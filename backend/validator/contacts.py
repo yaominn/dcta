@@ -56,14 +56,17 @@ def validate_contact_change(intent: ContactEditPlan, change: ResolvedContactChan
 
     if hash_transcript(transcript) != change.transcript_hash:
         checks.append(_fail("transcript_binding", "*",
-                            "the change is not bound to this transcript"))
+                            "the change is not bound to this transcript",
+                            "This change wasn't made from what you just said. Please ask again."))
         return _finish(change.draft_id, change, checks, [], llm_check="skipped",
                        audit=audit, fset=fset)
     checks.append(_pass("transcript_binding", "*", "bound to this transcript"))
     if len(intent.edits) != len(change.edits):
         checks.append(_fail("edit_count", "*",
                             f"{len(intent.edits)} edit(s) asked for, "
-                            f"{len(change.edits)} drafted"))
+                            f"{len(change.edits)} drafted",
+                            f"You asked for {len(intent.edits)} change(s), but the draft "
+                            f"has {len(change.edits)}."))
 
     digits_said = _digit_stream(transcript)
     conn = connect(db_path) if db_path else get_conn()
@@ -76,7 +79,9 @@ def validate_contact_change(intent: ContactEditPlan, change: ResolvedContactChan
                 checks.append(_pass("target", leg, f"{nickname!r} was named or chosen"))
             else:
                 checks.append(_fail("target", leg,
-                                    f"{nickname or e.payee_id!r} was neither named nor chosen"))
+                                    f"{nickname or e.payee_id!r} was neither named nor chosen",
+                                    f"The draft changes {nickname or 'a contact'}, but you "
+                                    f"didn't name them or pick them."))
 
             if e.field == "phone":
                 national = re.sub(r"\D", "", e.new_value)
@@ -84,10 +89,13 @@ def validate_contact_change(intent: ContactEditPlan, change: ResolvedContactChan
                     national = national[2:]
                 ok = bool(national) and national in digits_said
                 detail = f"number {e.new_value} {'is' if ok else 'is NOT'} in what was said"
+                say = f"The new number {e.new_value} isn't the one you said."
             else:
                 ok = _word_in(" ".join(e.new_value.split()), " ".join(transcript.split()))
                 detail = f"name {e.new_value!r} {'is' if ok else 'is NOT'} in what was said"
-            checks.append((_pass if ok else _fail)("new_value", leg, detail))
+                say = f"The new name “{e.new_value}” isn't the one you said."
+            checks.append(_pass("new_value", leg, detail) if ok
+                          else _fail("new_value", leg, detail, say))
     finally:
         conn.close()
 
@@ -104,17 +112,21 @@ def validate_contact_add(add: ResolvedContactAdd, transcript: str, *, audit: Aud
     fset = freeze_set if freeze_set is not None else default_freeze_set
     if hash_transcript(transcript) != add.transcript_hash:
         return _finish(add.draft_id, add, [_fail("transcript_binding", "*",
-                                                 "the contact is not bound to this transcript")],
+                                                 "the contact is not bound to this transcript",
+                                                 "This contact wasn't made from what you just "
+                                                 "said. Please ask again.")],
                        [], llm_check="skipped", audit=audit, fset=fset)
     checks = [_pass("transcript_binding", "*", "bound to this transcript")]
     said = " ".join(transcript.split())
     ok = _word_in(add.nickname, said)
-    checks.append((_pass if ok else _fail)(
-        "name", "new", f"name {add.nickname!r} {'is' if ok else 'is NOT'} in what was said"))
+    detail = f"name {add.nickname!r} {'is' if ok else 'is NOT'} in what was said"
+    checks.append(_pass("name", "new", detail) if ok else _fail(
+        "name", "new", detail, f"The name “{add.nickname}” isn't the one you said."))
     national = re.sub(r"\D", "", add.phone)
     if add.phone.startswith("+65 "):
         national = national[2:]
     ok = bool(national) and national in _digit_stream(transcript)
-    checks.append((_pass if ok else _fail)(
-        "number", "new", f"number {add.phone} {'is' if ok else 'is NOT'} in what was said"))
+    detail = f"number {add.phone} {'is' if ok else 'is NOT'} in what was said"
+    checks.append(_pass("number", "new", detail) if ok else _fail(
+        "number", "new", detail, f"The number {add.phone} isn't the one you said."))
     return _finish(add.draft_id, add, checks, [], llm_check="skipped", audit=audit, fset=fset)

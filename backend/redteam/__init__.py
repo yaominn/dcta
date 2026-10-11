@@ -63,7 +63,7 @@ def _client() -> TestClient:
 
 
 def _draft(client: TestClient, transcript: str, *, answer_first_choice=False,
-           purpose: str = "paying them back") -> dict:
+           purpose: str = "paying them back, no one is with me") -> dict:
     """POST a transcript; optionally answer the first clarification by choosing
     the first candidate (the demo's disambiguation step). A risky payment's
     "what is this payment for?" is answered with `purpose` (the default adds

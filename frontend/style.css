@@ -286,6 +286,15 @@ details.sec[open] summary::before { transform: rotate(90deg); }
 .safeguards li { display: flex; gap: 8px; align-items: baseline; padding: 2px 0; }
 .sg-icon { flex: none; width: 16px; text-align: center; color: var(--ok); font-weight: 700; }
 .scam-help { margin: 8px 0 0 !important; font-size: 13px; font-weight: 600; }
+/* "Call for help" tel: links. Stacked: on a laptop the app is still drawn in a
+   390px phone frame, so there's never room for two side by side. */
+.help-calls { display: flex; flex-direction: column; }
+.btn.help-call { min-height: 44px; text-decoration: none; text-align: center; }
+.btn.help-call:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* On a tinted warning box, --line all but vanishes: a button must look like one. */
+.scam-warn .btn.help-call { background: var(--surface); border-color: color-mix(in srgb, currentColor 35%, transparent); }
+.help-note { margin: 4px 2px 0 !important; font-size: 11px; color: inherit; opacity: .8; }
+.help-note a { color: inherit; font-weight: 600; }
 .chip.add { border-style: dashed; }
 
 /* step-up (out-of-band code) */

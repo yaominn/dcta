@@ -43,8 +43,10 @@ function makeEl(tag) {
       const tags = sel.split(",").map((s) => s.trim().toUpperCase());
       return descendants(this).filter((d) => tags.includes(d.tagName));
     },
-    querySelector(sel) {               // a single ".class"
-      return descendants(this).find((d) => d.classList.contains(sel.replace(/^\./, ""))) || null;
+    querySelector(sel) {               // a single ".class" or tag
+      const match = sel.startsWith(".") ? (d) => d.classList.contains(sel.slice(1))
+        : (d) => d.tagName === sel.toUpperCase();
+      return descendants(this).find(match) || null;
     },
     focus() {}, select() {},
   };
@@ -76,6 +78,7 @@ const env = {
                   signature: new ArrayBuffer(1), userHandle: null } }) },
   },
   canonicalJson: (v) => JSON.stringify(v),   // frontend/canonical.js isn't loaded here
+  Voice: { speak() {} },                      // nor frontend/voice.js
   fetch: (...args) => respond(...args),
   confirm: () => true,
   requestAnimationFrame: () => 0,
@@ -85,9 +88,18 @@ const env = {
 const app = new Function(...Object.keys(env), SRC + `
   showErr = (msg) => errors.push(msg);
   botSay = (text) => { said.push(text); };
-  return { wireKillSwitch, onDecline, onSign, handleDraft, typedName, CURRENT };`)(...Object.values(env));
+  return { wireKillSwitch, onDecline, onSign, handleDraft, typedName, showScheduled, CURRENT };`)(
+  ...Object.values(env));
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 const sign = () => document.getElementById("sign");
+// The "call for help" tel: links on a card, as the user would find them.
+const helpLinks = (node) => descendants(node)
+  .filter((d) => d.tagName === "A" && d.classList.contains("help-call"))
+  .map((a) => ({ href: a.href, label: a.textContent, aria: a["aria-label"],
+                 disabled: !!a.disabled,
+                 overseas: (descendants(a.parent).find((d) => d !== a && d.tagName === "A")
+                            || {}).href || null }));
+const result = () => document.getElementById("result");
 const now = Math.floor(Date.now() / 1000);
 const heldPayment = { status: 200, json: {
   status: "ready", draft_id: "d-held", transcript: "pay mom 500", narration: null,
@@ -167,6 +179,40 @@ const heldPayment = { status: 200, json: {
   app.handleDraft(heldPayment);
   out.typedName = { live, afterNewCard: app.typedName() };
   errors.length = 0;
+  said.length = 0;
+
+  // "Call for help" links: on a held card (where Confirm stays locked), a
+  // warned card, a stopped payment, a refused contact and a scheduled one —
+  // never on a card with no warning.
+  out.help = { held: helpLinks(document.getElementById("plan")), heldSignDisabled: sign().disabled };
+  const warned = JSON.parse(JSON.stringify(heldPayment));
+  Object.assign(warned.json.scam, { outcome: "WARN", score: 2, hold: null,
+                                    warnings: ["This is your first payment to this destination."] });
+  app.handleDraft(warned);
+  const warnedCard = document.getElementById("plan");
+  out.help.warned = helpLinks(warnedCard);
+  const silent = JSON.parse(JSON.stringify(heldPayment));
+  Object.assign(silent.json.scam, { outcome: "DELAY", score: 5, hold: null, warnings: [] });
+  app.handleDraft(silent);                     // a delay with no warning sentence to show
+  out.help.delayedNoSentence = helpLinks(document.getElementById("plan"));
+  out.help.retired = helpLinks(warnedCard);    // a newer card took over: still there
+  const calm = JSON.parse(JSON.stringify(heldPayment));
+  Object.assign(calm.json.scam, { outcome: "ALLOW", score: 0, hold: null, warnings: [] });
+  app.handleDraft(calm);
+  out.help.allowed = helpLinks(document.getElementById("plan"));
+  app.handleDraft({ status: 200, json: { status: "blocked", kind: "scam", draft_id: "d-stop",
+                                         reasons: ["Several payments were stopped today."] } });
+  out.help.stopped = helpLinks(result());
+  app.handleDraft({ status: 200, json: { status: "blocked", kind: "contact_add", draft_id: "d-add",
+                                         contact: { display: "Bob ··4567" },
+                                         risk: { rung: "REFUSE", warnings: [] } } });
+  out.help.contactRefused = helpLinks(result());
+  respond = async () => reply(200, { status: "SCHEDULED", seconds_left: 60 });
+  app.showScheduled({ json: { draft_id: "d-later", seconds_left: 60 } });
+  const scheduled = result();
+  out.help.scheduled = helpLinks(scheduled);
+  respond = async () => reply(200, { status: "cancelled" });
+  await descendants(scheduled).find((d) => d.tagName === "BUTTON").onclick();   // stops its timers
   said.length = 0;
 
   // Freeze with no connection: never shown as frozen.

@@ -67,18 +67,18 @@ def _transfer(transcript, cents, *, mention="mom", source_mention="default",
 def test_a_simple_payment_reads_like_an_assistant():
     out = _transfer("pay mom 50 dollars", 5000)
     reply = out["reply"]
-    assert "$50.00 to Mom from your Savings account" in reply
-    assert "less than you usually send Mom ($500.00)" in reply          # worked out
-    assert "You didn't say which account, so I've used Savings" in reply  # filled in
-    assert "cancel and ask again with the account" in reply              # a real way to change it
-    assert "You'll have $8,370.50 in Savings left afterwards" in reply     # worked out
+    assert reply.startswith("$50.00 to Mom from Savings.")
+    assert "Less than your usual $500.00 to Mom." in reply              # worked out
+    assert "No account named, so I used Savings" in reply               # filled in
+    assert "cancel to change" in reply                                  # a real way to change it
+    assert "Leaves $8,370.50 in Savings." in reply                      # worked out
 
 
 @pytest.mark.parametrize("cents,phrase", [
-    (50000, "in line with what you usually send Mom"),
-    (120000, "more than you usually send Mom ($500.00)"),
-    (10000, "less than you usually send Mom ($500.00)"),
-    (500000, "about 10× what you usually send Mom ($500.00)"),
+    (50000, "Your usual amount for Mom."),
+    (120000, "More than your usual $500.00 to Mom."),
+    (10000, "Less than your usual $500.00 to Mom."),
+    (500000, "About 10× your usual $500.00 to Mom."),
 ])
 def test_the_comparison_with_what_you_usually_send(cents, phrase):
     assert phrase in _transfer("pay mom some money", cents)["reply"]
@@ -87,29 +87,31 @@ def test_the_comparison_with_what_you_usually_send(cents, phrase):
 def test_a_first_payment_says_so():
     out = _transfer("pay landlord 800", 80000, mention="landlord",
                     payee=("payee_30", "Landlord ··7001"), history=[])
-    assert "It's your first payment to Landlord." in out["reply"]
+    assert "First payment to Landlord." in out["reply"]
 
 
 def test_a_named_account_is_not_called_a_default():
     out = _transfer("send mom 20 from my spending account", 2000,
                     source_mention="spending", acct="acct_joint")
-    assert "from your Spending account" in out["reply"]
-    assert "didn't say which account" not in out["reply"]
+    assert "from Spending" in out["reply"]
+    assert "No account named" not in out["reply"]
     assert "$1,180.00 in Spending" in out["reply"]
     assert out["evidence"]["t1"]["from"] == {"kind": "said", "quote": "spending"}
 
 
 def test_the_extra_check_gives_the_real_reason():
     far = _transfer("pay mom 5000", 500000, extra_check=True)
-    assert "Because that's far more than you usually send Mom, I've texted a code" in far["reply"]
+    assert "About 10× your usual $500.00 to Mom." in far["reply"]
+    assert far["reply"].endswith("I've texted you a code.")
     first = _transfer("pay landlord 800", 80000, mention="landlord", extra_check=True,
                       payee=("payee_30", "Landlord ··7001"), history=[])
-    assert "Because it's your first payment to Landlord, I've texted a code" in first["reply"]
+    assert "First payment to Landlord." in first["reply"]
+    assert first["reply"].endswith("I've texted you a code.")
 
 
 def test_a_chosen_amount_says_what_was_chosen():
     out = _transfer("pay mom 50 no wait 500", 5000, answers={"t1.amount": "50000"})
-    assert "You mentioned $50.00 and $500.00, and chose $500.00." in out["reply"]
+    assert "You chose $500.00 over $50.00." in out["reply"]
     assert out["evidence"]["t1"]["amount"]["kind"] == "chosen"
     assert out["evidence"]["t1"]["amount"]["quote"] == "500"
 
@@ -132,10 +134,10 @@ def test_a_calculated_amount_and_two_payments():
                                 ticker="AAPL", amount_cents=772800, estimated_shares=32,
                                 estimated_fill_price_cents=24150)])
     out = narrate(intent, plan, transcript, accounts=ACCOUNTS, history=MOM_HISTORY)
-    assert "two payments: $500.00 to Mom" in out["reply"]
+    assert "Two payments: $500.00 to Mom" in out["reply"]
     assert "about 32 AAPL shares at $241.50 — $7,728.00" in out["reply"]
-    assert "$7,728.00 is the rest of what's left in Savings" in out["reply"]
-    assert "$192.50 in Savings left afterwards" in out["reply"]
+    assert "$7,728.00 is the rest of Savings." in out["reply"]
+    assert "Leaves $192.50 in Savings." in out["reply"]
     assert out["evidence"]["t2"]["amount"]["kind"] == "calculated"
     assert out["evidence"]["t2"]["from"]["kind"] == "derived"
 
@@ -144,8 +146,7 @@ def test_every_figure_in_the_reply_comes_from_the_plan_or_the_ledger():
     """The reply can never disagree with the card: its payment amount is the
     RESOLVED amount, even if the parser's literal said something else."""
     out = _transfer("pay mom 50 no wait 500", 5000, answers={"t1.amount": "50000"})
-    first_sentence = out["reply"].split(" account.")[0]
-    assert first_sentence.endswith("$500.00 to Mom from your Savings")
+    assert out["reply"].split(". ")[0] == "$500.00 to Mom from Savings"
 
 
 def test_narration_uses_no_model():
@@ -221,7 +222,7 @@ def test_an_account_named_in_other_words_is_not_called_a_default():
     """"using spending": the resolver used the named account, so the reply
     must not say it was a default."""
     out = _transfer("send mom 50 using spending", 5000, source_mention="spending", acct="acct_joint")
-    assert "didn't say which account" not in out["reply"]
+    assert "No account named" not in out["reply"]
     assert out["evidence"]["t1"]["from"] == {"kind": "said", "quote": "spending"}
 
 
@@ -241,22 +242,22 @@ def test_a_zero_in_the_history_does_not_crash():
 def test_a_new_number_is_never_in_line_with_the_usual():
     """Paid before, but not at this number: the usual amount vouches for nothing."""
     out = _transfer("pay mom 500", 50000, new_destination_legs=frozenset({"t1"}))
-    assert "first payment to Mom at this number" in out["reply"]
-    assert "in line with" not in out["reply"]
+    assert "First payment to Mom at this number." in out["reply"]
+    assert "usual" not in out["reply"]
 
 
 def test_a_new_number_with_a_zero_history_is_not_far_more_than_usual():
     out = _transfer("pay mom 50", 5000, history=[{"payee_id": "payee_17", "amount": 0}],
                     extra_check=True, new_destination_legs=frozenset({"t1"}))
-    assert "first payment to Mom at this number" in out["reply"]
-    assert "far more than you usually send" not in out["reply"]
+    assert "First payment to Mom at this number." in out["reply"]
+    assert "usual" not in out["reply"]
 
 
 def test_the_threshold_is_the_policy_engines(monkeypatch):
     """"N× usual" must follow the rule that triggers the check, not a copy."""
     import backend.narrate as mod
     monkeypatch.setattr(mod, "ANOMALY_MULTIPLE", 5)
-    assert "about 6× what you usually send Mom" in _transfer("pay mom 3000", 300000)["reply"]
+    assert "About 6× your usual" in _transfer("pay mom 3000", 300000)["reply"]
 
 
 def test_a_narration_failure_never_breaks_a_draft(client, monkeypatch):

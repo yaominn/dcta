@@ -228,7 +228,9 @@ never the model. Full details: [`docs/SCAM_DECISION_FLOW.md`](docs/SCAM_DECISION
   passkey 4, freeze turned off 4, midnight–5am 1, and **earlier attempts**
   (`scam_attempts`): a retry after a stopped payment 3, a smaller amount after
   it +3, several stopped attempts 2–3, split payments 3, growing amounts 2.
-  Under 3 → sign as normal (a warning may show); 10+ → **BLOCK**; 3–9.9 →
+  Under the ask line (4; 5 for a payment under $500 with no amount fact; 3 when
+  the request's words already score 2+) → sign as normal (a warning may show);
+  10+ → **BLOCK**; from the line to 9.9 →
   **ask** a question picked by the riskiest fact, plus "Is anyone on a call or
   chat with you about it right now?" (never sent to the model).
 - **Threshold 2, the words** of the request and the answer, in 10 Singapore
@@ -240,6 +242,16 @@ never the model. Full details: [`docs/SCAM_DECISION_FLOW.md`](docs/SCAM_DECISION
   The bank telling you to move money ("The bank called me. They told me to
   transfer my savings…") scores 4 like an official, but isn't a never rule:
   banks do sometimes ask you to move money to an account of your own.
+
+**One tap to call for help.** Warned, held, delayed and stopped payments, and
+contacts refused as a likely scam, show buttons to call the DBS Fraud Hotline
+(1800 339 6963) and ScamShield (1799). They're plain `tel:` links (`HELP_LINES`
+in `frontend/app.js`) that change nothing in DCTA. Why buttons and not more
+text: a UK experiment with 8,958 adults (CeDEx, University of Nottingham, August
+2023, as reported in a research summary we haven't checked against the paper)
+found warning text alone cut fraud by 4 points, while buttons that make stopping
+easy, such as cancelling or calling the bank, cut it by 12. And a call the user
+places to a number a scammer didn't give them is hard to script around.
 
 **Typing the name is checked by the server**, not only by the page. The page
 sends the typed name with the signed payment, and the gateway refuses it

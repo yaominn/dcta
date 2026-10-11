@@ -122,6 +122,9 @@ def test_2_tampered_amount_freezes(tmp_path):
     report = validate(intent, tampered, transcript, audit=_audit(tmp_path))
     assert report.verdict == "freeze"
     assert _failed(report, "amount", "t1"), report.checks
+    # The freeze card's sentence, not just the audit detail.
+    fail = next(c for c in report.checks if c["outcome"] == "fail")
+    assert fail["say"] == "You said $500.00, but the draft pays $200.00.", fail
 
 
 # --------------------------------------------------------------------------- 3. tampered beneficiary freezes
@@ -135,6 +138,9 @@ def test_3_tampered_beneficiary_freezes(tmp_path):
     report = validate(intent, tampered, transcript, audit=_audit(tmp_path))
     assert report.verdict == "freeze"
     assert _failed(report, "beneficiary", "t1"), report.checks
+    fail = next(c for c in report.checks if c["check"] == "beneficiary")
+    assert fail["say"].startswith("The draft sends the money to Landlord, "
+                                  "but you didn't say Landlord."), fail
 
 
 # --------------------------------------------------------------------------- 4. symbolic amount does NOT false-positive

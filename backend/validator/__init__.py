@@ -58,7 +58,7 @@ from typing import Protocol
 from backend.audit.canonical import payload_hash, hash_transcript
 from backend.audit.log import AuditEntryType, AuditLog
 from backend.data.db import get_conn
-from backend.display import cents_to_display
+from backend.display import account_label, cents_to_display
 from backend.models.schemas import (
     IntentPlan,
     LiteralAmount,
@@ -228,6 +228,7 @@ def validate(
             "check": "transcript_binding", "leg": "*", "outcome": "fail",
             "detail": (f"plan is bound to transcript {resolved_plan.transcript_hash[:16]}… "
                        f"but was validated against {supplied[:16]}…"),
+            "say": "This draft wasn't made from what you just said. Please ask again.",
         })
         return _finish(draft_id, resolved_plan, checks, soft,
                        llm_check="skipped", audit=audit, fset=fset)
@@ -242,6 +243,7 @@ def validate(
                 "check": "structure", "leg": "*",
                 "outcome": "fail",
                 "detail": f"intent legs {intent_ids} != resolved legs {resolved_ids}",
+                "say": "The draft doesn't have the same payments you asked for.",
             })
         else:
             recomputed = amounts.recompute_symbolic(intent_plan, resolved_plan, conn)
@@ -325,13 +327,16 @@ def _check_amount(ileg, rleg, clause: str, recomputed: dict[str, int], conn) -> 
     if isinstance(ileg.amount, SymbolicAmount):
         expected = recomputed.get(ileg.id)
         if expected is None:
-            return _fail(name, ileg.id, "symbolic recomputation unavailable")
+            return _fail(name, ileg.id, "symbolic recomputation unavailable",
+                         "I couldn't work out the amount myself, so I couldn't check it.")
         if expected != rleg.amount_cents:
             return _fail(
                 name, ileg.id,
                 f"symbolic: independently recomputed {expected}c != resolved "
                 f"{rleg.amount_cents}c (op={ileg.amount.op.value}, "
                 f"after_leg={ileg.amount.after_leg})",
+                f"Working it out from what you said gives {_money(expected)}, "
+                f"but the draft pays {_money(rleg.amount_cents)}.",
             )
         return _pass(name, ileg.id, f"recomputed {expected}c matches")
 
@@ -347,6 +352,7 @@ def _check_amount(ileg, rleg, clause: str, recomputed: dict[str, int], conn) -> 
             name, ileg.id,
             f"literal {lit}c not derivable from its clause {clause!r} "
             f"(clause yields {sorted(derivable) or 'nothing'})",
+            f"The draft pays {_money(lit)}, but you didn't say that amount for this payment.",
         )
     if isinstance(rleg, ResolvedBuyEquity):
         price = amounts._equity_price(conn, rleg.ticker)
@@ -357,6 +363,7 @@ def _check_amount(ileg, rleg, clause: str, recomputed: dict[str, int], conn) -> 
         return _fail(
             name, ileg.id,
             f"resolved {rleg.amount_cents}c != expected {expected}c for literal {lit}c",
+            f"You said {_money(lit)}, but the draft pays {_money(rleg.amount_cents)}.",
         )
     return _pass(name, ileg.id, f"literal {lit}c derivable + consistent")
 
@@ -370,12 +377,15 @@ def _check_competing(ileg, rleg, transcript: str, offered: list[int], answers: d
     if not offered:
         return _fail("amount", ileg.id,
                      "more amounts than payments were said, and which belongs to which "
-                     "payment cannot be told from the words")
+                     "payment cannot be told from the words",
+                     "You said more amounts than payments, so I can't tell which amount "
+                     "goes with which payment.")
     said = " and ".join("$" + cents_to_display(c) for c in offered)
     chosen = answers.get(f"{ileg.id}.amount")
     if chosen not in {str(c) for c in offered}:
         return _fail("amount", ileg.id,
-                     f"you said {said} and no choice between them was confirmed")
+                     f"you said {said} and no choice between them was confirmed",
+                     f"You said {said}, and didn't pick one.")
     confirmed = ileg.model_copy(update={"amount": LiteralAmount(literal_cents=int(chosen))})
     # The chosen figure is one the user SAID for this payment (it is among
     # `offered`), possibly in a follow-up clause — so it is checked against the
@@ -414,9 +424,19 @@ def _check_beneficiary(rleg, transcript: str, conn) -> dict:
         return _fail(name, "?", "unknown leg type")
     if ok:
         return _pass(name, rleg.id, f"{label!r} mentioned in transcript")
+    if not label:
+        say = "The draft pays someone who isn't in your saved contacts."
+    elif isinstance(rleg, ResolvedTransfer):
+        say = (f"The draft sends the money to {label}, but you didn't say {label}. "
+               f"Say the name as it's saved in your contacts.")
+    elif isinstance(rleg, ResolvedPayBill):
+        say = f"The draft pays your {label} bill, but you didn't say {label}."
+    else:
+        say = f"The draft buys {label}, but you didn't name it."
     return _fail(
         name, rleg.id,
         f"{label!r} (from DB) not mentioned in transcript",
+        say,
     )
 
 
@@ -489,7 +509,9 @@ def _check_source_account(rleg, clause: str, transcript: str, conn) -> dict:
                     "detail": f"you said {said_word!r}, and it debits {acct_type!r}"}
         return _fail(name, rleg.id,
                      f"you said {said_word!r} ({said_type}), but the draft debits "
-                     f"{acct_type!r}")
+                     f"{acct_type!r}",
+                     f"You said to pay from {said_word}, but the draft takes the money "
+                     f"from your {account_label(rleg.source_account)} account.")
     if len(named) > 1:
         return {"check": name, "leg": rleg.id, "outcome": "warn",
                 "detail": f"several accounts named ({', '.join(sorted(named.values()))}) "
@@ -560,12 +582,21 @@ def _run_llm_check(transcript: str, resolved_plan: ResolvedPlan,
 
 
 # --------------------------------------------------------------------------- small helpers
+def _money(cents: int) -> str:
+    return "$" + cents_to_display(cents)
+
+
 def _pass(check: str, leg: str, detail: str) -> dict:
     return {"check": check, "leg": leg, "outcome": "pass", "detail": detail}
 
 
-def _fail(check: str, leg: str, detail: str) -> dict:
-    return {"check": check, "leg": leg, "outcome": "fail", "detail": detail}
+def _fail(check: str, leg: str, detail: str, say: str | None = None) -> dict:
+    """`detail` is for the audit log; `say` is the same finding in plain words,
+    for the person whose payment was stopped (the freeze card shows it)."""
+    out = {"check": check, "leg": leg, "outcome": "fail", "detail": detail}
+    if say:
+        out["say"] = say
+    return out
 
 
 def _word_in(needle: str, haystack: str) -> bool:

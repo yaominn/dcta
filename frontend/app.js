@@ -267,6 +267,38 @@ const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "
 /* ---------- scam protection: the sign gate, the hold, the name check ---------- */
 const SIGN_LABEL = "Confirm with biometric";
 
+// Help lines the user can call themselves. Check against the live pages
+// before a demo: dbs.com.sg/personal/scam-defence and scamshield.gov.sg.
+const HELP_LINES = [
+  { label: "Call DBS Fraud Hotline", number: "1800 339 6963", tel: "tel:18003396963",
+    overseas: { number: "+65 6339 6963", tel: "tel:+6563396963" } },
+  { label: "Call ScamShield", number: "1799", tel: "tel:1799" },
+];
+
+// One tap to a call the user places themselves, to a number a scammer on the
+// line didn't give them. Plain tel: links: they cancel, send and change
+// nothing here, and no Confirm gate ever disables them.
+function buildHelpCalls() {
+  const row = el("div", "help-calls");
+  for (const line of HELP_LINES) {
+    const cell = el("div", "help-call-cell");
+    const a = el("a", "btn secondary help-call", line.label + " \u00b7 " + line.number);
+    a.href = line.tel;
+    a.setAttribute("aria-label", line.label + ", " + line.number);
+    cell.append(a);
+    if (line.overseas) {                  // a 1800 number can't be dialled from abroad
+      const note = el("p", "help-note", "Overseas: ");
+      const o = el("a", null, line.overseas.number);
+      o.href = line.overseas.tel;
+      o.setAttribute("aria-label", line.label + " from overseas, " + line.overseas.number);
+      note.append(o);
+      cell.append(note);
+    }
+    row.append(cell);
+  }
+  return row;
+}
+
 // A card calls this with its own button while it is being built: the card
 // isn't on the page yet, so looking "#sign" up would find nothing and leave
 // Confirm enabled through a hold or before the phone code.
@@ -366,9 +398,11 @@ function buildPlanCard(plan, confirmation, narration, transcript, risk) {
   card.append(el("p", "card-title", "Review payment"));
   // Scam warnings: FIXED sentences from the server's rules (policy/scam.py),
   // never model text — the card only renders trusted text.
-  if (risk && risk.warnings && risk.warnings.length) {
+  // Shown whenever the outcome isn't ALLOW, with the help lines to call.
+  if (risk && ((risk.warnings && risk.warnings.length) || (risk.outcome && risk.outcome !== "ALLOW"))) {
     const box = el("div", "scam-warn " + (risk.outcome === "WARN" ? "warn" : "stop"));
-    for (const w of risk.warnings) box.append(el("p", null, "\u26a0\ufe0f " + w));
+    for (const w of risk.warnings || []) box.append(el("p", null, "\u26a0\ufe0f " + w));
+    box.append(buildHelpCalls());
     card.append(box);
   }
   // A large payment waits after Confirm (scam.RELEASE_DELAY_SECONDS) and can
@@ -579,8 +613,9 @@ function showContactRefused(body) {
   card.append(el("p", "lead", "I won't save " + ((body.contact && body.contact.display) || "this contact")
     + ". Nothing was saved and nothing was sent."));
   card.append(riskBox(body.risk || {}, "Why"));
-  card.append(el("p", "scam-help", "If someone asked you to do this, stop. Call the ScamShield "
-    + "Helpline on 1799, or your bank on the number on your card."));
+  card.append(el("p", "scam-help", "If someone asked you to do this, stop and call one of "
+    + "these yourself:"));
+  card.append(buildHelpCalls());
   Voice.speak("I won't save this contact. It looks like a scam. Nothing was sent.");
 }
 
@@ -907,9 +942,9 @@ function showScamBlocked(body) {
   const box = el("div", "scam-warn stop");
   for (const w of body.reasons || []) box.append(el("p", null, "\u26a0\ufe0f " + w));
   card.append(box);
-  card.append(el("p", "scam-help", "If you still need to make it, call your bank on the number "
-    + "on the back of your card. If someone is telling you to make this payment, hang up and call "
-    + "the ScamShield Helpline on 1799."));
+  card.append(el("p", "scam-help", "If you still need to make it, call DBS. If someone is "
+    + "telling you to make this payment, hang up first, then call ScamShield."));
+  card.append(buildHelpCalls());
   Voice.speak("I've stopped this payment. It shows several signs of a scam. Nothing was sent.");
 }
 
@@ -923,7 +958,7 @@ function showScheduled(res) {
   const lead = el("p", "lead", "");
   card.append(lead);
   const cancel = el("button", "btn danger", "Cancel this payment");
-  card.append(cancel);
+  card.append(cancel, buildHelpCalls());
   let left = Math.max(0, res.json.seconds_left || 0);
   const paint = () => {
     lead.textContent = "This is a large payment, so it waits before it's sent. It goes in "
@@ -966,13 +1001,32 @@ function showScheduled(res) {
   };
 }
 
-function showRefusal(title, detail, explanation) {
+// `reasons`: plain sentences for the person. `detail`, if any: the raw checks,
+// folded away under "Technical details".
+function showRefusal(title, reasons, explanation, detail) {
   const card = newResultCard(false);
   card.append(el("h3", null, title));
   card.append(el("p", "lead", explanation));
-  const pre = el("pre");
-  pre.textContent = JSON.stringify(detail, null, 2);   // textContent, never innerHTML (H1)
-  card.append(pre);
+  if (reasons.length) {
+    const ul = el("ul");
+    reasons.forEach(r => ul.append(el("li", null, r)));   // textContent, never innerHTML (H1)
+    card.append(ul);
+  }
+  if (detail) {
+    const more = el("details", "sec");
+    more.append(el("summary", null, "Technical details"));
+    const pre = el("pre");
+    pre.textContent = JSON.stringify(detail, null, 2);
+    more.append(pre);
+    card.append(more);
+  }
+}
+
+// What a validator freeze says: each failed check's plain sentence. A failure
+// with none (an older server) still says which check it was.
+function freezeReasons(checks) {
+  return checks.filter(c => c && c.outcome === "fail")
+    .map(c => c.say || ("The " + String(c.check).replace(/_/g, " ") + " check didn't match."));
 }
 
 /* ---------- the conversation: transcript -> draft, with the clarify loop ---------- */
@@ -994,7 +1048,10 @@ function setStatus(msg) {
 // The two thresholds (policy/scam.py), as the console prints them.
 function thresholdsText(t) {
   if (!t) return "";
-  return "facts <" + t.facts_ask + " pass · " + t.facts_ask + "+ ask · " + t.facts_fail
+  const lines = t.facts_ask_lines;   // this payment's ask line, of the three it can be
+  const which = lines ? " (doubt " + lines.doubt + " / usual " + lines.usual
+    + " / small " + lines.small + ")" : "";
+  return "facts <" + t.facts_ask + " pass · " + t.facts_ask + "+ ask" + which + " · " + t.facts_fail
     + "+ delay · " + t.facts_call_bank + "+ call bank  |  words <" + t.words_fail + " pass · "
     + t.words_fail + "+ delay · " + t.words_serious + "+ code · " + t.words_call_bank + "+ call bank";
 }
@@ -1096,10 +1153,12 @@ function handleDraft(res) {
     return;
   }
   if (body.status === "frozen") {                  // M6 validator freeze
-    showRefusal("Frozen by validator",
-      (body.validation && body.validation.checks) || body.validation || [],
-      "The independent validator found a mismatch between what you said and "
-      + "what was drafted. This draft cannot be signed.");
+    const checks = (body.validation && body.validation.checks) || [];
+    showRefusal("Stopped: this doesn't match what you said",
+      freezeReasons(checks),
+      "Before you approve anything, an independent check compares the draft with "
+      + "your words. It didn't match, so this draft can't be signed and nothing was sent.",
+      body.validation);
     return;
   }
 
@@ -1142,7 +1201,7 @@ function handleDraft(res) {
   // same checked data as the card (backend/narrate.py) — never model text.
   const reply = body.narration && body.narration.reply;
   const intro = el("div", "bubble", reply
-    ? reply + " Check it, then confirm with your biometric."
+    ? reply
     : conf ? "Here's the draft. It's unusual for you, so I need one more check first."
            : "Here's the draft. Check it, then confirm with your biometric.");
   addMsg("bot", intro, buildPlanCard(body.resolved_plan, conf, body.narration, body.transcript,
@@ -1191,6 +1250,7 @@ function renderClarify(body) {
   stopAwaitingNumber();
   const bubble = el("div", "bubble", body.kind === "purpose" && body.questions ? "" : body.question);
   if (body.kind === "purpose" && body.questions) {
+    if (body.note) bubble.append(el("p", null, body.note));            // asked again
     for (const q of body.questions) bubble.append(el("p", null, q));   // fixed server text
   }
   const m = addMsg("bot", bubble);
