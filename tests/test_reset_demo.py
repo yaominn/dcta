@@ -102,14 +102,32 @@ def test_contacts_removed_in_a_rehearsal_come_back(tmp_path):
 
 
 def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
-    """Run before the new server has ever started: no removed_at column yet."""
+    """Run before the new server has ever started: no removed_at column yet.
+
+    The old table is rebuilt without the column rather than dropped from it:
+    ALTER TABLE ... DROP COLUMN fails its schema check on some SQLite builds
+    ("error in table payees after drop column")."""
     db = tmp_path / "ledger.db"
     with contextlib.redirect_stdout(io.StringIO()):
         seed(db)
     conn = connect(db)
     try:
-        conn.execute("ALTER TABLE payees DROP COLUMN removed_at")
+        conn.execute("PRAGMA foreign_keys = OFF")          # history rows point at payees
+        conn.execute("PRAGMA legacy_alter_table = ON")     # rename without re-checking the schema
+        info = [r for r in conn.execute("PRAGMA table_info(payees)") if r["name"] != "removed_at"]
+        # Same columns, types, defaults and primary key (history rows reference it).
+        defs = ", ".join(
+            f'{r["name"]} {r["type"]}' + (" PRIMARY KEY" if r["pk"] else "")
+            + (" NOT NULL" if r["notnull"] else "")
+            + (f' DEFAULT {r["dflt_value"]}' if r["dflt_value"] is not None else "")
+            for r in info)
+        cols = ", ".join(r["name"] for r in info)
+        conn.execute(f"CREATE TABLE payees_old ({defs})")
+        conn.execute(f"INSERT INTO payees_old ({cols}) SELECT {cols} FROM payees")
+        conn.execute("DROP TABLE payees")
+        conn.execute("ALTER TABLE payees_old RENAME TO payees")
         conn.commit()
+        assert "removed_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
     finally:
         conn.close()
 
