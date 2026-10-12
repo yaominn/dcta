@@ -257,3 +257,39 @@ def test_a_question_with_an_amount_in_it_is_still_answered(client, text, label):
         monkey.undo()
     assert d["status"] == "info"
     assert client.get("/api/data").json()["traces"][0]["events"][-1]["label"] == label
+
+
+# --------------------------------------------------------------------------- questions about past payments
+@pytest.mark.parametrize("text,question", [
+    ("can you check if I sent 50 to mom?", True),       # asked politely, about the past
+    ("I paid mom 500 yesterday right?", True),
+    ("did I pay mom 500?", True), ("have I paid the landlord this month", True),
+    ("is it safe to pay landlord 1500?", True), ("I transferred 50 to John, did it arrive", True),
+    ("can you pay mom 50?", False),                     # a polite request IS a payment
+    ("could you send 50 to John", False), ("pay mom 50 dollars", False),
+    ("mom paid for dinner, send her 30", False),        # a new payment beside a past one
+    ("I sent 50 to mom but it failed, send it again", False)])
+def test_a_question_about_money_is_told_apart_from_a_payment(text, question):
+    from backend.agent.router import is_money_question
+    assert is_money_question(text) is question
+
+
+@pytest.mark.parametrize("text", ["can you check if I sent 50 to mom?",
+                                  "I paid mom 500 yesterday right?"])
+def test_a_question_about_a_past_payment_never_drafts_one(client, text):
+    """It goes to the question lane before the payment reader: "I paid mom
+    500 yesterday right?" used to become a new $500 draft."""
+    import backend.main as main
+    parsed = []
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(main, "parse_transcript", lambda *a, **k: parsed.append(a))
+    try:
+        d = _ask(client, text)
+    finally:
+        monkey.undo()
+    assert d["status"] == "info" and "resolved_plan" not in d and parsed == []
+
+
+def test_a_polite_payment_is_still_a_payment(client):
+    d = _ask(client, "can you pay mom 50 dollars?")
+    assert d["status"] == "ready" and d["resolved_plan"]["plan"][0]["amount_cents"] == 5000

@@ -1131,6 +1131,16 @@ def create_draft(req: DraftRequest):
         _traces.event(tid, "contacts", note="read-only; the LLM is not called",
                       count=len(view["contacts"]))
         return view
+    if route == "question":
+        # About money, not moving it ("I paid mom 500 yesterday right?"): the
+        # payment reader never sees it, so it can never become a draft.
+        tid = "ask-" + DraftStore.new_id()
+        _trace_start(tid, req, route)
+        out, calls = _answer_question(req, tid)
+        if settings.console_debug:          # no draft, so no scam score: just the call
+            out["debug"] = {"scam": None, "llm_calls": calls,
+                            "scam_language": scam.phrase_codes(scam.scan_transcript(req.transcript))}
+        return out
 
     provider = RecordingProvider(get_provider(settings))
     fallback = None
@@ -1207,7 +1217,7 @@ def create_draft(req: DraftRequest):
     question_calls: list = []
     if (route == "payment" and out.get("status") == "clarify" and out.get("kind") == "empty"
             and not looks_like_payment(req.transcript)):
-        out, question_calls = _answer_question(req, draft)
+        out, question_calls = _answer_question(req, draft.draft_id)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
     # A refused new contact already carries its own warning: no second one.
@@ -1221,7 +1231,7 @@ def create_draft(req: DraftRequest):
                        provider.calls + question_calls + getattr(draft, "llm_calls", []))
 
 
-def _answer_question(req: DraftRequest, draft: Draft) -> tuple[dict, list]:
+def _answer_question(req: DraftRequest, trace_id: str) -> tuple[dict, list]:
     """Which question a request with no payment is asking. The model picks ONE
     label (backend/agent/question.py) from the user's words alone; the answer
     is fixed sentences from the ledger (backend/answers.py), or the contacts
@@ -1234,7 +1244,7 @@ def _answer_question(req: DraftRequest, draft: Draft) -> tuple[dict, list]:
     else:
         out = answers.reply(label, req.user_id, stopped=_stopped.get(req.user_id))
         said = out["message"]
-    _traces.event(draft.draft_id, "question", provider=classifier.name,
+    _traces.event(trace_id, "question", provider=classifier.name,
                   llm_calls=classifier.calls, label=label, reply=said)
     return out, classifier.calls
 
