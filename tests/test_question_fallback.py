@@ -260,36 +260,59 @@ def test_a_question_with_an_amount_in_it_is_still_answered(client, text, label):
 
 
 # --------------------------------------------------------------------------- questions about past payments
-@pytest.mark.parametrize("text,question", [
+@pytest.mark.parametrize("text,past", [
     ("can you check if I sent 50 to mom?", True),       # asked politely, about the past
     ("I paid mom 500 yesterday right?", True),
     ("did I pay mom 500?", True), ("have I paid the landlord this month", True),
-    ("is it safe to pay landlord 1500?", True), ("I transferred 50 to John, did it arrive", True),
+    ("I transferred 50 to John, did it arrive", True),
     ("can you pay mom 50?", False),                     # a polite request IS a payment
-    ("could you send 50 to John", False), ("pay mom 50 dollars", False),
+    ("could you send 50 to John", False), ("are you able to send 50 to mom?", False),
+    ("is it possible to pay mom 50 now?", False), ("pay mom 50 dollars", False),
+    ("is it safe to pay landlord 1500?", False),        # scored as a payment, as before
+    ("Is mom paid? if not pay her 500", False),         # an instruction after the question
     ("mom paid for dinner, send her 30", False),        # a new payment beside a past one
-    ("I sent 50 to mom but it failed, send it again", False)])
-def test_a_question_about_money_is_told_apart_from_a_payment(text, question):
-    from backend.agent.router import is_money_question
-    assert is_money_question(text) is question
+    ("I sent 50 to mom but it failed, send it again", False),
+    ("I sent 50 to mom but it failed, resend it", False),
+    ("repeat the 50 I sent mom yesterday", False)])
+def test_a_mention_of_a_past_payment_is_told_apart_from_a_new_one(text, past):
+    from backend.agent.router import only_past_payments
+    assert only_past_payments(text) is past
 
 
-@pytest.mark.parametrize("text", ["can you check if I sent 50 to mom?",
-                                  "I paid mom 500 yesterday right?"])
-def test_a_question_about_a_past_payment_never_drafts_one(client, text):
-    """It goes to the question lane before the payment reader: "I paid mom
-    500 yesterday right?" used to become a new $500 draft."""
+def _no_parse(text, client):
     import backend.main as main
     parsed = []
     monkey = pytest.MonkeyPatch()
     monkey.setattr(main, "parse_transcript", lambda *a, **k: parsed.append(a))
     try:
-        d = _ask(client, text)
+        return _ask(client, text), parsed
     finally:
         monkey.undo()
+
+
+@pytest.mark.parametrize("text", ["can you check if I sent 50 to mom?",
+                                  "I paid mom 500 yesterday right?"])
+def test_a_question_about_a_past_payment_never_drafts_one(client, text):
+    """Answered as a question without the payment reader: "I paid mom 500
+    yesterday right?" used to become a new $500 draft."""
+    d, parsed = _no_parse(text, client)
     assert d["status"] == "info" and "resolved_plan" not in d and parsed == []
 
 
-def test_a_polite_payment_is_still_a_payment(client):
-    d = _ask(client, "can you pay mom 50 dollars?")
+def test_a_past_payment_question_is_still_audited(client):
+    from backend.main import _audit
+    before = len([e for e in _audit.all_entries() if e["entry_type"] == "TRANSCRIPT"])
+    _no_parse("did I pay mom 500?", client)
+    assert len([e for e in _audit.all_entries() if e["entry_type"] == "TRANSCRIPT"]) == before + 1
+
+
+def test_a_past_payment_question_still_gets_the_scam_warning(client):
+    """A coached victim asking about the past still hears the warning."""
+    d, _ = _no_parse("did I send 5000 to the safe account the police officer gave me?", client)
+    assert d["status"] == "info" and d.get("scam_language", {}).get("warning")
+
+
+@pytest.mark.parametrize("text", ["can you pay mom 50 dollars?", "are you able to send 50 to mom?"])
+def test_a_polite_payment_is_still_a_payment(client, text):
+    d = _ask(client, text)
     assert d["status"] == "ready" and d["resolved_plan"]["plan"][0]["amount_cents"] == 5000

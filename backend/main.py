@@ -42,7 +42,7 @@ from backend.auth import (
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, assess_scam_risk,
                            build_context, classify_question, classify_request, get_provider,
-                           looks_like_payment,
+                           looks_like_payment, only_past_payments,
                            parse_contact_add, parse_contact_edit, parse_transcript,
                            unknown_payee_fallback)
 from backend.models.contacts import (ContactAddPlan, ContactEditPlan, ResolvedContactAdd,
@@ -1131,19 +1131,12 @@ def create_draft(req: DraftRequest):
         _traces.event(tid, "contacts", note="read-only; the LLM is not called",
                       count=len(view["contacts"]))
         return view
-    if route == "question":
-        # About money, not moving it ("I paid mom 500 yesterday right?"): the
-        # payment reader never sees it, so it can never become a draft.
-        tid = "ask-" + DraftStore.new_id()
-        _trace_start(tid, req, route)
-        out, calls = _answer_question(req, tid)
-        if settings.console_debug:          # no draft, so no scam score: just the call
-            out["debug"] = {"scam": None, "llm_calls": calls,
-                            "scam_language": scam.phrase_codes(scam.scan_transcript(req.transcript))}
-        return out
 
     provider = RecordingProvider(get_provider(settings))
     fallback = None
+    # About a payment, not one ("I paid mom 500 yesterday right?"): answered as
+    # a question below, and never read as a new draft.
+    past_only = route == "payment" and only_past_payments(req.transcript)
     try:
         if route == "contact_edit":
             plan = parse_contact_edit(req.transcript, provider=provider, context=context)
@@ -1152,6 +1145,8 @@ def create_draft(req: DraftRequest):
                                      name_hint=origin["name"] if origin else None)
             if origin and not plan.contact.nickname:
                 plan.contact.nickname = origin["name"]
+        elif past_only:                  # asked about, not asked for: nothing to read
+            plan = IntentPlan.model_validate({"plan": [], "unresolved": []})
         else:
             plan = parse_transcript(req.transcript, provider=provider, context=context)
             # The model dropped everything: a payment to someone who isn't a
@@ -1208,13 +1203,17 @@ def create_draft(req: DraftRequest):
         "user_id": req.user_id,
         "kind": draft.kind,
     })
-    out = _run(draft)
+    question_calls: list = []
+    if past_only:
+        # Still audited (above) and scanned for scam phrases (below).
+        out, question_calls = _answer_question(req, draft.draft_id)
+    else:
+        out = _run(draft)
     _note_stopped(req.user_id, out)
     # No payment in it ("how much do I have?"): answer the question instead of
     # asking for a payment. A payment never reaches this — not even one the
     # parser failed to read ("send 50 to mom" still gets "I didn't catch a
     # payment") — so a payment makes no extra model call.
-    question_calls: list = []
     if (route == "payment" and out.get("status") == "clarify" and out.get("kind") == "empty"
             and not looks_like_payment(req.transcript)):
         out, question_calls = _answer_question(req, draft.draft_id)

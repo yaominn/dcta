@@ -54,7 +54,7 @@ _BARE_BILL = re.compile(
 
 def classify_request(transcript: str) -> str:
     """'contact_list' | 'contact_add' | 'contact_edit' | 'recurring_bill' |
-    'bill_ambiguous' | 'question' | 'payment'."""
+    'bill_ambiguous' | 'payment'."""
     # A request that starts with "add"/"save" is an addition, whatever the
     # name: "add See Toh as a contact" is not "see contacts".
     if _ADD_FIRST.search(transcript) and _ADD.search(transcript):
@@ -69,8 +69,6 @@ def classify_request(transcript: str) -> str:
         return "recurring_bill"
     if _BARE_BILL.search(transcript):
         return "bill_ambiguous"
-    if is_money_question(transcript):
-        return "question"
     return "payment"
 
 
@@ -91,28 +89,25 @@ _AMOUNT = re.compile(
 
 def looks_like_payment(transcript: str) -> bool:
     return bool(_MONEY_VERB.search(transcript) and _AMOUNT.search(transcript)
-                and not _ASKED.search(transcript) and not is_money_question(transcript))
+                and not _ASKED.search(transcript))
 
 
-# A question ABOUT money, not a request to move it. It goes to the question
-# lane before the payment reader ever sees it: "I paid mom 500 yesterday
-# right?" used to become a new $500 draft. Two signs, either is enough:
-#   - only past-tense money words ("sent", "paid") and no present-tense one:
-#     "can you check if I sent 50 to mom?" asks about the past, while
-#     "mom paid for dinner, send her 30" still asks for a payment
-#   - it opens like a yes/no question: "did I pay mom?", "is it safe to pay?"
-# "can/could/would you pay mom 50" is a polite payment, so those openers are
-# not on the list. Not a security decision either way: a mis-route is a
-# read-only answer or a draft the user must still sign.
+# Money mentioned only in the past: "I paid mom 500 yesterday right?", "can
+# you check if I sent 50 to mom?", "did I pay mom?". Asked about, not asked
+# for, so the payment reader must not turn it into a new draft (it did: a
+# $500 one). Any present-tense request beside it ("mom paid for dinner, send
+# her 30", "resend it", "if not pay her 500") keeps it a payment. Not a
+# security decision: a miss is a read-only answer, or a draft still to sign.
 _PAST_MONEY = re.compile(
-    r"\b(?:paid|sent|transferred|gave|bought|purchased|wired|remitted|moved|topped\s+up)\b", re.I)
-_YES_NO = re.compile(r"^\s*(?:did|do|does|is|was|were|has|have|had|am|are)\b", re.I)
+    r"\b(?:paid|sent|transferred|gave|bought|purchased|wired|remitted|moved|topped\s+up)\b"
+    r"|\b(?:did|didn'?t|have|haven'?t|has|hasn'?t|had)\s+(?:\w+\s+){1,2}?"
+    r"(?:pay|send|transfer|give|buy|wire|move)\b", re.I)
+_REQUEST = re.compile(
+    r"\b(?:pay|send|transfer|give(?!\s+me\b)|buy|purchase|wire|remit|move|top\s*up|"
+    r"re-?send|re-?pay|repeat|redo|retry|again)\b", re.I)
 
 
-def is_money_question(transcript: str) -> bool:
-    if not (_MONEY_VERB.search(transcript) or _PAST_MONEY.search(transcript)):
+def only_past_payments(transcript: str) -> bool:
+    if not _PAST_MONEY.search(transcript):
         return False
-    if _YES_NO.search(transcript):
-        return True
-    return bool(_PAST_MONEY.search(transcript)) and not _MONEY_VERB.search(
-        _PAST_MONEY.sub(" ", transcript))
+    return not _REQUEST.search(_PAST_MONEY.sub(" ", transcript))
