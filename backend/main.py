@@ -485,7 +485,6 @@ class ExecuteRequest(BaseModel):
     signature: str | None = None
     nonce: str
     credential_id: str
-    confirm_name: str | None = Field(default=None, max_length=64)   # HOLD_STEP_UP: as typed
 
 
 @app.post("/api/gateway/execute", **_MOCK_ONLY)
@@ -495,8 +494,7 @@ def gateway_execute(req: ExecuteRequest):
     verification failure (brief acceptance test: unsigned request rejected+logged)."""
     return _traced_gateway(req.resolved_plan.draft_id, "mock signer",
                            _gateway.submit(req.resolved_plan, req.signature,
-                                           req.nonce, req.credential_id,
-                                           confirm_name=req.confirm_name))
+                                           req.nonce, req.credential_id))
 
 
 def _traced_gateway(draft_id: str, path: str, out: dict) -> dict:
@@ -625,7 +623,6 @@ class WebAuthnExecuteRequest(BaseModel):
     assertion: dict
     nonce: str
     credential_id: str
-    confirm_name: str | None = Field(default=None, max_length=64)   # HOLD_STEP_UP: as typed
 
 
 @app.post("/api/gateway/execute-webauthn")
@@ -636,8 +633,7 @@ def webauthn_execute(req: WebAuthnExecuteRequest):
     assertion, a stale challenge, or a replayed sign count."""
     return _traced_gateway(req.resolved_plan.draft_id, "WebAuthn",
                            _webauthn_gateway.submit(req.resolved_plan, req.assertion,
-                                                    req.nonce, req.credential_id,
-                                                    confirm_name=req.confirm_name))
+                                                    req.nonce, req.credential_id))
 
 
 # --------------------------------------------------------------------------- M3: LLM parser + opaque IDs
@@ -949,13 +945,8 @@ def _pipeline(draft: Draft) -> dict:
             # the card shows a hold with nothing explaining it.
             warnings.append(_FLOOR_WARNING)
         draft.scam_floor = scam_outcome
-        # confirm_name is for THIS payload (payload_hash): if the draft ends up
-        # keeping an older one (a failure below), the gateway doesn't ask for
-        # a name the card never showed.
         draft.scam = {**assessment.to_dict(), "outcome": scam_outcome,
                       "scored": assessment.outcome, "warnings": warnings,
-                      "confirm_name": (assessment.riskiest_payee
-                                       if scam_outcome == scam.HOLD_STEP_UP else None),
                       "payload_hash": p_hash}
         _audit.append(AuditEntryType.SCAM_ASSESSMENT,
                       {"stage": "draft", "payload_hash": p_hash, **assessment.to_audit()})
@@ -1278,7 +1269,7 @@ def _public_scam(assessment, hold_release: int | None, stored: dict | None) -> d
            "signals": [{"code": s.code, "weight": s.weight, "detail": s.detail}
                        for s in assessment.signals],
            "warnings": stored["warnings"],
-           "confirm_name": stored["confirm_name"], "hold": None,
+           "hold": None,
            "facts": assessment.facts, "words": assessment.words,
            "decision": assessment.decision,
            "release_delay_seconds": scam.release_delay(stored["outcome"])}

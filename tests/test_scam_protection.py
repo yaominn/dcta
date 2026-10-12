@@ -182,11 +182,11 @@ def _landlord(cents, leg_id="t2"):
                             destination_masked="+65 6123 ••01", destination_hash="h")
 
 
-def test_the_name_to_type_is_the_risky_payee_not_the_first():
+def test_a_risky_second_payee_steps_the_whole_plan_up():
     # landlord: first payment 2 + amount (capped) 5 = facts 7, a serious fail
     a = scam.assess(_plan(_mom(5000, leg_id="t1"), _landlord(500000)),
                     _ctx(extra_dests={"payee_30": LANDLORD}))
-    assert a.outcome == "HOLD_STEP_UP" and a.confirm_name == "Landlord"
+    assert a.outcome == "HOLD_STEP_UP"
 
 
 def test_buying_shares_with_the_rest_is_not_a_drain():
@@ -525,16 +525,14 @@ def _newest_code():
     return re.search(r"code (\d{6})", _phone.messages("u_alice")[0]["text"]).group(1)
 
 
-def _execute(client, d, *, credential="cred_alice", name=None):
-    """Straight at the gateway, bypassing the page (and its nonce refusals).
-    `name`: the payee's name as typed on the card (HOLD_STEP_UP)."""
+def _execute(client, d, *, credential="cred_alice"):
+    """Straight at the gateway, bypassing the page (and its nonce refusals)."""
     from backend.main import _nonce_store, _signer
     plan = d["resolved_plan"]
     n = _nonce_store.issue(d["draft_id"])
     sig = _signer.sign(challenge_hash(payload_hash(ResolvedPlan.model_validate(plan)), n))
     return client.post("/api/gateway/execute", json={"resolved_plan": plan, "signature": sig,
-                                                     "nonce": n, "credential_id": credential,
-                                                     "confirm_name": name}).json()
+                                                     "nonce": n, "credential_id": credential}).json()
 
 
 def _change_moms_number(client, number="8123 4567"):
@@ -985,7 +983,7 @@ def test_nothing_is_sent_when_the_hold_ends(client):
     assert _balance() == before
     assert d["scam"]["outcome"] == "HOLD_STEP_UP"               # facts 7 (+1 after midnight)
     _confirm(client, d)
-    assert _execute(client, d, name="Mom")["accepted"] is True   # the user confirms: now it runs
+    assert _execute(client, d)["accepted"] is True   # the user confirms: now it runs
     assert _balance() == before - 50000
 
 
@@ -1014,50 +1012,23 @@ def _confirm(client, d):
 def test_hold_step_up_needs_the_code_after_the_hold(client):
     _change_moms_number(client)
     d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
-    assert d["scam"]["outcome"] == "HOLD_STEP_UP" and d["scam"]["confirm_name"] == "Mom"
+    assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     assert d["requires_extra_confirmation"] is True
     _release_hold_now(d["draft_id"])
-    assert _execute(client, d, name="Mom")["rejection"] == "CONFIRMATION"
+    assert _execute(client, d)["rejection"] == "CONFIRMATION"
     client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
-    assert _execute(client, d, name="Mom")["accepted"] is True
+    assert _execute(client, d)["accepted"] is True
 
 
-def test_hold_step_up_needs_the_name_typed_at_the_gateway(client):
-    """The card's name box only disables a button: a request that skips the
-    page, or a page that skips the box, is refused by the gateway. The typed
-    name is compared as the card compares it, and never logged."""
+def test_hold_step_up_asks_for_no_typed_name(client):
+    """The step-up is the hold and the phone code; the user isn't asked to
+    type the payee's name, and the gateway doesn't ask for one."""
     _change_moms_number(client)
     d = client.post("/api/drafts", json={"transcript": "send mom 500"}).json()
-    assert d["scam"]["confirm_name"] == "Mom"
+    assert d["scam"]["outcome"] == "HOLD_STEP_UP" and "confirm_name" not in d["scam"]
     _release_hold_now(d["draft_id"])
     client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
-    before = _balance()
-    for typed in (None, "", "Mallory", "Mo"):
-        out = _execute(client, d, name=typed)
-        assert out["rejection"] == "CONFIRMATION" and "name" in out["reason"], typed
-    assert _balance() == before
-    assert "Mallory" not in json.dumps(client.get("/api/audit/chain").json())
-    assert _execute(client, d, name="  mOM ")["accepted"] is True
-
-
-def test_the_gateway_compares_the_name_as_the_card_does():
-    """buildNameCheck in frontend/app.js: trimmed as JavaScript trims (a
-    byte-order mark too, which str.strip() keeps), case-insensitive."""
-    assert scam.name_confirmed(" MOM ", "Mom") and scam.name_confirmed("mom", "Mom")
-    assert scam.name_confirmed("\ufeffMom\ufeff\n", "Mom")
-    assert not scam.name_confirmed("Mo", "Mom") and not scam.name_confirmed("Mum", "Mom")
-    assert not scam.name_confirmed(None, "Mom") and not scam.name_confirmed("", "Mom")
-
-
-def test_the_name_to_type_belongs_to_the_payload_it_was_shown_for():
-    """A re-run that fails before its payload is kept leaves the card's older
-    payload in place: the gateway must not ask for the newer run's name."""
-    from backend.drafts import Draft, DraftStore
-    store = DraftStore()
-    store.put(Draft(draft_id="d1", user_id="u_alice", transcript="", intent_plan={},
-                    created_at=time.time(), scam={"confirm_name": "Mom", "payload_hash": "h1"}))
-    assert store.confirm_name_of("d1", "h1") == "Mom"
-    assert store.confirm_name_of("d1", "h2") is None and store.confirm_name_of("gone", "h1") is None
+    assert _execute(client, d)["accepted"] is True
 
 
 def _add_passkeys_now():
@@ -1139,7 +1110,7 @@ def test_a_lower_score_now_does_not_lift_the_phone_code(client):
     assert d["scam"]["outcome"] == "HOLD_STEP_UP"
     _age_moms_number()
     _release_hold_now(d["draft_id"])
-    out = _execute(client, d, name="Mom")
+    out = _execute(client, d)
     assert out["rejection"] == "CONFIRMATION" and "code" in out["reason"]
 
 
@@ -1155,13 +1126,13 @@ def test_a_clarification_does_not_lower_the_safeguards(client):
     d2 = client.post(f"/api/drafts/{d['draft_id']}/clarify",
                      json={"field": f"{leg}.target", "choice_id": "payee_17"}).json()
     assert d2["status"] == "ready" and d2["scam"]["score"] < 7
-    assert d2["scam"]["outcome"] == "HOLD_STEP_UP" and d2["scam"]["confirm_name"] == "Mom"
+    assert d2["scam"]["outcome"] == "HOLD_STEP_UP"
     assert d2["requires_extra_confirmation"] is True
     assert any("riskier earlier" in w for w in d2["scam"]["warnings"])
     _release_hold_now(d["draft_id"])
-    assert _execute(client, d2, name="Mom")["rejection"] == "CONFIRMATION"
+    assert _execute(client, d2)["rejection"] == "CONFIRMATION"
     client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
-    assert _execute(client, d2, name="Mom")["accepted"] is True
+    assert _execute(client, d2)["accepted"] is True
 
 
 def test_a_different_payee_on_the_same_draft_waits_again(client):
@@ -1323,13 +1294,11 @@ def page():
                                      timeout=60, check=True).stdout)
 
 
-def test_only_the_live_card_s_typed_name_goes_to_the_gateway(page):
-    """The name travels with the signed payment, from the card on screen: an
-    older card's box, further up the conversation, is never read."""
-    assert page["typedName"] == {"live": {"confirm_name": " mom"}, "afterNewCard": {}}
+def test_a_step_up_card_signs_without_a_typed_name(page):
+    """The signed payment goes to the gateway with no name typed in."""
     sent = page["signedBody"]
     assert sent["url"].endswith("/api/gateway/execute-webauthn")
-    assert sent["confirm_name"] == " mom" and sent["draft_id"] == "d-step"
+    assert sent["draft_id"] == "d-step" and sent["has_name"] is False
 
 
 def test_a_card_locks_confirm_from_the_moment_it_is_shown(page):
@@ -1403,7 +1372,7 @@ def test_a_question_answered_late_still_leaves_time_to_sign(client):
     _release_hold_now(d["draft_id"])
     if held["requires_extra_confirmation"]:
         client.post(f"/api/drafts/{d['draft_id']}/confirm", json={"code": _newest_code()})
-    assert _execute(client, held, name=held["scam"]["confirm_name"])["accepted"] is True
+    assert _execute(client, held)["accepted"] is True
 
 
 def test_a_draft_still_waiting_on_a_question_expires_on_time():

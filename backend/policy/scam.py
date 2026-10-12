@@ -23,14 +23,13 @@ pattern and slowing them down. So, before a draft can be signed
                 words < 2, facts < 7      PASS
                 words 2-5.9, or facts 7+  FAIL: DELAY (sign, then a wait before
                                           the money moves; can cancel), or
-                                          HOLD_STEP_UP (+ a server hold, a phone
-                                          code and typing the name) when words
+                                          HOLD_STEP_UP (+ a server hold and a
+                                          phone code) when words
                                           4+ or facts 7+
                 words 6+                  BLOCK
 
 Below threshold 1 the words add nothing (a warning sentence can still show).
-HOLD_STEP_UP's phone code and typed name are both checked by the gateway,
-not only the page.
+HOLD_STEP_UP's phone code is checked by the gateway, not only the page.
 
 DETERMINISTIC, NOT THE MODEL. Every signal here is a rule over the ledger and
 the raw transcript. The scam-wording rules (new_contact.py's list, shared with
@@ -146,18 +145,6 @@ def rose_past_drafted(drafted: str | None, fresh: str) -> bool:
     gateway.) `drafted` None (never assessed): nothing to compare."""
     return (drafted is not None and (needs_hold(fresh) or fresh == BLOCK)
             and _RANK[fresh] > _RANK.get(drafted, 0))
-
-
-# JavaScript's String.trim(): whitespace, and the byte-order mark that
-# Python's str.strip() leaves in place.
-_TRIM = re.compile(r"^[\s\ufeff]+|[\s\ufeff]+$")
-
-
-def name_confirmed(typed: str | None, expected: str) -> bool:
-    """HOLD_STEP_UP's type-the-payee's-name check, as the gateway enforces it.
-    The same comparison as the card's (buildNameCheck in frontend/app.js) —
-    trimmed, case-insensitive — so a name the card accepts is never refused."""
-    return _TRIM.sub("", typed or "").lower() == expected.lower()
 
 
 def asks_unasked(fresh, asked: bool) -> bool:
@@ -489,8 +476,6 @@ class ScamAssessment:
     outcome: str
     warnings: tuple[str, ...]
     phrase_codes: list = field(default_factory=list)   # phrase-rule codes, incl. advisory
-    riskiest_payee: str | None = None                  # the transfer the risk points at
-    confirm_name: str | None = None                    # HOLD_STEP_UP: the name to type
     # Every transfer leg to a destination never paid before: not only the first
     # leg per destination (that one alone carries the signal), so the reply
     # vouches for none of them.
@@ -511,7 +496,6 @@ class ScamAssessment:
                 "signals": [{"code": s.code, "weight": s.weight, "detail": s.detail,
                              "leg": s.leg} for s in self.signals],
                 "warnings": list(self.warnings), "phrase_codes": self.phrase_codes,
-                "confirm_name": self.confirm_name,
                 "release_delay_seconds": release_delay(self.outcome),
                 "source": "rules (not the model)"}
 
@@ -824,19 +808,11 @@ def assess(plan, ctx: ScamContext, *, draft_id: str | None = None) -> ScamAssess
             questions += (PURPOSE_QUESTION,)
         questions += (CALL_QUESTION,)
 
-    # HOLD_STEP_UP: type the name of the payee the risk points at, not simply
-    # the first one in the plan (plan order breaks a tie).
-    leg_risk: dict[str, float] = {}
-    for sig in signals:
-        if sig.leg in names:
-            leg_risk[sig.leg] = leg_risk.get(sig.leg, 0) + sig.weight
-    riskiest = names[max(names, key=lambda k: leg_risk.get(k, 0))] if names else None
     return ScamAssessment(
         draft_id=draft_id or plan.draft_id, signals=tuple(signals),
         score=round(facts_score + words_points, 1), outcome=outcome,
         warnings=tuple(dict.fromkeys(warnings)) if outcome != ALLOW else (),
         phrase_codes=phrase_codes(found),
-        riskiest_payee=riskiest, confirm_name=riskiest if outcome == HOLD_STEP_UP else None,
         new_destination_legs=frozenset(new_legs), never_rules=never,
         facts=facts_score, words=words_points, words_weighed=weighed, decision=decision,
         asks=asks, questions=questions, ask_from=line)

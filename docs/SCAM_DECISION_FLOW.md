@@ -73,9 +73,8 @@ user sees and how to try it is in [`SCAM_SCORING.md`](SCAM_SCORING.md).
  │               │   │                   │   │                      │
  │               │   │ words 4+ or facts │   │                      │
  │               │   │ 7+: HOLD_STEP_UP  │   │                      │
- │               │   │ — also a 30s hold,│   │                      │
- │               │   │ a phone code and  │   │                      │
- │               │   │ typing the name   │   │                      │
+ │               │   │ — also a 30s hold │   │                      │
+ │               │   │ and a phone code  │   │                      │
  └───────────────┘   └───────────────────┘   └──────────────────────┘
 ```
 

@@ -485,13 +485,12 @@ def scenario_11_coached_victim(client: TestClient) -> Result:
                "I need to transfer 5000 to landlord immediately, don't tell anyone\".",
                "The customer's own words are checked by RULES on the raw transcript — "
                "not the model, which an injection could switch off: a specific warning, "
-               "a hold, a phone code, typing the payee's name, and a one-tap Cancel.")
+               "a hold, a phone code, and a one-tap Cancel.")
     before = _balance("acct_savings")
     d = _draft(client, "the police officer said I need to transfer 5000 to landlord "
                        "immediately, don't tell anyone")
     risk = d.get("scam") or {}
-    r.line(f"scam score {risk.get('score')}: {risk.get('outcome')} "
-           f"(type-to-confirm: {risk.get('confirm_name')})")
+    r.line(f"scam score {risk.get('score')}: {risk.get('outcome')}")
     for sig in risk.get("signals", []):
         r.line(f"  +{sig['weight']} {sig['code']} — {sig['detail']}")
     r.line(f"warning shown: {(risk.get('warnings') or ['(none)'])[0][:90]}...")

@@ -43,7 +43,7 @@ attempts in [`backend/policy/attempts.py`](../backend/policy/attempts.py).
 | `ALLOW` | A pass with nothing to say | Sign with a passkey as normal. |
 | `WARN` | A pass with a warning | Read the warning on the card, then sign. |
 | `DELAY` | A fail | Sign. The payment then waits **60 seconds** before the money moves, with a **Cancel this payment** button. |
-| `HOLD_STEP_UP` | A fail with words 4+ or facts 7+ | A 30-second wait before Confirm, a code sent to the phone (`/phone`), typing the payee's name, then the same 60-second wait after signing. |
+| `HOLD_STEP_UP` | A fail with words 4+ or facts 7+ | A 30-second wait before Confirm, a code sent to the phone (`/phone`), then the same 60-second wait after signing. |
 | `BLOCK` | A never rule, words 6+, or facts 10+ | Nothing to sign. "If you still need to make it, call your bank on the number on the back of your card", plus the ScamShield Helpline (1799). |
 
 ### The question

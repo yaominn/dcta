@@ -3,8 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b1020" />
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)" />
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)" />
   <title>DCTA Assistant</title>
+  <!-- Theme, colour and other display settings, applied before the first
+       paint. ?theme=light or ?theme=dark overrides them for the visit. -->
+  <script src="/static/settings.js"></script>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -35,47 +39,40 @@
         </div>
 
         <header class="appbar">
-          <div class="avatar" aria-hidden="true">
-            <svg width="20" height="20" viewBox="0 0 24 24"><path fill="currentColor" d="M12 2l1.9 5.6L19.5 9.5l-5.6 1.9L12 17l-1.9-5.6L4.5 9.5l5.6-1.9L12 2Zm6.5 11l.9 2.6 2.6.9-2.6.9-.9 2.6-.9-2.6-2.6-.9 2.6-.9.9-2.6Z"/></svg>
-          </div>
-          <div class="who">
-            <p class="name">DCTA Assistant</p>
-            <p class="sub"><span class="dot"></span>Drafts only · you approve every payment</p>
-          </div>
-          <!-- The assistant's voice. Its icon follows the situation: waves
-               while it is talking (tap = stop now and mute), a speaker when
-               on (tap = mute), a crossed speaker when muted (tap = unmute). -->
-          <button id="sound" class="sound" type="button" data-state="on" hidden
-                  aria-label="Mute the assistant's voice" title="Mute the assistant's voice">
+          <p class="hello">Hi, Alice</p>
+          <!-- Shown only while the assistant is talking: tap to stop it.
+               Turning its voice off for good is in Settings. -->
+          <button id="sound" class="icon-btn sound" type="button" data-state="on" hidden
+                  aria-label="Stop talking" title="Stop talking">
             <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M4 9.5h3.2L12 5.5v13l-4.8-4H4a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1Z"/><path class="w1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.2 9.2a4 4 0 0 1 0 5.6"/><path class="w2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M17.8 6.8a7.5 7.5 0 0 1 0 10.4"/><path class="x" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" d="M15.5 9.5l5 5m0-5-5 5"/></svg>
           </button>
           <!-- Recurring bills: the arrangements, and any payment waiting for
                the user's approval (the badge counts those). -->
-          <button id="bills" class="bills" type="button" title="Recurring bill payments">Bills<span id="bills-badge" class="badge" hidden></span></button>
+          <button id="bills" class="icon-btn bills" type="button" aria-label="Bills" title="Recurring bill payments">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="5" width="16" height="15" rx="3"/><path d="M4 10h16M9 3v4M15 3v4"/></svg>
+            <span id="bills-badge" class="badge" hidden></span>
+          </button>
           <!-- The kill switch: one tap freezes every outgoing payment. -->
-          <button id="freeze" class="freeze" type="button" title="Freeze all outgoing payments">Freeze</button>
-          <div class="shield" title="Every payment needs your biometric">
-            <svg width="20" height="20" viewBox="0 0 24 24"><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" d="M12 3l7 3v5.5c0 4.3-2.9 7.9-7 9.5-4.1-1.6-7-5.2-7-9.5V6l7-3Z"/><path fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" d="M8.8 12.2l2.2 2.2 4.3-4.6"/></svg>
-          </div>
+          <button id="freeze" class="icon-btn freeze" type="button"
+                  aria-label="Freeze all outgoing payments" title="Freeze all outgoing payments">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 2v20M3.3 7l17.4 10M3.3 17L20.7 7M9 4l3 2 3-2M9 20l3-2 3 2"/></svg>
+          </button>
+          <button id="settings-btn" class="icon-btn" type="button" aria-label="Settings" title="Settings"
+                  aria-haspopup="dialog" aria-controls="settings">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10M18 7h2M4 17h4M12 17h8"/><circle cx="16" cy="7" r="2"/><circle cx="10" cy="17" r="2"/></svg>
+          </button>
         </header>
 
         <!-- Live balances, read from the ledger — so the demo can say "from my
              savings" and the audience sees the money leave. Refreshed on load,
              after every executed payment, and when the tab regains focus. -->
         <section id="balances" class="balances" aria-label="Account balances">
-          <div class="bal"><span class="bal-name">Savings</span><span id="bal-savings" class="bal-amt">—</span></div>
-          <div class="bal"><span class="bal-name">Spending</span><span id="bal-joint" class="bal-amt">—</span></div>
-        </section>
-
-        <!-- Shown while the kill switch is engaged: every outgoing payment is
-             refused by the server until the user unfreezes with a phone code. -->
-        <section id="frozen" class="frozen" hidden>
-          <p><strong>All outgoing payments are frozen.</strong> Nothing can be sent until you unfreeze.</p>
-          <button id="unfreeze" type="button" class="btn secondary">Unfreeze with a code</button>
-          <form id="unfreeze-form" class="stepup-form" hidden>
-            <input id="unfreeze-code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" maxlength="6" />
-            <button type="submit" class="btn primary">Unfreeze</button>
-          </form>
+          <p class="bal-label">Total balance</p>
+          <p id="bal-total" class="bal-total">—</p>
+          <div class="bal-split">
+            <div class="bal"><span class="bal-name">Savings</span><span id="bal-savings" class="bal-amt">—</span></div>
+            <div class="bal"><span class="bal-name">Spending</span><span id="bal-joint" class="bal-amt">—</span></div>
+          </div>
         </section>
 
         <!-- The drop-down notification after a payment goes through. Built with
@@ -86,10 +83,15 @@
              so the step-up code shows without a second window. -->
         <div id="sms-banner" class="sms-banner" role="status" aria-live="polite" hidden></div>
 
+        <!-- Dims the app while the live review card is up as a bottom sheet. -->
+        <div class="scrim" aria-hidden="true"></div>
+
         <!-- The conversation. Every value from the server is set with
              textContent (never innerHTML), and a payment is rendered as a
              FIXED-TEMPLATE card from the ResolvedPlan JSON — never from
-             LLM-generated text (brief 4.2). -->
+             LLM-generated text (brief 4.2). The live card (#plan) is shown as
+             a bottom sheet by CSS alone; it stays in the conversation, where
+             it falls back once it is spent. -->
         <main id="thread" class="thread" aria-live="polite">
           <!-- Registration (mock session = u_alice). A passkey is device-bound;
                do this live as part of the demo (brief 10). -->
@@ -107,23 +109,93 @@
           <section id="result" class="result" hidden></section>
         </main>
 
+        <!-- While the microphone is on: the conversation steps aside for one
+             big button (tap = done). Shown by the .listening class on .screen. -->
+        <section id="listen" class="listen" aria-live="polite">
+          <p id="listen-text" class="listen-text">Listening…</p>
+          <button id="listen-orb" class="orb" type="button" aria-label="Stop listening" title="Stop listening">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
+          </button>
+          <button id="listen-type" class="pill-btn" type="button">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="6" width="18" height="12" rx="2.5"/><path d="M7 10h.01M11 10h.01M15 10h.01M7 14h10"/></svg>
+            Type instead
+          </button>
+        </section>
+
         <!-- Say it, or type it. Voice has three tiers (server ASR -> Web
              Speech API -> this text box). The text box is ALWAYS present: if
              the room beats the microphone on stage, you type the same sentence
              and the demo continues (brief §5). -->
         <footer id="say-box" class="composer" hidden>
           <p id="status" class="status" hidden></p>
-          <form id="say-form" class="say-form">
-            <button id="mic" class="mic" type="button" title="Speak">
-              <svg width="20" height="20" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+          <div class="composer-row">
+            <form id="say-form" class="say-form">
+              <input id="say" type="text" autocomplete="off" enterkeyhint="send"
+                     aria-label="Message" placeholder="Type a request…" />
+              <button type="submit" class="send" aria-label="Send" title="Send">
+                <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </form>
+            <button id="mic" class="mic" type="button" aria-label="Speak" title="Speak">
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0M12 17.5V21"/></svg>
             </button>
-            <input id="say" type="text" autocomplete="off" enterkeyhint="send"
-                   placeholder="Pay, invest, or edit a contact…" />
-            <button type="submit" class="send" title="Send">
-              <svg width="18" height="18" viewBox="0 0 24 24"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            </button>
-          </form>
+          </div>
         </footer>
+
+        <!-- Shown while the kill switch is engaged: every outgoing payment is
+             refused by the server until the user unfreezes with a phone code. -->
+        <section id="frozen" class="frozen" hidden aria-labelledby="frozen-title">
+          <button id="frozen-close" class="icon-btn" type="button" aria-label="Back to the assistant" title="Back">
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+          </button>
+          <div class="frozen-hero">
+            <span class="frozen-lock" aria-hidden="true">
+              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/></svg>
+            </span>
+            <div>
+              <h2 id="frozen-title">Payments frozen</h2>
+              <p id="frozen-since" class="frozen-sub">Nothing can leave your accounts</p>
+            </div>
+          </div>
+          <ul class="frozen-rows">
+            <li><span>Money out</span><span class="blocked">Blocked</span></li>
+            <li><span>Money in</span><span class="works">Still works</span></li>
+          </ul>
+          <div class="frozen-actions">
+            <button id="unfreeze" type="button" class="btn solid">Unfreeze</button>
+            <form id="unfreeze-form" class="stepup-form" hidden>
+              <input id="unfreeze-code" inputmode="numeric" autocomplete="one-time-code" placeholder="6-digit code" maxlength="6" aria-label="Code from your phone" />
+              <button type="submit" class="btn solid">Unfreeze</button>
+            </form>
+            <p id="frozen-note" class="frozen-note" role="status">Needs a code from your phone</p>
+          </div>
+        </section>
+
+        <!-- Display settings (settings.js). Kept in this browser only. -->
+        <section id="settings" class="settings" hidden role="dialog" aria-modal="true" aria-labelledby="settings-title">
+          <div class="settings-head">
+            <h2 id="settings-title">Settings</h2>
+            <button id="settings-close" class="icon-btn" type="button" aria-label="Close settings" title="Close">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+            </button>
+          </div>
+          <p class="set-label" id="set-theme-label">Theme</p>
+          <div class="segmented" role="radiogroup" aria-labelledby="set-theme-label">
+            <button type="button" role="radio" data-theme-choice="system">System</button>
+            <button type="button" role="radio" data-theme-choice="light">Light</button>
+            <button type="button" role="radio" data-theme-choice="dark">Dark</button>
+          </div>
+          <p class="set-label" id="set-accent-label">Colour</p>
+          <div id="set-accents" class="swatches" role="radiogroup" aria-labelledby="set-accent-label"></div>
+          <div class="set-list">
+            <label class="set-row"><span>Large text</span><input id="set-large" class="switch" type="checkbox" /></label>
+            <label class="set-row"><span>Hide balances</span><input id="set-privacy" class="switch" type="checkbox" /></label>
+            <label class="set-row" id="set-voice-row"><span>Assistant voice</span><input id="set-voice" class="switch" type="checkbox" /></label>
+            <label class="set-row"><span>Animations</span><input id="set-motion" class="switch" type="checkbox" /></label>
+          </div>
+          <button id="settings-reset" class="btn secondary" type="button">Reset</button>
+        </section>
+
         <div class="homebar" aria-hidden="true"></div>
       </div>
     </div>

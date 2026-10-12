@@ -88,7 +88,7 @@ const env = {
 const app = new Function(...Object.keys(env), SRC + `
   showErr = (msg) => errors.push(msg);
   botSay = (text) => { said.push(text); };
-  return { wireKillSwitch, onDecline, onSign, handleDraft, typedName, showScheduled, CURRENT };`)(
+  return { wireKillSwitch, onDecline, onSign, handleDraft, showScheduled, CURRENT };`)(
   ...Object.values(env));
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 const sign = () => document.getElementById("sign");
@@ -110,7 +110,7 @@ const heldPayment = { status: 200, json: {
                             payee_display: "Mom ··4567", amount_cents: 50000,
                             destination_masked: "+65 8123 ••67" }] },
   scam: { outcome: "HOLD", score: 5, warnings: ["Mom's PayNow number was changed just now."],
-          confirm_name: null, hold: { release_at: now + 30, seconds_left: 30 } } } };
+          hold: { release_at: now + 30, seconds_left: 30 } } } };
 
 (async () => {
   const out = {};
@@ -156,16 +156,13 @@ const heldPayment = { status: 200, json: {
   errors.length = 0;
   said.length = 0;
 
-  // HOLD_STEP_UP: the name typed on the live card goes with the signature; a
-  // newer card retires the box, and its old value is never sent.
+  // HOLD_STEP_UP: the payment is signed and sent with no name typed in.
   const stepUp = JSON.parse(JSON.stringify(heldPayment));
   Object.assign(stepUp.json, { draft_id: "d-step", requires_extra_confirmation: true,
                                confirmation: { reasons: [] } });
-  Object.assign(stepUp.json.scam, { outcome: "HOLD_STEP_UP", score: 8, confirm_name: "Mom" });
+  Object.assign(stepUp.json.scam, { outcome: "HOLD_STEP_UP", score: 8 });
   stepUp.json.resolved_plan.draft_id = "d-step";
   app.handleDraft(stepUp);
-  document.getElementById("name-check").value = " mom";
-  const live = app.typedName();
   let signed = null;
   respond = async (url, opts) => {
     if (url.includes("/api/auth/nonce")) return reply(200, { nonce: "n1", draft_id: "d-step" });
@@ -174,10 +171,9 @@ const heldPayment = { status: 200, json: {
   };
   Object.assign(app.CURRENT, { credentialIds: ["AAAA"], rpId: "localhost" });
   await app.onSign();
-  out.signedBody = signed && { url: signed.url, confirm_name: signed.confirm_name,
+  out.signedBody = signed && { url: signed.url, has_name: "confirm_name" in signed,
                                draft_id: signed.resolved_plan.draft_id };
   app.handleDraft(heldPayment);
-  out.typedName = { live, afterNewCard: app.typedName() };
   errors.length = 0;
   said.length = 0;
 
