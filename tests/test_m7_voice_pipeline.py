@@ -95,9 +95,11 @@ def test_clarify_round_trip_the_ui_performs():
     assert second["resolved_plan"]["plan"][0]["payee_id"] == "payee_22"
 
 
-def test_unparseable_utterance_asks_and_builds_no_plan():
+def test_unparseable_utterance_builds_no_plan():
+    """No payment and no question in it: the question fallback says what the
+    app can help with (tests/test_question_fallback.py), and nothing is drafted."""
     body = _draft("mmmm").json()
-    assert body["status"] == "clarify"
+    assert (body["status"], body["kind"]) == ("info", "answer")
     assert body.get("resolved_plan") is None
 
 

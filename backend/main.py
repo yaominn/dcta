@@ -41,7 +41,8 @@ from backend.auth import (
 )
 from backend.models.schemas import IntentPlan, ResolvedPlan, ResolvedTransfer
 from backend.agent import (ParseFailure, ProviderUnavailable, assess_scam_risk,
-                           build_context, classify_request, get_provider,
+                           build_context, classify_question, classify_request, get_provider,
+                           looks_like_payment,
                            parse_contact_add, parse_contact_edit, parse_transcript,
                            unknown_payee_fallback)
 from backend.models.contacts import (ContactAddPlan, ContactEditPlan, ResolvedContactAdd,
@@ -56,6 +57,7 @@ from backend.validator.contacts import validate_contact_add, validate_contact_ch
 from backend.asr import (MAX_AUDIO_BYTES,
                          ASRNoSpeech, ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
+from backend import answers
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
@@ -1166,6 +1168,15 @@ def create_draft(req: DraftRequest):
         "kind": draft.kind,
     })
     out = _run(draft)
+    _note_stopped(req.user_id, out)
+    # No payment in it ("how much do I have?"): answer the question instead of
+    # asking for a payment. A payment never reaches this — not even one the
+    # parser failed to read ("send 50 to mom" still gets "I didn't catch a
+    # payment") — so a payment makes no extra model call.
+    question_calls: list = []
+    if (route == "payment" and out.get("status") == "clarify" and out.get("kind") == "empty"
+            and not looks_like_payment(req.transcript)):
+        out, question_calls = _answer_question(req, draft)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
     # A refused new contact already carries its own warning: no second one.
@@ -1175,7 +1186,51 @@ def create_draft(req: DraftRequest):
         if scam.strong_codes(found):
             out["scam_language"] = {"codes": scam.phrase_codes(found),
                                     "warning": scam.warning_for(found)}
-    return _with_debug(out, draft, provider.calls + getattr(draft, "llm_calls", []))
+    return _with_debug(out, draft,
+                       provider.calls + question_calls + getattr(draft, "llm_calls", []))
+
+
+def _answer_question(req: DraftRequest, draft: Draft) -> tuple[dict, list]:
+    """Which question a request with no payment is asking. The model picks ONE
+    label (backend/agent/question.py) from the user's words alone; the answer
+    is fixed sentences from the ledger (backend/answers.py), or the contacts
+    list itself. No model text is shown. Recorded on the trace for /data."""
+    classifier = RecordingProvider(get_provider(settings))
+    label = classify_question(req.transcript, provider=classifier)
+    if label == "contacts":
+        out = _contacts_view(req.user_id)
+        said = f"the contacts list ({len(out['contacts'])} contacts)"
+    else:
+        out = answers.reply(label, req.user_id, stopped=_stopped.get(req.user_id))
+        said = out["message"]
+    _traces.event(draft.draft_id, "question", provider=classifier.name,
+                  llm_calls=classifier.calls, label=label, reply=said)
+    return out, classifier.calls
+
+
+# The reason sentences of each user's last stopped request (blocked, frozen, or
+# a refused contact), for "why did you stop that?". Rule text the user was
+# already shown — never the model's words. In memory: drafts themselves are
+# swept after a few minutes, and the audit log keeps the scam checks as codes.
+_stopped: dict[str, list[str]] = {}
+
+
+def _note_stopped(user_id: str, out: dict) -> None:
+    status = out.get("status")
+    if status == "blocked" and out.get("kind") == "contact_add":
+        # The rules' warnings; the model's advisory read ("ai") is left out.
+        reasons = [w.get("text") for w in (out.get("risk") or {}).get("warnings") or []
+                   if w.get("weight") != "ai"]
+    elif status == "blocked":
+        reasons = list(out.get("reasons") or [])
+    elif status == "frozen":
+        reasons = [c.get("say") for c in (out.get("validation") or {}).get("checks") or []
+                   if c.get("outcome") == "fail"]
+    else:
+        return
+    reasons = [r for r in reasons if isinstance(r, str) and r.strip()]
+    if reasons:
+        _stopped[user_id] = reasons
 
 
 # The page adds "Nothing was sent." to a refused signing challenge itself.
@@ -1523,7 +1578,9 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
                                   "status": draft.status})
     draft.answers[answer.field] = answer.choice_id
     _traces.event(draft_id, "answer", field=answer.field, choice_id=answer.choice_id)
-    return _with_debug(_run(draft), draft, getattr(draft, "llm_calls", []))
+    out = _run(draft)
+    _note_stopped(draft.user_id, out)
+    return _with_debug(out, draft, getattr(draft, "llm_calls", []))
 
 
 @app.get("/api/drafts/{draft_id}/release", response_model=None)
@@ -1595,7 +1652,9 @@ def answer_purpose(draft_id: str, body: PurposeAnswer):
         return {"status": "clarify", "draft_id": draft_id, **draft.question}
     draft.purpose = "\n".join(draft.replies)
     draft.unanswered = bool(missing) and out_of_tries
-    return _with_debug(_run(draft), draft, getattr(draft, "llm_calls", []))
+    out = _run(draft)
+    _note_stopped(draft.user_id, out)
+    return _with_debug(out, draft, getattr(draft, "llm_calls", []))
 
 
 # --------------------------------------------------------------------------- decline / cancel

@@ -1251,7 +1251,8 @@ function handleDraft(res) {
       buildMandateCard(body.mandate, body.preview));
     return;
   }
-  if (body.status === "info") {                    // nothing to draft (e.g. unsupported)
+  // A contacts list is "info" too: it is drawn as the list, further down.
+  if (body.status === "info" && body.kind !== "contacts") {   // nothing to draft: a line to say
     botSay(body.message);
     return;
   }

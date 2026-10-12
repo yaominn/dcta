@@ -39,6 +39,8 @@ class StubProvider:
                 user, prompts.NAME_HINT_MARKER)))
         if system == prompts.scam_system_prompt():
             return json.dumps(_rules_scam(transcript, _extract_facts(user)))
+        if system == prompts.question_system_prompt():
+            return json.dumps({"label": _rules_question(transcript)})
         plan = _rules_plan(transcript, context)
         return json.dumps(plan)
 
@@ -50,6 +52,7 @@ def _extract_transcript(user_prompt: str) -> str:
     after = user_prompt.split(prompts.TRANSCRIPT_MARKER, 1)[1]
     for end in (prompts.OUTPUT_FOOTER, prompts.CONTACT_OUTPUT_FOOTER,
                 prompts.CONTACT_ADD_OUTPUT_FOOTER, prompts.SCAM_OUTPUT_FOOTER,
+                prompts.QUESTION_OUTPUT_FOOTER,
                 *prompts.TRAILING_MARKERS):
         after = after.split(end, 1)[0]
     return after.strip()
@@ -418,3 +421,32 @@ def _rules_scam(conversation: str, facts: dict) -> dict:
     reason = ("no scam indicators in what the customer said" if not signals
               else "indicators: " + ", ".join(signals))
     return {"risk": risk, "signals": signals, "reason": reason}
+
+
+# --------------------------------------------------------------------------- questions
+# A question with no payment in it, by keyword: the stub's stand-in for the
+# model's topic label. First match wins, most specific first.
+_QUESTION_RULES = (
+    ("why_stopped", re.compile(
+        r"\bwhy\b.*\b(?:stop|stopped|block|blocked|refus|declin|cancel|"
+        r"didn'?t|did\s+not|won'?t|wouldn'?t|not\s+go|let\s+me)", re.I)),
+    ("recent_payments", re.compile(
+        r"\b(?:recent|recently|last|history|transactions?|spent|spend|spending|"
+        r"where\s+did\s+my\s+money|statement)\b", re.I)),
+    ("balance", re.compile(
+        r"\b(?:balance|how\s+much\s+(?:money\s+)?(?:do\s+i|is|have\s+i)|broke|"
+        r"what'?s\s+in\s+my|left\s+in|funds|money\s+do\s+i\s+have)\b", re.I)),
+    ("contacts", re.compile(
+        r"\b(?:who\s+(?:can|do)\s+i|which\s+people|payees?|contacts?|"
+        r"people\s+i\s+can)\b", re.I)),
+    ("what_can_you_do", re.compile(
+        r"\b(?:what\s+can\s+you|help|how\s+does\s+this|what\s+are\s+you|"
+        r"what\s+do\s+you\s+do)\b", re.I)),
+)
+
+
+def _rules_question(transcript: str) -> str:
+    for label, rule in _QUESTION_RULES:
+        if rule.search(transcript):
+            return label
+    return "off_topic"

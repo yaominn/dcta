@@ -70,3 +70,18 @@ def classify_request(transcript: str) -> str:
     if _BARE_BILL.search(transcript):
         return "bill_ambiguous"
     return "payment"
+
+
+# A money verb AND an amount: a payment the parser failed to read, not a
+# question. It keeps "I didn't catch a payment" and never reaches the question
+# classifier, so a payment makes no extra model call even when parsing fails.
+_MONEY_VERB = re.compile(
+    r"\b(?:pay|paid|send|sent|transfer|give|buy|purchase|wire|remit|move|top\s*up)\b", re.I)
+_AMOUNT = re.compile(
+    r"\d|\$|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"fifteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|"
+    r"grand|half|all|rest|everything)\b", re.I)
+
+
+def looks_like_payment(transcript: str) -> bool:
+    return bool(_MONEY_VERB.search(transcript) and _AMOUNT.search(transcript))

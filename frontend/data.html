@@ -130,6 +130,20 @@
       if (e.error) box.push(el("p", null, "Rejected: " + e.error));
       return box;
     },
+    question(e) {
+      // No payment in it: the model picks ONE label; plain code writes the answer.
+      const out = [];
+      const h1 = el("h3"); h1.append(who("llm"), document.createTextNode("Which question is it? — one label from a fixed list"));
+      out.push(h1);
+      (e.llm_calls || []).forEach((c, i) => {
+        if (i === 0) out.push(block("System prompt — the labels it may choose", c.system, false));
+        out.push(block("User prompt — your words only, no account data", c.user, false));
+        out.push(c.error ? block("Call failed", c.error, true) : block(`Raw reply · ${c.ms} ms`, c.output, true, "reply"));
+      });
+      const h2 = el("h3"); h2.append(who("code"), document.createTextNode("Answer — fixed sentences from your accounts"));
+      out.push(h2, el("p", null, `Label: ${e.label}`), el("p", "muted", "Said: " + e.reply));
+      return out;
+    },
     contacts(e) {
       const h = el("h3"); h.append(who("code"), document.createTextNode("Contacts list"));
       return [h, el("p", "muted", `${e.note}. ${e.count} contacts shown.`)];
@@ -226,6 +240,7 @@
     const sc = last("scam_check"); if (sc && sc.rung === "REFUSE") return ["bad", "NOT ADDED"];
     const parse = last("parse"); if (parse && parse.error) return ["bad", "PARSE FAILED"];
     if (last("contacts")) return ["ok", "LISTED"];
+    if (last("question")) return ["ok", "ANSWERED"];
     const r = last("resolve"); const lastEv = ev[ev.length - 1];
     if (lastEv && lastEv.step === "resolve" && r.outcome === "question") return ["wait", "ASKED"];
     if (last("step_up") && !(last("confirm") || {}).ok) return ["wait", "AWAITING CODE"];
