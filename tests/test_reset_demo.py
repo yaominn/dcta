@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import sqlite3
 import time
 
 from backend.data.db import connect
@@ -101,33 +102,41 @@ def test_contacts_removed_in_a_rehearsal_come_back(tmp_path):
     assert out["not_restored"] == ["Landlord ··7001", "Mom ··3310"]
 
 
-def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
-    """Run before the new server has ever started: no removed_at column yet.
+# payees before removed_at (contact removal): the shape an older demo DB has.
+_PAYEES_BEFORE_REMOVED_AT = """
+    CREATE TABLE payees (
+        id              TEXT PRIMARY KEY,
+        user_id         TEXT NOT NULL REFERENCES users(id),
+        nickname        TEXT NOT NULL,
+        legal_name      TEXT NOT NULL,
+        last4           TEXT NOT NULL,
+        phone           TEXT,
+        added_at        INTEGER,
+        hold_until      INTEGER,
+        dest_version    INTEGER NOT NULL DEFAULT 1,
+        dest_changed_at INTEGER
+    )"""
 
-    The old table is rebuilt without the column rather than dropped from it:
-    ALTER TABLE ... DROP COLUMN fails its schema check on some SQLite builds
-    ("error in table payees after drop column")."""
+
+def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
+    """A ledger from before removed_at, reset before the new server has ever
+    started (startup is what migrates).
+
+    The old table is swapped in rather than made with ALTER TABLE ... DROP
+    COLUMN: that failed its schema check on Zach's machine ("error in table
+    payees after drop column"; fine on SQLite 3.53.4). No ALTER at all here."""
     db = tmp_path / "ledger.db"
     with contextlib.redirect_stdout(io.StringIO()):
         seed(db)
-    conn = connect(db)
+    cols = ("id, user_id, nickname, legal_name, last4, phone, added_at, hold_until, "
+            "dest_version, dest_changed_at")
+    conn = sqlite3.connect(db)          # foreign keys off (the default): payees can be swapped
     try:
-        conn.execute("PRAGMA foreign_keys = OFF")          # history rows point at payees
-        conn.execute("PRAGMA legacy_alter_table = ON")     # rename without re-checking the schema
-        info = [r for r in conn.execute("PRAGMA table_info(payees)") if r["name"] != "removed_at"]
-        # Same columns, types, defaults and primary key (history rows reference it).
-        defs = ", ".join(
-            f'{r["name"]} {r["type"]}' + (" PRIMARY KEY" if r["pk"] else "")
-            + (" NOT NULL" if r["notnull"] else "")
-            + (f' DEFAULT {r["dflt_value"]}' if r["dflt_value"] is not None else "")
-            for r in info)
-        cols = ", ".join(r["name"] for r in info)
-        conn.execute(f"CREATE TABLE payees_old ({defs})")
-        conn.execute(f"INSERT INTO payees_old ({cols}) SELECT {cols} FROM payees")
+        rows = conn.execute(f"SELECT {cols} FROM payees").fetchall()
         conn.execute("DROP TABLE payees")
-        conn.execute("ALTER TABLE payees_old RENAME TO payees")
+        conn.execute(_PAYEES_BEFORE_REMOVED_AT)
+        conn.executemany(f"INSERT INTO payees ({cols}) VALUES ({', '.join('?' * 10)})", rows)
         conn.commit()
-        assert "removed_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
     finally:
         conn.close()
 
@@ -135,7 +144,11 @@ def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
 
     conn = connect(db)
     try:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
+        cols_now = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
+        payees = conn.execute("SELECT COUNT(*), COUNT(removed_at) FROM payees").fetchone()
     finally:
         conn.close()
-    assert "removed_at" in cols and out["not_restored"] == []
+    assert "removed_at" in cols_now
+    assert tuple(payees) == (len(rows), 0) and len(rows) == 4      # every contact kept, none removed
+    assert out["balances"] == {a[0]: a[3] for a in ACCOUNTS}          # and the reset itself ran
+    assert out["history_rows"] == 18 and out["not_restored"] == []
