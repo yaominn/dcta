@@ -246,7 +246,7 @@ never the model. Full details: [`docs/SCAM_DECISION_FLOW.md`](docs/SCAM_DECISION
   [`docs/SCAM_WORD_WEIGHTS.md`](docs/SCAM_WORD_WEIGHTS.md)): under 2 (and facts
   under 7) → sign; 2+ or facts 7+ → **DELAY**, a 60-second wait after signing
   that can be cancelled — words 4+ or facts 7+ make it **HOLD_STEP_UP** (+ a
-  30-second hold, a phone code and typing the payee's name); 6+ → **BLOCK**.
+  30-second hold and a phone code); 6+ → **BLOCK**.
   The bank telling you to move money ("The bank called me. They told me to
   transfer my savings…") scores 4 like an official, but isn't a never rule:
   banks do sometimes ask you to move money to an account of your own.
@@ -260,14 +260,6 @@ text: a UK experiment with 8,958 adults (CeDEx, University of Nottingham, August
 found warning text alone cut fraud by 4 points, while buttons that make stopping
 easy, such as cancelling or calling the bank, cut it by 12. And a call the user
 places to a number a scammer didn't give them is hard to script around.
-
-**Typing the name is checked by the server**, not only by the page. The page
-sends the typed name with the signed payment, and the gateway refuses it
-(`CONFIRMATION`) unless it matches the name the card asked for with that exact
-payment. It's compared the way the page compares it (trimmed,
-case-insensitive), so " landlord " is accepted. The name isn't part of what's
-signed and is never written to the audit log. A modified page, or a request
-sent straight to the gateway, can't skip it.
 
 **Reported numbers are never paid** (`backend/policy/new_contact.py`,
 `is_reported`). The mock scam-number list (`+65 8888 1234`, `+65 9999 1234`,
@@ -1138,7 +1130,7 @@ can show — both attack **our own code**, not the model:
     server-enforced hold, and a one-tap Cancel.
 11. **A coached victim** — "the police officer said I need to transfer 5000 to
     landlord immediately, don't tell anyone". Rules on the raw transcript flag
-    it: a specific warning, a hold, a phone code, typing the payee's name.
+    it: a specific warning, a hold, a phone code.
 12. **A benign control** — $50 to a long-standing payee goes through with no
     extra friction at all.
 

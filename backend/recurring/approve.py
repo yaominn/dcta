@@ -95,7 +95,7 @@ def build_draft(mandate_id: str, seq: int, *, user_id: str, db_path, now: int,
         draft.scam = {**assessment.to_dict(), "payload_hash": None}
         return draft, terms, verdicts, assessment
     draft.scam_floor = assessment.outcome
-    draft.scam = {**assessment.to_dict(), "confirm_name": None,
+    draft.scam = {**assessment.to_dict(),
                   "payload_hash": payload_hash(plan), "scored": assessment.outcome}
     draft.resolved_plan = plan
     draft.status = "ready"

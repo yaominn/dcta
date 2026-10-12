@@ -182,9 +182,19 @@ function el(tag, cls, text) {
 }
 const thread = () => document.getElementById("thread");
 
+// While the live card is up as a bottom sheet, the conversation gets room
+// underneath it, so its last lines (what the user just said) stay in view
+// above the sheet.
 function scrollDown() {
   const t = thread();
-  requestAnimationFrame(() => { t.scrollTop = t.scrollHeight; });
+  requestAnimationFrame(() => {
+    const live = document.getElementById("plan");
+    const composer = document.getElementById("say-box");
+    const covered = live && live.offsetHeight
+      ? live.offsetHeight - (composer && !composer.hidden ? composer.offsetHeight : 0) : 0;
+    t.style.paddingBottom = covered > 0 ? covered + 12 + "px" : "";
+    t.scrollTop = t.scrollHeight;
+  });
 }
 function addMsg(who, ...children) {
   const m = el("section", "msg " + who);
@@ -213,15 +223,18 @@ function typing(on) {
    the live controls are unambiguous. A newer card retires the older one:
    its ids are dropped and its controls disabled — an old draft can't be
    signed from further up the conversation. */
-const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign", "decline", "name-check",
-                  "stepup", "stepup-reason", "stepup-form", "stepup-code"];
+const LIVE_IDS = ["plan", "legs", "window", "txhash", "phash", "sign", "decline",
+                  "stepup", "stepup-form", "stepup-code"];
 function retireLiveCard() {
   clearInterval(CURRENT.holdTimer);
   CURRENT.gate = {};                  // a new card starts with no gates of its own
   // Every control on the spent card, not only the ones with ids — the
   // step-up Verify button stayed live after a Cancel.
   const live = document.getElementById("plan");
-  if (live) live.querySelectorAll("button, input").forEach((n) => { n.disabled = true; });
+  if (live) {
+    live.querySelectorAll("button, input").forEach((n) => { n.disabled = true; });
+    live.classList.add("retired");    // back in the conversation, without its controls
+  }
   for (const id of LIVE_IDS) {
     const n = document.getElementById(id);
     if (!n) continue;
@@ -305,7 +318,7 @@ function buildHelpCalls() {
 function updateSignGate(btn = document.getElementById("sign")) {
   if (!btn) return;
   const g = CURRENT.gate || {};
-  btn.disabled = !!(g.code || g.name || g.hold);
+  btn.disabled = !!(g.code || g.hold);
 }
 
 // A server-enforced hold, shown as a countdown. When it ends NOTHING is sent:
@@ -317,8 +330,7 @@ function startHoldCountdown(seconds, cardBtn) {
     const btn = cardBtn || document.getElementById("sign");
     if (!btn) { clearInterval(CURRENT.holdTimer); return; }
     if (left > 0) {
-      btn.textContent = "\u23f3 Confirm available in " + Math.floor(left / 60) + ":"
-        + String(left % 60).padStart(2, "0");
+      btn.textContent = "Confirm in " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
     } else {
       clearInterval(CURRENT.holdTimer);
       btn.textContent = SIGN_LABEL;
@@ -329,21 +341,6 @@ function startHoldCountdown(seconds, cardBtn) {
   };
   paint();
   CURRENT.holdTimer = setInterval(paint, 1000);
-}
-
-function buildNameCheck(name) {
-  const box = el("div", "name-check");
-  box.append(el("label", null, "To continue, type " + name + "\u2019s name:"));
-  const input = el("input");
-  input.type = "text";
-  input.autocomplete = "off";
-  input.id = "name-check";
-  input.oninput = () => {
-    CURRENT.gate.name = input.value.trim().toLowerCase() !== name.toLowerCase();
-    updateSignGate();
-  };
-  box.append(input);
-  return box;
 }
 
 function evidenceText(ev, leg) {
@@ -367,12 +364,14 @@ function evidenceText(ev, leg) {
 
 function legRow(leg, ev) {
   const row = el("div", "leg");
-  row.append(el("div", "icon", LEG_ICON[leg.type] || "•"));
   // payee_display / biller_display are already the safe DB-sourced labels
   // (nickname + last 4). Raw ids are internal and never shown.
+  const who = leg.payee_display || leg.biller_display;
+  const kind = leg.type === "PAY_BILL" ? "bill" : leg.type === "BUY_EQUITY" ? "equity" : "person";
+  row.append(el("div", "icon " + kind,
+    leg.type === "BUY_EQUITY" ? LEG_ICON.BUY_EQUITY : who ? who.charAt(0).toUpperCase() : LEG_ICON[leg.type] || "•"));
   let title = LEG_NAME[leg.type] || leg.type;
-  if (leg.payee_display) title = "To " + leg.payee_display;
-  if (leg.biller_display) title = "To " + leg.biller_display;
+  if (who) title = who;
   if (leg.type === "BUY_EQUITY" && leg.ticker) {
     title = (leg.estimated_shares != null ? leg.estimated_shares + " × " : "") + leg.ticker;
   }
@@ -395,37 +394,32 @@ function buildPlanCard(plan, confirmation, narration, transcript, risk) {
   retireLiveCard();
   const card = el("div", "bubble card plan-card plan");
   card.id = "plan";
-  card.append(el("p", "card-title", "Review payment"));
   // Scam warnings: FIXED sentences from the server's rules (policy/scam.py),
   // never model text — the card only renders trusted text.
   // Shown whenever the outcome isn't ALLOW, with the help lines to call.
   if (risk && ((risk.warnings && risk.warnings.length) || (risk.outcome && risk.outcome !== "ALLOW"))) {
+    card.classList.add("risky");                     // the sheet gets a red edge
     const box = el("div", "scam-warn " + (risk.outcome === "WARN" ? "warn" : "stop"));
-    for (const w of risk.warnings || []) box.append(el("p", null, "\u26a0\ufe0f " + w));
+    box.append(el("p", "scam-title", risk.outcome === "WARN" ? "Check this first" : "Slow down"));
+    for (const w of risk.warnings || []) box.append(el("p", null, w));
     box.append(buildHelpCalls());
     card.append(box);
   }
-  // A large payment waits after Confirm (scam.RELEASE_DELAY_SECONDS) and can
-  // still be cancelled: say so before the user signs.
-  if (risk && risk.release_delay_seconds) {
-    card.append(el("p", "hint", "\u23f1 Large payment: after you confirm, it waits "
-      + risk.release_delay_seconds + " seconds before it's sent, and you can still cancel it."));
-  }
-  // The server's copy of what was said — what the draft was actually built from.
-  if (transcript) card.append(el("p", "said", "You said: \u201c" + transcript + "\u201d"));
 
-  const legs = el("div", "legs"); legs.id = "legs";
+  const legs = el("div", "legs" + (plan.plan.length === 1 ? " one" : "")); legs.id = "legs";
   const ev = (narration && narration.evidence) || {};
   for (const leg of plan.plan) legs.append(legRow(leg, ev[leg.id]));
   card.append(legs);
 
   const sec = el("details", "sec");
-  sec.append(el("summary", null, "Security details"));
+  sec.append(el("summary", null, "Details"));
   const dl = el("dl", "meta");
   const add = (k, v, id, cls) => {
     const dd = el("dd", cls, v); if (id) dd.id = id;
     dl.append(el("dt", null, k), dd);
   };
+  // The server's copy of what was said — what the draft was actually built from.
+  if (transcript) add("You said", "\u201c" + transcript + "\u201d");
   add("Authorization window", windowLabel(plan.created_at, plan.expires_at), "window");
   add("Transcript hash", plan.transcript_hash.slice(0, 16) + "…", "txhash", "mono");
   // Computed at sign time; a placeholder reads better than an empty row.
@@ -435,23 +429,21 @@ function buildPlanCard(plan, confirmation, narration, transcript, risk) {
 
   if (confirmation) card.append(buildStepUp(confirmation));
 
-  // HOLD_STEP_UP: type the payee's name. Someone rushing through a coached
-  // call is more likely to stop at typing than at a button. (UX friction; the
-  // server enforces the hold and the code whatever this page does.)
-  if (risk && risk.confirm_name) card.append(buildNameCheck(risk.confirm_name));
-
   const btn = el("button", "btn primary", SIGN_LABEL);
   btn.id = "sign";
   btn.onclick = onSign;
   // Gates that must ALL clear before Confirm enables — each is UX only; the
   // gateway refuses an unconfirmed, unheld or unbound payment regardless.
-  CURRENT.gate = { code: !!confirmation, name: !!(risk && risk.confirm_name),
-                   hold: !!(risk && risk.hold && risk.hold.seconds_left > 0) };
-  card.append(btn, declineButton());
+  CURRENT.gate = { code: !!confirmation, hold: !!(risk && risk.hold && risk.hold.seconds_left > 0) };
+  card.append(btn);
+  // A large payment waits after Confirm (scam.RELEASE_DELAY_SECONDS) and can
+  // still be cancelled: say so before the user signs, under the button.
+  if (risk && risk.release_delay_seconds) {
+    card.append(el("p", "hint", "Sends " + risk.release_delay_seconds + "s after you confirm"));
+  }
+  card.append(declineButton());
   if (CURRENT.gate.hold) startHoldCountdown(risk.hold.seconds_left, btn);
   updateSignGate(btn);
-  card.append(el("p", "hint",
-    "Your device signs a hash of exactly this payment, recomputed in your browser."));
   return card;
 }
 
@@ -462,7 +454,7 @@ function buildChangeCard(change, confirmation) {
   retireLiveCard();
   const card = el("div", "bubble card plan-card plan");
   card.id = "plan";
-  card.append(el("p", "card-title", "Review change"));
+  card.append(el("p", "card-title", "Change contact"));
   const legs = el("div", "legs"); legs.id = "legs";
   for (const e of change.edits) {
     const row = el("div", "leg change");
@@ -480,7 +472,7 @@ function buildChangeCard(change, confirmation) {
   card.append(legs);
 
   const sec = el("details", "sec");
-  sec.append(el("summary", null, "Security details"));
+  sec.append(el("summary", null, "Details"));
   const dl = el("dl", "meta");
   const add = (k, v, id, cls) => {
     const dd = el("dd", cls, v); if (id) dd.id = id;
@@ -501,8 +493,6 @@ function buildChangeCard(change, confirmation) {
   updateSignGate(btn);
   btn.onclick = onSign;
   card.append(btn, declineButton());
-  card.append(el("p", "hint",
-    "Nothing changes until you confirm. Your device signs exactly this change."));
   return card;
 }
 
@@ -523,7 +513,7 @@ function buildContactsCard(contacts) {
     ul.append(li);
   }
   card.append(ul, buildAddContactForm());
-  card.append(el("p", "hint", "To rename someone or change a number, just say it."));
+  card.append(el("p", "hint", "Say it to rename someone or change a number."));
   return card;
 }
 
@@ -610,7 +600,7 @@ function buildAddContactForm() {
 }
 
 function showContactsCard(contacts) {
-  addMsg("bot", el("div", "bubble", "Here are your saved contacts."), buildContactsCard(contacts));
+  addMsg("bot", buildContactsCard(contacts));
 }
 
 /* The greeting's one button: the list, straight from the server (no model). */
@@ -654,7 +644,7 @@ function buildAddCard(add, risk, confirmation) {
   retireLiveCard();
   const card = el("div", "bubble card plan-card plan");
   card.id = "plan";
-  card.append(el("p", "card-title", "Add new contact"));
+  card.append(el("p", "card-title", "New contact"));
   const legs = el("div", "legs"); legs.id = "legs";
   const row = el("div", "leg change");
   row.append(el("div", "icon", "+"), el("div", "title", add.nickname), el("div", "amt", ""));
@@ -683,7 +673,7 @@ function buildAddCard(add, risk, confirmation) {
   card.append(el("p", "sg-title", "Safeguards"), sg);
 
   const sec = el("details", "sec");
-  sec.append(el("summary", null, "Security details"));
+  sec.append(el("summary", null, "Details"));
   const dl = el("dl", "meta");
   const addRow = (k, v, id, cls) => {
     const dd = el("dd", cls, v); if (id) dd.id = id;
@@ -703,8 +693,6 @@ function buildAddCard(add, risk, confirmation) {
   updateSignGate(btn);
   btn.onclick = onSign;
   card.append(btn, declineButton());
-  card.append(el("p", "hint", "Nothing is saved until you confirm. Your device signs exactly "
-    + "this contact and these safeguards."));
   return card;
 }
 
@@ -712,12 +700,10 @@ function showContactRefused(body) {
   retireLiveCard();
   CURRENT.afterAdd = null;
   const card = newResultCard(false);
-  card.append(el("h3", null, "NOT ADDED"));
-  card.append(el("p", "lead", "I won't save " + ((body.contact && body.contact.display) || "this contact")
-    + ". Nothing was saved and nothing was sent."));
+  card.append(el("h3", null, "Not added"));
+  card.append(el("p", "lead", "Nothing was saved."));
   card.append(riskBox(body.risk || {}, "Why"));
-  card.append(el("p", "scam-help", "If someone asked you to do this, stop and call one of "
-    + "these yourself:"));
+  card.append(el("p", "scam-help", "Asked to do this? Stop and call:"));
   card.append(buildHelpCalls());
   Voice.speak("I won't save this contact. It looks like a scam. Nothing was sent.");
 }
@@ -743,24 +729,23 @@ function stopAwaitingNumber() {
   NEW_CONTACT = null;
   PURPOSE_FOR = null;
   const input = document.getElementById("say");
-  if (input) input.placeholder = "Pay, invest, or edit a contact\u2026";
+  if (input) input.placeholder = "Type a request\u2026";
 }
 
 /* Out-of-band step-up. The code is NOT in any response this page receives: it
    goes to the user's phone, in a message describing the payment from the
    server's copy of the plan. */
 function buildStepUp(conf) {
+  // Why the code is needed is the server's sentence: read by screen readers
+  // and kept on the box, but the sheet itself just asks for the code.
   const box = el("div", "stepup"); box.id = "stepup";
-  box.append(el("p", "stepup-title", "Extra confirmation needed"));
-  const reason = el("p", "stepup-reason", (conf.reasons || []).join(" "));
-  reason.id = "stepup-reason";
-  box.append(reason);
-  const hint = el("p", "hint", "We texted a 6-digit code to your phone. Check the details in the "
-    + "message at the top of the screen, then enter it. ");
-  const a = el("a", null, "Open the demo phone");
+  box.setAttribute("aria-label", "Code from your phone. " + (conf.reasons || []).join(" "));
+  const head = el("div", "stepup-head");
+  head.append(el("p", "stepup-title", "Code from your phone"));
+  const a = el("a", "stepup-link", "Open phone");
   a.href = "/phone"; a.target = "dcta-phone";
-  hint.append(a);
-  box.append(hint);
+  head.append(a);
+  box.append(head);
 
   const form = el("form", "stepup-form"); form.id = "stepup-form";
   const input = el("input"); input.id = "stepup-code";
@@ -780,14 +765,12 @@ function buildStepUp(conf) {
     if (res.status === 200) {
       input.disabled = true;
       box.classList.add("done");
-      box.querySelector(".stepup-title").textContent = "Confirmed on your phone";
+      box.querySelector(".stepup-title").textContent = "Code confirmed \u2713";
       form.remove();
       CURRENT.gate = CURRENT.gate || {};
-      CURRENT.gate.code = false;          // one gate of several (hold, name, code)
+      CURRENT.gate.code = false;          // one gate of two (hold, code)
       updateSignGate();
-      botSay("Code accepted. Confirm with your biometric to "
-        + (CURRENT.kind === "contact_add" ? "save the contact."
-           : CURRENT.kind === "contact_edit" ? "make the change." : "send it."));
+      botSay("Code accepted.");
       return;
     }
     go.disabled = false;
@@ -802,19 +785,32 @@ function buildStepUp(conf) {
 function showErr(msg) {
   typing(false);
   botSay(msg, "error");
+  // The conversation is behind the sheet: say it on the live card too.
+  const live = document.getElementById("plan");
+  if (!live || !live.querySelector) return;
+  let note = live.querySelector(".sheet-note");
+  if (!note) {
+    note = el("p", "sheet-note");
+    note.setAttribute("role", "alert");
+    const sign = document.getElementById("sign");
+    if (sign && sign.parentNode === live && live.insertBefore) live.insertBefore(note, sign);
+    else live.append(note);
+  }
+  note.textContent = msg;
 }
 
 /* ---------- results ---------- */
 /* #result is always the LATEST outcome card. showResult / showRefusal move the
    id to a new card; an empty placeholder (the static one) is removed. */
-function newResultCard(ok) {
+// `tone`: "neutral" for an outcome that is neither good nor bad (cancelled).
+function newResultCard(ok, tone) {
   typing(false);
   const prev = document.getElementById("result");
   if (prev) {
     prev.removeAttribute("id");
     if (!prev.childElementCount) prev.remove();
   }
-  const box = el("section", "msg bot result " + (ok ? "ok" : "bad"));
+  const box = el("section", "msg bot result " + (ok ? "ok" : "bad") + (tone ? " " + tone : ""));
   box.id = "result";
   const card = el("div", "bubble card");
   box.append(card);
@@ -823,22 +819,26 @@ function newResultCard(ok) {
   return card;
 }
 
+// Leg statuses as words, for the result cards.
+const LEG_STATUS = { EXECUTED: "Sent", FAILED: "Failed", SKIPPED: "Not sent" };
+function legStatusText(s) { return LEG_STATUS[s] || s; }
+
 // A repeat of a draft that already ran. Not a failure: the one real execution
 // is shown, stated as such, so a retry after a lost response ends in the truth.
 function showAlreadySent(res) {
   refreshBalances();          // money did move — possibly just now, in a race
   const exec = res.json.execution || {};
   const card = newResultCard(exec.status !== "FAILED");
-  card.append(el("h3", null, "ALREADY SENT"));
+  card.append(el("h3", null, "Already sent"));
   const at = res.json.executed_at
     ? new Date(res.json.executed_at * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
     : "earlier";
-  card.append(el("p", "lead", "This was already sent at " + at + ". Nothing was sent twice."));
+  card.append(el("p", "lead", "Sent earlier, at " + at + ". Not sent again."));
   const ul = el("ul");
   for (const leg of exec.legs || []) {
     const li = el("li");
     li.append(el("span", null, LEG_NAME[leg.type] || leg.type),
-              el("span", null, (leg.amount_cents != null ? centsToDisplay(leg.amount_cents) + " · " : "") + leg.status));
+              el("span", null, (leg.amount_cents != null ? centsToDisplay(leg.amount_cents) + " · " : "") + legStatusText(leg.status)));
     ul.append(li);
   }
   for (const c of exec.changes || []) {
@@ -866,16 +866,21 @@ async function refreshBalances() {
     return;                           // a missing panel value is not worth an error
   }
   if (mine !== balanceSeq) return;    // a newer refresh was started; it wins
-  for (const a of rows) {
-    const n = document.getElementById("bal-" + String(a.id).replace(/^acct_/, ""));
-    if (!n) continue;
-    const text = centsToDisplay(a.balance);
+  const paint = (n, text) => {
+    if (!n) return;
     if (n.textContent !== text && n.textContent !== "—") {
       n.classList.add("changed");
       setTimeout(() => n.classList.remove("changed"), 1500);
     }
     n.textContent = text;
+  };
+  let total = 0;
+  for (const a of rows) {
+    total += a.balance || 0;
+    paint(document.getElementById("bal-" + String(a.id).replace(/^acct_/, "")), centsToDisplay(a.balance));
   }
+  // The total is the ledger's own rows added up — every account, shown or not.
+  if (rows.length) paint(document.getElementById("bal-total"), centsToDisplay(total));
 }
 
 // One line per leg that actually ran, from the executor's result joined to the
@@ -967,15 +972,23 @@ function showResult(res) {
   }
   const exec = res.json.execution || {};
   const status = ok ? (exec.status || "EXECUTED") : res.json.rejection || "REJECTED";
-  const card = newResultCard(ok);
-  // status + body are TEXT, never parsed as HTML. A rejection reason carries
-  // executor/LLM-influenced text (e.g. a failed account "<img src=x ...>");
-  // this is the trusted surface the "what you see is what you sign" argument
-  // presumes renders faithfully, so markup must appear as literal characters.
-  // (H1: this was an innerHTML sink; JSON.stringify escapes quotes but not </>.)
-  card.append(el("h3", null, status));
+  const lines = ok && exec.legs ? executedLines(exec, CURRENT.plan) : [];
+  const nothingRan = ok && !!exec.legs && !lines.length;      // accepted, but no leg went through
+  const card = newResultCard(ok && !nothingRan);
+  // The machine status stays on the box (data-status) for scripts and tests;
+  // the person gets words. Status, title and body are TEXT, never parsed as
+  // HTML: a rejection carries executor/LLM-influenced text (e.g. a failed
+  // account "<img src=x ...>"), and this is the trusted surface the "what you
+  // see is what you sign" argument presumes renders faithfully, so markup must
+  // appear as literal characters. (H1: this was an innerHTML sink.)
+  const box = document.getElementById("result");
+  if (box && box.dataset) box.dataset.status = status;
+  const contact = CURRENT.kind === "contact_add" || CURRENT.kind === "contact_edit";
   if (ok) {
-    card.append(el("p", "lead", "Done. Here's what went through:"));
+    const title = successToast(exec, CURRENT.plan).title;
+    card.append(el("h3", null, nothingRan ? "Not sent"
+      : title === "Transfer successful" ? "Sent" : title || "Done"));
+    for (const line of lines) card.append(el("p", "lead", line));
     const ul = el("ul");
     if (exec.contact) {
       const c = exec.contact;
@@ -994,19 +1007,30 @@ function showResult(res) {
                 el("span", null, c.new_value));
       ul.append(li);
     }
-    for (const leg of exec.legs || []) {
-      const li = el("li");
-      li.append(el("span", null, LEG_NAME[leg.type] || leg.type),
-                el("span", null, (leg.amount_cents != null ? centsToDisplay(leg.amount_cents) + " · " : "") + leg.status));
-      ul.append(li);
+    // Every leg, with what happened to it, when not all of them went through.
+    const legs = exec.legs || [];
+    if (legs.length > 1 || legs.some((l) => l.status !== "EXECUTED")) {
+      for (const leg of legs) {
+        const li = el("li");
+        li.append(el("span", null, LEG_NAME[leg.type] || leg.type),
+                  el("span", null, (leg.amount_cents != null ? centsToDisplay(leg.amount_cents) + " · " : "")
+                                   + legStatusText(leg.status)));
+        ul.append(li);
+      }
     }
-    card.append(ul);
+    if (ul.childElementCount) card.append(ul);
     if (exec.contact) afterContactAdded(exec.contact);
   } else {
-    card.append(el("p", "lead", res.json.reason || "The gateway refused this payment."));
+    card.append(el("h3", null, contact ? "Not saved" : "Not sent"));
+    card.append(el("p", "lead", res.json.reason
+      || (contact ? "Nothing was saved." : "The gateway refused this payment.")));
+    card.append(el("p", "code-line", status));
+    const more = el("details", "sec");
+    more.append(el("summary", null, "Technical details"));
     const pre = el("pre");
     pre.textContent = JSON.stringify(res.json, null, 2);
-    card.append(pre);
+    more.append(pre);
+    card.append(more);
   }
 }
 
@@ -1042,13 +1066,11 @@ function afterContactAdded(c) {
 function showScamBlocked(body) {
   const card = newResultCard(false);
   card.append(el("h3", null, "Payment stopped"));
-  card.append(el("p", "lead", "This payment shows several signs of a scam, so it can't be made "
-    + "in the app. Nothing was sent."));
+  card.append(el("p", "lead", "Nothing was sent."));
   const box = el("div", "scam-warn stop");
-  for (const w of body.reasons || []) box.append(el("p", null, "\u26a0\ufe0f " + w));
+  for (const w of body.reasons || []) box.append(el("p", null, w));
   card.append(box);
-  card.append(el("p", "scam-help", "If you still need to make it, call DBS. If someone is "
-    + "telling you to make this payment, hang up first, then call ScamShield."));
+  card.append(el("p", "scam-help", "Being told to pay? Hang up, then call:"));
   card.append(buildHelpCalls());
   Voice.speak("I've stopped this payment. It shows several signs of a scam. Nothing was sent.");
 }
@@ -1062,13 +1084,11 @@ function showScheduled(res) {
   card.append(el("h3", null, "Scheduled"));
   const lead = el("p", "lead", "");
   card.append(lead);
-  const cancel = el("button", "btn danger", "Cancel this payment");
+  const cancel = el("button", "btn danger", "Cancel");
   card.append(cancel, buildHelpCalls());
   let left = Math.max(0, res.json.seconds_left || 0);
   const paint = () => {
-    lead.textContent = "This is a large payment, so it waits before it's sent. It goes in "
-      + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0")
-      + ". You can still cancel it until then.";
+    lead.textContent = "Sends in " + Math.floor(left / 60) + ":" + String(left % 60).padStart(2, "0");
   };
   const finish = (title, text) => {
     clearInterval(tick); clearInterval(poll);
@@ -1246,8 +1266,7 @@ function handleDraft(res) {
     CURRENT.draftId = body.draft_id;
     CURRENT.plan = body.mandate;
     CURRENT.kind = "mandate";
-    addMsg("bot", el("div", "bubble", "Here's the recurring payment. Check every detail — you're "
-      + "agreeing to these exact terms — then confirm with your biometric."),
+    addMsg("bot", el("div", "bubble", "Check every detail, then confirm."),
       buildMandateCard(body.mandate, body.preview));
     return;
   }
@@ -1275,18 +1294,14 @@ function handleDraft(res) {
     return;
   }
   if (body.status === "blocked") {                 // M5 policy refusal
-    showRefusal("Blocked by policy", body.reasons || [],
-      "A policy rule refused this before it could be drafted. "
-      + (body.kind === "contact_edit" ? "Nothing was saved." : "Nothing was sent."));
+    showRefusal("Not allowed", body.reasons || [],
+      body.kind === "contact_edit" ? "Nothing was saved." : "Nothing was sent.");
     return;
   }
   if (body.status === "frozen") {                  // M6 validator freeze
     const checks = (body.validation && body.validation.checks) || [];
-    showRefusal("Stopped: this doesn't match what you said",
-      freezeReasons(checks),
-      "Before you approve anything, an independent check compares the draft with "
-      + "your words. It didn't match, so this draft can't be signed and nothing was sent.",
-      body.validation);
+    showRefusal("Doesn't match what you said", freezeReasons(checks),
+      "A check compares the draft with your words. Nothing was sent.", body.validation);
     return;
   }
 
@@ -1301,12 +1316,11 @@ function handleDraft(res) {
     CURRENT.kind = "contact_add";
     const rung = (body.risk && body.risk.rung) || "STANDARD";
     const intro = el("div", "bubble",
-      rung === "HOLD" ? "I can save them, but with extra protection \u2014 parts of this look like "
-                        + "common scams. Please read the warnings first."
-      : conf ? "Here's the new contact. Before I save them, I've texted a code to your phone."
-      : "Here's the new contact. Check the number, then confirm with your biometric.");
+      rung === "HOLD" ? "Some of this looks like a scam. Read the warnings first."
+      : conf ? "I've texted a code to your phone."
+      : "Check the number, then confirm.");
     addMsg("bot", intro, buildAddCard(body.contact_add, body.risk, conf));
-    if (conf) { const code = document.getElementById("stepup-code"); if (code) code.focus(); }
+    if (conf) { const code = document.getElementById("stepup-code"); if (code) code.focus({ preventScroll: true }); }
     return;
   }
   if (body.kind === "contact_edit") {
@@ -1314,10 +1328,10 @@ function handleDraft(res) {
     CURRENT.plan = body.contact_change;
     CURRENT.kind = "contact_edit";
     const intro = el("div", "bubble",
-      conf ? "Here's the change. A new phone number changes where payments go, so I need one more check first."
-           : "Here's the change. Check it, then confirm with your biometric.");
+      conf ? "A new number changes where payments go, so one more check."
+           : "Check the change, then confirm.");
     addMsg("bot", intro, buildChangeCard(body.contact_change, conf));
-    if (conf) { const code = document.getElementById("stepup-code"); if (code) code.focus(); }
+    if (conf) { const code = document.getElementById("stepup-code"); if (code) code.focus({ preventScroll: true }); }
     return;
   }
 
@@ -1329,26 +1343,25 @@ function handleDraft(res) {
   const reply = body.narration && body.narration.reply;
   const rec = body.recurring;
   const intro = el("div", "bubble", rec
-    ? "Payment " + rec.seq + " of " + rec.count + " for your " + rec.biller + " arrangement is due. "
-      + "Check it, then approve it with your biometric — nothing is paid until you do."
+    ? "Payment " + rec.seq + " of " + rec.count + " to " + rec.biller + " is due."
     : reply
     ? reply
-    : conf ? "Here's the draft. It's unusual for you, so I need one more check first."
-           : "Here's the draft. Check it, then confirm with your biometric.");
+    : conf ? "This is unusual for you, so one more check."
+           : "Check it, then confirm.");
   // A recurring payment wasn't said by anyone just now: don't label the
   // server's description of it "You said".
   const card = buildPlanCard(body.resolved_plan, conf, body.narration, rec ? null : body.transcript,
                              body.scam);
   if (rec) {
-    card.insertBefore(el("p", "said", "Payment " + rec.seq + " of " + rec.count + " under the recurring "
-      + "arrangement you set up. Its biller, account and amount are fixed by what you signed then."),
+    card.insertBefore(el("p", "said", "Fixed by the terms you signed."),
       card.querySelector(".legs"));
   }
   addMsg("bot", intro, card);
   if (reply && CURRENT.via) Voice.speak(reply);     // spoken request -> spoken reply
   if (conf) {
+    // The warning at the top of the sheet is read first: no scrolling to the box.
     const code = document.getElementById("stepup-code");
-    if (code) code.focus();
+    if (code) code.focus({ preventScroll: true });
   }
 }
 
@@ -1395,7 +1408,7 @@ function renderClarify(body) {
   const m = addMsg("bot", bubble);
   if (body.kind === "purpose") {
     awaitPurpose(body.draft_id);
-    m.append(el("p", "meta-note", "Type or say your answer. Nothing has been sent."));
+    m.append(el("p", "meta-note", "Nothing has been sent."));
     return;
   }
   if (body.kind === "recurrence") {                // "pay my bill": once, or recurring?
@@ -1465,7 +1478,7 @@ function renderClarify(body) {
   } else {
     // 0-match / empty / insufficient: no candidate list to choose from, so the
     // user re-states the request and it re-enters the pipeline from the top.
-    m.append(el("p", "meta-note", "Say or type it again with more detail."));
+    m.append(el("p", "meta-note", "Try again with more detail."));
   }
 }
 
@@ -1501,24 +1514,16 @@ async function onDecline() {
     showErr("Couldn't cancel: " + (d.error || res.status || "no connection")
       + ". Nothing has been sent.");
     btn.disabled = false;
-    updateSignGate();                     // back to what the hold, name and code allow
+    updateSignGate();                     // back to what the hold and code allow
     return;
   }
   retireLiveCard();
 }
 
 function showCancelled() {
-  const card = newResultCard(true);
-  card.append(el("h3", null, "CANCELLED"));
-  card.append(el("p", "lead", "Nothing was sent. This can't be approved now — "
-    + "say it again if you still want to send it."));
-}
-
-// HOLD_STEP_UP: the payee's name as typed on the live card. The gateway checks
-// it too — the disabled button is only the page's half of the check.
-function typedName() {
-  const input = document.getElementById("name-check");
-  return input ? { confirm_name: input.value } : {};
+  const card = newResultCard(true, "neutral");
+  card.append(el("h3", null, "Cancelled"));
+  card.append(el("p", "lead", "Nothing was sent."));
 }
 
 async function onSign() {
@@ -1535,8 +1540,7 @@ async function onSign() {
       : CURRENT.kind === "mandate"
       ? await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
                              "/api/recurring/mandates/enroll-webauthn", "mandate")
-      : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId,
-                             undefined, undefined, typedName());
+      : await signAndExecute(CURRENT.plan, CURRENT.credentialIds, CURRENT.rpId);
     // One draft, one signature: the card is spent whatever the outcome.
     // Retired BEFORE the result renders, so chips the result offers (carry on
     // with the payment) are not retired along with it.
@@ -1610,7 +1614,7 @@ function renderSetupForm(body) {
   CURRENT.kind = "recurring_setup";
   const f = body.fields || {}, err = body.errors || {}, opt = body.options || {};
   const card = el("div", "bubble card plan-card setup-card");
-  card.append(el("p", "card-title", "Set up a recurring bill payment"));
+  card.append(el("p", "card-title", "Set up a recurring bill"));
   if (body.transcript) card.append(el("p", "said", "You said: “" + body.transcript + "”"));
   if ((body.questions || []).length) {
     const q = el("div", "setup-questions");
@@ -1709,7 +1713,7 @@ function buildMandateCard(m, preview) {
   const p = preview || {};
   const card = el("div", "bubble card plan-card plan mandate-card");
   card.id = "plan";
-  card.append(el("p", "card-title", "Review recurring payment"));
+  card.append(el("p", "card-title", "Recurring payment"));
   const dl = el("dl", "meta terms");
   const row = (k, v, cls) => dl.append(el("dt", null, k), el("dd", cls || null, v));
   row("Pay", m.biller_display + " · " + m.biller_reference_masked);
@@ -1726,16 +1730,13 @@ function buildMandateCard(m, preview) {
   const box = el("div", "approvals-box" + (m.auto_after_supervised ? " auto" : ""));
   box.append(el("p", null, p.approvals));
   if (m.auto_after_supervised) {
-    box.append(el("p", null, "Automatic payments only ever pay these exact terms. They stop "
-      + "for anything unusual — a changed bill reference, a frozen account, a safety check — "
-      + "and you're told after every payment."));
+    box.append(el("p", null, "Automatic payments only pay these exact terms, and stop for anything unusual."));
   }
   card.append(box);
-  card.append(el("p", "hint", "You can pause or cancel it at any time under Bills. Pausing "
-    + "skips payments; nothing is ever paid late."));
+  card.append(el("p", "hint", "Pause or cancel any time under Bills."));
 
   const sec = el("details", "sec");
-  sec.append(el("summary", null, "Security details"));
+  sec.append(el("summary", null, "Details"));
   const meta = el("dl", "meta");
   const add = (k, v, id, cls) => { const dd = el("dd", cls, v); if (id) dd.id = id; meta.append(el("dt", null, k), dd); };
   add("Arrangement", m.mandate_id + " v" + m.version, null, "mono");
@@ -1751,15 +1752,14 @@ function buildMandateCard(m, preview) {
   CURRENT.gate = {};
   card.append(btn, declineButton());
   updateSignGate(btn);
-  card.append(el("p", "hint", "Your device signs a hash of exactly these terms. Nothing is paid now."));
+  card.append(el("p", "hint", "Nothing is paid now."));
   return card;
 }
 
 function showMandateCreated(res) {
   const card = newResultCard(true);
-  card.append(el("h3", null, "SET UP"));
-  card.append(el("p", "lead", "Your recurring payment is set up. Nothing has been paid yet — "
-    + "when a payment falls due, you'll get a message and it will wait under Bills for you to approve."));
+  card.append(el("h3", null, "Set up"));
+  card.append(el("p", "lead", "Nothing has been paid yet. You'll get a message when one is due."));
   const b = el("button", "btn secondary", "Open Bills");
   b.type = "button";
   b.onclick = showBills;
@@ -1788,10 +1788,8 @@ async function mandateAction(mandateId, action) {
   const r = await jpost(API + "/api/recurring/mandates/" + encodeURIComponent(mandateId) + "/" + action,
                         { user_id: DEMO_USER });
   if (r.status !== 200) { showErr(((r.json.detail || {}).error || "That didn't work") + "."); return; }
-  botSay(action === "pause"
-    ? "Paused. Nothing will be paid while it's paused, and payments that fall due are skipped, not paid later."
-    : action === "cancel" ? "Cancelled. Nothing more will be paid under it."
-    : "Resumed. Payments due from now on go ahead as agreed.");
+  botSay(action === "pause" ? "Paused. Payments due while paused are skipped."
+    : action === "cancel" ? "Cancelled. Nothing more will be paid." : "Resumed.");
   showBills();
 }
 
@@ -1815,34 +1813,47 @@ function resumeControls(mandateId, holder) {
                              { user_id: DEMO_USER, code: code.value.trim() });
       if (rr.status !== 200) { showErr(((rr.json.detail || {}).error || "That code didn't work") + "."); return; }
       form.querySelectorAll("input, button").forEach((x) => { x.disabled = true; });
-      botSay("Resumed. Payments due from now on go ahead as agreed; anything skipped while paused stays unpaid.");
+      botSay("Resumed. Skipped payments stay unpaid.");
       showBills();
     };
     holder.append(form);
     code.focus();
-    botSay("I've texted a code to your phone. Enter it to resume the payments.");
+    botSay("Code sent to your phone.");
   };
   return b;
 }
 
+// The first letter of a biller's name, for its tile.
+function initial(name) {
+  return (name || "?").charAt(0).toUpperCase();
+}
+
 function mandateBlock(m) {
   const box = el("div", "mandate");
-  const head = el("div", "mandate-head");
-  head.append(el("span", "mandate-name", m.biller || "Recurring payment"),
-              el("span", "pill " + String(m.status || "").toLowerCase(), MANDATE_LABELS[m.status] || m.status));
+  const head = el("div", "bill-row mandate-head");
+  const main = el("div", "bill-main");
+  main.append(el("span", "bill-name mandate-name", m.biller || "Recurring payment"));
+  if (!m.broken) {
+    main.append(el("span", "bill-sub", (m.frequency === "WEEKLY" ? "Weekly" : "Monthly")
+      + (m.next_due && (m.status === "ACTIVE" || m.status === "PAUSED") ? " · next " + m.next_due : "")));
+  }
+  main.append(el("span", "pill " + String(m.status || "").toLowerCase(), MANDATE_LABELS[m.status] || m.status));
+  head.append(el("span", "tile", initial(m.biller)), main);
+  if (!m.broken) head.append(el("span", "bill-amt", m.amount_display));
   box.append(head);
   if (m.broken) { box.append(el("p", "hint", m.status_reason)); return box; }
-  box.append(el("p", "mandate-line", m.amount_display + " " + (m.frequency === "WEEKLY" ? "weekly" : "monthly")
-    + " from " + m.account + " · " + m.reference));
-  box.append(el("p", "mandate-line", "Paid " + m.paid_count + " of " + m.count + " (" + m.paid_total_display
+  if (m.status_reason && m.status !== "ACTIVE") box.append(el("p", "hint", m.status_reason));
+
+  // Everything else, folded away: the terms, every payment, and the controls.
+  const det = el("details", "sec");
+  det.append(el("summary", null, "Details"));
+  det.append(el("p", "mandate-line", "From " + m.account + " · " + m.reference));
+  det.append(el("p", "mandate-line", "Paid " + m.paid_count + " of " + m.count + " (" + m.paid_total_display
     + " of at most " + m.total_cap_display + ")"));
   if (m.next_due && (m.status === "ACTIVE" || m.status === "PAUSED")) {
-    box.append(el("p", "mandate-line", "Next due: " + m.next_due + " at " + m.due_time + " (" + m.timezone + ")"));
+    det.append(el("p", "mandate-line", "Next due: " + m.next_due + " at " + m.due_time + " (" + m.timezone + ")"));
   }
-  box.append(el("p", "mandate-line strong", "Automatic payment: " + m.automatic));
-  if (m.status_reason && m.status !== "ACTIVE") box.append(el("p", "hint", m.status_reason));
-  const det = el("details", "sec");
-  det.append(el("summary", null, "Payments"));
+  det.append(el("p", "mandate-line strong", "Automatic payment: " + m.automatic));
   const ul = el("ul", "occ-list");
   for (const o of m.occurrences || []) {
     const li = el("li", "occ " + String(o.status).toLowerCase());
@@ -1857,7 +1868,6 @@ function mandateBlock(m) {
     ul.append(li);
   }
   det.append(ul);
-  box.append(det);
   const actions = el("div", "mandate-actions");
   if (m.status === "ACTIVE") {
     const b = el("button", "btn secondary", "Pause");
@@ -1875,7 +1885,8 @@ function mandateBlock(m) {
     };
     actions.append(b);
   }
-  box.append(actions);
+  det.append(actions);
+  box.append(det);
   return box;
 }
 
@@ -1893,29 +1904,35 @@ async function showBills() {
     return;
   }
   paintBillsBadge(pending.length);
-  const card = el("div", "bubble card plan-card bills-card");
-  card.append(el("p", "card-title", "Recurring payments"));
+  const card = el("div", "bubble card bills-card");
+  card.append(el("p", "card-title", "Bills"));
   if (pending.length) {
-    card.append(el("p", "sg-title", "WAITING FOR YOUR APPROVAL"));
-    const ul = el("ul", "occ-list pending");
+    card.append(el("p", "sg-title", "Needs you"));
     for (const p of pending) {
-      const li = el("li", "occ pending_approval");
-      li.append(el("span", null, p.biller + " · " + p.amount_display + " · payment " + p.seq + " of " + p.count),
-                el("span", null, "Due " + p.due + "; approve by " + p.review_until));
-      if (p.reason) li.append(el("span", "occ-reason", p.reason));
-      const b = el("button", "chip choice", "Review & approve");
+      const item = el("div", "pending-bill");
+      const row = el("div", "bill-row");
+      const main = el("div", "bill-main");
+      main.append(el("span", "bill-name", p.biller),
+                  el("span", "bill-sub", "Payment " + p.seq + " of " + p.count + " · due " + p.due));
+      row.append(el("span", "tile", initial(p.biller)), main, el("span", "bill-amt", p.amount_display));
+      item.append(row);
+      item.append(el("span", "occ-reason", "Approve by " + p.review_until + "." + (p.reason ? " " + p.reason : "")));
+      const b = el("button", "btn primary", "Review & approve");
       b.type = "button";
       b.onclick = () => reviewOccurrence(p.mandate_id, p.seq);
-      li.append(b);
-      ul.append(li);
+      item.append(b);
+      card.append(item);
     }
-    card.append(ul);
   }
   if (!mandates.length) {
-    card.append(el("p", "hint", "No recurring payments yet. Try: “Pay SP Group S$85 from savings every "
+    card.append(el("p", "hint", "No bills yet. Try: “Pay SP Group S$85 from savings every "
       + "month, starting 1 November, for six months.”"));
+  } else {
+    card.append(el("p", "sg-title", "Your bills"));
+    const list = el("div", "mandates");
+    for (const m of mandates) list.append(mandateBlock(m));
+    card.append(list);
   }
-  for (const m of mandates) card.append(mandateBlock(m));
   if (notes.length) {
     const act = el("details", "sec");
     act.append(el("summary", null, "Recent messages"));
@@ -1998,17 +2015,34 @@ function wireVoice() {
   let serverAsrDown = false;
   let serverAsrFailures = 0;       // consecutive transient tier-1 failures
   let active = null;               // { stop() } for whichever tier is listening
+  let discard = false;             // "Type instead": drop what this recording hears
+
+  // While listening, the conversation steps aside for one big button
+  // (.listening on .screen); .thinking while the words are transcribed.
+  const screen = document.querySelector(".screen");
+  const listenText = document.getElementById("listen-text");
+  const showListening = (st) => {
+    if (!screen) return;
+    const on = !discard && (st === "listening" || st === "thinking");
+    screen.classList.toggle("listening", on);
+    screen.classList.toggle("thinking", on && st === "thinking");
+    if (listenText) listenText.textContent = st === "thinking" ? "Transcribing…" : "Listening…";
+  };
 
   const onText = (t, provider) => {
     active = null;
     setStatus("");
+    showListening("idle");
+    if (discard) { discard = false; return; }
     if (!t || !t.trim()) { showErr("I didn't catch that. Tap the mic and try again."); return; }
     submitTranscript(t.trim(), provider === "webspeech" ? "browser speech" : provider);
   };
   const onError = (e) => {
     active = null;
     setStatus("");
+    showListening("idle");
     mic.classList.remove("live");
+    if (discard) { discard = false; return; }
     const m = /^speech recognition: (.+)$/.exec(String(e && e.message || e));
     const msg = m ? SPEECH_ERRORS[m[1]] ?? ("Speech recognition failed (" + m[1] + "). Type it instead.")
                   : String(e && e.message || e);
@@ -2018,8 +2052,8 @@ function wireVoice() {
     // "idle" = the browser recognizer ended on its own (pause, result, error).
     if (st === "idle") active = null;
     mic.classList.toggle("live", st === "listening");
-    setStatus(st === "listening" ? "Listening… tap the mic when you're done"
-      : st === "thinking" ? "Transcribing…" : "");
+    showListening(st);
+    setStatus(st === "thinking" && !discard ? "Transcribing…" : "");
   };
 
   function startWebSpeech() {
@@ -2037,6 +2071,7 @@ function wireVoice() {
     Voice.silence();                // the mic must not hear the assistant
     // A second press stops whichever tier is listening.
     if (active) { active.stop(); active = null; return; }
+    discard = false;
     if (serverAsrDown) { startWebSpeech(); return; }
     // Tier 1 first (server-side ASR: OpenAI or Tencent, the backend decides).
     const rec = await Voice.recordAndUpload({
@@ -2055,6 +2090,22 @@ function wireVoice() {
     active = rec ? { stop: () => Voice.stop() } : null;
   };
 
+  // The big button while listening is the mic's second press: done talking.
+  const orb = document.getElementById("listen-orb");
+  if (orb) orb.onclick = () => mic.onclick();
+  // "Type instead": stop listening, keep nothing it heard, and go to the box.
+  const typeInstead = document.getElementById("listen-type");
+  if (typeInstead) {
+    typeInstead.onclick = () => {
+      discard = true;
+      showListening("idle");
+      mic.classList.remove("live");
+      setStatus("");
+      if (active) { active.stop(); active = null; }
+      textIn.focus();
+    };
+  }
+
   // Tier 3, always present: typing the same sentence must always work.
   textForm.onsubmit = (e) => {
     e.preventDefault();
@@ -2066,9 +2117,7 @@ function wireVoice() {
 }
 
 function greet() {
-  const m = botSay("Hi Alice. Tell me what you'd like to do — pay someone, "
-    + "pay a bill, buy shares, or update a contact. I'll draft it, and nothing moves until you "
-    + "approve it with your biometric.");
+  const m = botSay("What would you like to do?");
   const chips = el("div", "chips");
   const b = el("button", "chip", "Show my contacts");
   b.type = "button";
@@ -2083,41 +2132,59 @@ function tickClock() {
 }
 
 /* ---------- bootstrap ---------- */
-/* The voice button, top right. What a tap does depends on the moment:
-   talking -> stop now and mute; on -> mute; muted -> unmute. */
-const SOUND_LABELS = {
-  speaking: "Stop talking and mute the assistant",
-  on: "Mute the assistant's voice",
-  muted: "Unmute the assistant's voice",
-};
+/* The voice button, top right: shown only while the assistant is talking, and
+   a tap stops it. Turning the voice off altogether is in Settings. */
 function wireSound() {
   const btn = document.getElementById("sound");
-  if (!btn || !Voice.ttsAvailable()) return;   // no speech engine: nothing to mute
-  btn.hidden = false;
+  if (!btn || !Voice.ttsAvailable()) return;   // no speech engine: nothing to stop
   Voice.onStateChange((st) => {
     btn.dataset.state = st;
-    btn.setAttribute("aria-pressed", String(st === "muted"));
-    btn.setAttribute("aria-label", SOUND_LABELS[st]);
-    btn.title = SOUND_LABELS[st];
+    btn.hidden = st !== "speaking";
   });
-  btn.onclick = () => Voice.setMuted(!Voice.isMuted());
+  btn.onclick = () => Voice.silence();
 }
 
 /* ---------- kill switch ---------- */
-function paintFreeze(engaged) {
-  const banner = document.getElementById("frozen");
+/* While payments are frozen, the frozen panel covers the app. Back hides it
+   (the freeze stays: the red snowflake in the app bar shows it, and a tap on
+   it brings the panel back). */
+function paintFreeze(engaged, show = engaged) {
+  const panel = document.getElementById("frozen");
   const btn = document.getElementById("freeze");
-  if (banner) banner.hidden = !engaged;
-  if (btn) { btn.classList.toggle("on", engaged); btn.textContent = engaged ? "Frozen" : "Freeze"; }
+  if (panel) panel.hidden = !(engaged && show);
+  if (btn) {
+    btn.classList.toggle("on", engaged);
+    const label = engaged ? "Payments are frozen" : "Freeze all outgoing payments";
+    btn.setAttribute("aria-label", label);
+    btn.title = label;
+  }
+}
+
+// The line under Unfreeze: what to do next, or what went wrong.
+function frozenNote(text, isError) {
+  const n = document.getElementById("frozen-note");
+  if (!n) return;
+  n.textContent = text;
+  n.classList.toggle("error", !!isError);
+}
+
+function frozenSince(unix) {
+  const n = document.getElementById("frozen-since");
+  if (!n) return;
+  n.textContent = unix
+    ? "Since " + new Date(unix * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+    : "Nothing can leave your accounts";
 }
 
 // Paints the server's freeze state and returns it (null if it can't be read).
 async function refreshKillSwitch() {
   try {
-    const engaged = !!(await jget(API + "/api/killswitch?user_id=" + DEMO_USER)).engaged;
+    const st = await jget(API + "/api/killswitch?user_id=" + DEMO_USER);
+    const engaged = !!st.engaged;
     paintFreeze(engaged);
+    if (engaged) frozenSince(st.engaged_at);
     return engaged;
-  } catch (_) {       /* the banner is a convenience; the server enforces the freeze */
+  } catch (_) {       /* the panel is a convenience; the server enforces the freeze */
     return null;
   }
 }
@@ -2127,10 +2194,12 @@ function wireKillSwitch() {
   const unfreeze = document.getElementById("unfreeze");
   const form = document.getElementById("unfreeze-form");
   const code = document.getElementById("unfreeze-code");
+  const close = document.getElementById("frozen-close");
   if (!btn) return;
+  if (close) close.onclick = () => paintFreeze(true, false);
   // One tap (plus "are you sure") — making things safer should be easy.
   btn.onclick = async () => {
-    if (btn.classList.contains("on")) return;
+    if (btn.classList.contains("on")) { paintFreeze(true, true); return; }   // show the panel again
     if (!confirm("Freeze all outgoing payments? Unfreezing needs a code sent to your phone.")) return;
     let r;
     try {
@@ -2144,46 +2213,53 @@ function wireKillSwitch() {
       // did (the freeze is recorded first, then the cleanup can fail): ask.
       if (await refreshKillSwitch()) {
         retireLiveCard();
-        botSay("Your payments are frozen. Something went wrong while cancelling requests "
-          + "waiting for approval, but none of them can be sent while you're frozen.");
+        botSay("Your payments are frozen. Some waiting requests couldn't be cancelled, but none can be sent.");
         return;
       }
       showErr("Couldn't freeze your payments (" + (((r.json.detail || {}).error) || r.status
         || "no connection") + "). Try again.");
       return;
     }
+    frozenSince(Math.floor(Date.now() / 1000));
+    frozenNote("Needs a code from your phone");
     paintFreeze(true);
     retireLiveCard();
-    botSay("Done — all outgoing payments are frozen. " + (r.json.drafts_cancelled
-      ? r.json.drafts_cancelled + " request(s) waiting for approval were cancelled. " : "")
+    botSay("Payments frozen." + (r.json.drafts_cancelled
+      ? " " + r.json.drafts_cancelled + " waiting request(s) cancelled." : "")
       + (r.json.already_sent
-      ? r.json.already_sent + " payment(s) had already gone through before the freeze — check your balance. " : "")
-      + "Nothing can be sent until you unfreeze with a code from your phone.");
+      ? " " + r.json.already_sent + " payment(s) went through before the freeze." : ""));
   };
   unfreeze.onclick = async () => {
     const r = await jpost(API + "/api/killswitch/release/begin", { user_id: DEMO_USER });
     if (r.status !== 200) {                    // too many codes this hour
-      showErr(((r.json.detail || {}).error || "Couldn't send a code") + ".");
+      const msg = ((r.json.detail || {}).error || "Couldn't send a code") + ".";
+      frozenNote(msg, true);
+      showErr(msg);
       return;
     }
     if (r.json.engaged === false) { paintFreeze(false); return; }
+    unfreeze.hidden = true;
     form.hidden = false;
     code.focus();
-    botSay("I've texted a code to your phone. Enter it to unfreeze your payments.");
+    frozenNote("We texted a code to your phone");
   };
   form.onsubmit = async (e) => {
     e.preventDefault();
     const r = await jpost(API + "/api/killswitch/release", { user_id: DEMO_USER, code: code.value.trim() });
     if (r.status === 200 && r.json.engaged === false) {
       form.hidden = true;
+      unfreeze.hidden = false;
       code.value = "";
+      frozenNote("Needs a code from your phone");
       paintFreeze(false);
       if (r.json.drafts_cancelled) retireLiveCard();
       botSay("Payments are unfrozen." + (r.json.drafts_cancelled
-        ? " " + r.json.drafts_cancelled + " request(s) made while frozen were cancelled — ask again if you still want them."
+        ? " " + r.json.drafts_cancelled + " request(s) made while frozen were cancelled."
         : ""));
     } else {
-      showErr(((r.json.detail || {}).error || "That code didn't work") + ".");
+      const msg = ((r.json.detail || {}).error || "That code didn't work") + ".";
+      frozenNote(msg, true);
+      showErr(msg);
     }
   };
 }
@@ -2230,10 +2306,10 @@ async function init() {
   // Bills that fell due while the app was closed are still waiting: say so.
   const pending = await refreshBillsBadge();
   if (pending && pending.length) {
-    const m = botSay("You have " + pending.length + " bill payment" + (pending.length > 1 ? "s" : "")
-      + " waiting for your approval. Nothing is paid until you approve.");
+    const m = botSay(pending.length + " bill payment" + (pending.length > 1 ? "s need" : " needs")
+      + " your approval.");
     const chips = el("div", "chips live");
-    const b = el("button", "chip choice", "Review now");
+    const b = el("button", "chip choice", "Review");
     b.type = "button";
     b.onclick = () => { chips.classList.remove("live"); b.disabled = true; showBills(); };
     chips.append(b);

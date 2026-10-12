@@ -96,7 +96,8 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             reply = page.locator(".msg.bot").last.inner_text()
             assert "$500.00 to Mom from Savings." in reply, reply
             assert "Your usual amount for Mom." in reply, reply
-            assert "You said: \u201ctransfer five hundred from my savings to mom\u201d" in plan_text
+            # The server's copy of the words is on the card, folded under Details.
+            assert "\u201ctransfer five hundred from my savings to mom\u201d" in page.text_content("#plan")
             assert "\u201cfive hundred\u201d \u00b7 \u201cmom\u201d \u00b7 \u201csavings\u201d" in plan_text, plan_text
 
             # 4. biometric sign -> gateway execute. The virtual authenticator
@@ -104,8 +105,11 @@ def test_real_webauthn_approves_hardcoded_transfer(server_url):
             #    resolves with a genuine assertion over sha256(phash + nonce).
             page.click("#sign")
             page.wait_for_selector("#result:not([hidden])", timeout=20000)
-            status = page.inner_text("#result h3")
+            # The card says it in words ("Sent"); the executor's status is on
+            # the box itself.
+            status = page.get_attribute("#result", "data-status")
             assert status == "EXECUTED", f"expected EXECUTED, got {status!r}"
+            assert page.inner_text("#result h3") == "Sent"
             cls = page.get_attribute("#result", "class") or ""
             assert "ok" in cls, f"result box class should contain 'ok': {cls!r}"
 
