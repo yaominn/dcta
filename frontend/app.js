@@ -599,6 +599,26 @@ function buildAddContactForm() {
   return wrap;
 }
 
+/* An answer with several rows ("what did I pay recently?"), as a card. Every
+   cell is the server's own text from the ledger (backend/answers.py). */
+function buildTable(t) {
+  const card = el("div", "bubble card data-card");
+  if (t.title) card.append(el("p", "card-title", t.title));
+  const cols = t.columns || [];
+  const row = (cells, tag) => {
+    const tr = el("tr");
+    cells.forEach((cell, i) => tr.append(el(tag, cols[i] && cols[i].numeric ? "num" : "", cell)));
+    return tr;
+  };
+  const section = (tag, ...rows) => { const s = el(tag); s.append(...rows); return s; };
+  const table = el("table", "data-table");
+  table.append(section("thead", row(cols.map(c => c.label), "th")),
+               section("tbody", ...t.rows.map(r => row(r, "td"))));
+  if (t.footer) table.append(section("tfoot", row(t.footer, "td")));
+  card.append(table);
+  return card;
+}
+
 function showContactsCard(contacts) {
   addMsg("bot", buildContactsCard(contacts));
 }
@@ -1272,7 +1292,8 @@ function handleDraft(res) {
   }
   // A contacts list is "info" too: it is drawn as the list, further down.
   if (body.status === "info" && body.kind !== "contacts") {   // nothing to draft: a line to say
-    botSay(body.message);
+    if (body.table && body.table.rows && body.table.rows.length) addMsg("bot", buildTable(body.table));
+    else botSay(body.message);
     return;
   }
   if (body.status === "blocked" && body.kind === "recurring_review") {

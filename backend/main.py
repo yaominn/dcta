@@ -22,7 +22,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 from backend.config import settings
 from backend.data.db import DB_PATH, get_conn, migrate
@@ -57,7 +57,7 @@ from backend.validator.contacts import validate_contact_add, validate_contact_ch
 from backend.asr import (MAX_AUDIO_BYTES,
                          ASRNoSpeech, ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
-from backend import answers
+from backend import answers, spelling
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
@@ -844,6 +844,33 @@ class DraftRequest(BaseModel):
     # "pay my bill"). Only ever narrows: "once" can't create a mandate, and
     # "recurring" only opens the setup form, which needs its own signature.
     recurrence: Literal["once", "recurring"] | None = None
+    # (typed, read as) for each word the server corrected: never sent by a
+    # client, only set by _autocorrect and shown on the trace.
+    _corrected: list = PrivateAttr(default_factory=list)
+
+
+def _autocorrect(req: DraftRequest, *, billers: list, equities: list,
+                 payees: list) -> DraftRequest:
+    """The request with its typos fixed (backend/spelling.py), so every step
+    after this one, from routing to the transcript hash the signature binds,
+    reads the same words. Contact names are kept exactly as typed; biller
+    names and tickers are a closed list, so a near miss is corrected to one."""
+    fixed, changes = spelling.correct(
+        req.transcript,
+        names=[b["name"] for b in billers] + [e["ticker"] for e in equities],
+        keep=[p["nickname"] for p in payees])
+    if not changes:
+        return req
+    out = req.model_copy(update={"transcript": fixed})
+    out._corrected = changes
+    return out
+
+
+def _trace_start(trace_id: str, req: DraftRequest, route: str) -> None:
+    _traces.start(trace_id, transcript=req.transcript, route=route, user_id=req.user_id)
+    if req._corrected:
+        _traces.event(trace_id, "autocorrect", note="typos fixed before anything read them",
+                      changes=[{"typed": a, "read_as": b} for a, b in req._corrected])
 
 
 class ClarifyAnswer(BaseModel):
@@ -877,10 +904,22 @@ def _pipeline(draft: Draft) -> dict:
         offer = _new_contact_offer(plan, outcome)
         if offer:
             draft.question["new_contact"] = offer
-            # Lead with the likely answer: someone new, not a typo for a contact.
-            draft.question["question"] = (
-                f"{offer['name']} isn't in your contacts yet. Do you want to add them?"
-                + (" If you meant someone else, pick them below." if outcome.choices else ""))
+            # Lead with the likely answer: someone new, not a typo for a contact
+            # — unless the name is one typo from a contact ("Mon" / "Mom"):
+            # then that contact is asked about first. Asked, never assumed.
+            choices = draft.question["choices"]
+            name_of = lambda c: c["display"].rsplit(" ··", 1)[0]   # the resolver's "Mom ··3310"
+            near = spelling.closest(offer["name"], [name_of(c) for c in choices])
+            if near:
+                draft.question["choices"] = sorted(choices, key=lambda c: name_of(c) != near)
+                same = " or ".join(c["display"] for c in choices if name_of(c) == near)
+                draft.question["question"] = (
+                    f"{offer['name']} isn't in your contacts. Did you mean {same}? "
+                    f"Or add {offer['name']} as a new contact.")
+            else:
+                draft.question["question"] = (
+                    f"{offer['name']} isn't in your contacts yet. Do you want to add them?"
+                    + (" If you meant someone else, pick them below." if outcome.choices else ""))
         _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
         return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
 
@@ -1063,6 +1102,7 @@ def create_draft(req: DraftRequest):
                             accounts=accounts, equities=equities)
     for flag in context.flags:
         logging.warning("injection tripwire: stored field flagged: %s", flag)
+    req = _autocorrect(req, billers=billers, equities=equities, payees=payees)
 
     # Which pipeline. Not a security decision: every route ends at a draft the
     # user must sign, or (the list) a read-only view of their own contacts.
@@ -1087,7 +1127,7 @@ def create_draft(req: DraftRequest):
     if route == "contact_list":
         view = _contacts_view(req.user_id)
         tid = "list-" + DraftStore.new_id()
-        _traces.start(tid, transcript=req.transcript, route=route, user_id=req.user_id)
+        _trace_start(tid, req, route)
         _traces.event(tid, "contacts", note="read-only; the LLM is not called",
                       count=len(view["contacts"]))
         return view
@@ -1110,7 +1150,7 @@ def create_draft(req: DraftRequest):
                 plan, fallback = rules, "rules: a payee who isn't a contact yet"
     except (ProviderUnavailable, ParseFailure) as exc:
         tid = "failed-" + DraftStore.new_id()
-        _traces.start(tid, transcript=req.transcript, route=route, user_id=req.user_id)
+        _trace_start(tid, req, route)
         _traces.event(tid, "parse", provider=provider.name, llm_calls=provider.calls,
                       error=str(exc))
         if isinstance(exc, ParseFailure):
@@ -1133,7 +1173,7 @@ def create_draft(req: DraftRequest):
         risk={"for_payment": origin["for_payment"], "pending_cents": origin["pending_cents"]}
              if origin else None,
     ))
-    _traces.start(draft.draft_id, transcript=req.transcript, route=route, user_id=req.user_id)
+    _trace_start(draft.draft_id, req, route)
     _traces.event(draft.draft_id, "parse", provider=provider.name, llm_calls=provider.calls,
                   context=context.to_prompt_json(), result=plan.model_dump(mode="json"),
                   **({"fallback": fallback} if fallback else {}))
@@ -1628,9 +1668,12 @@ def answer_purpose(draft_id: str, body: PurposeAnswer):
     if (draft.question or {}).get("kind") != "purpose" or not body.answer.strip():
         raise HTTPException(409, {"error": "this draft isn't waiting for what the payment "
                                            "is for", "draft_id": draft_id})
-    reply = body.answer.strip()
+    # Typos fixed so the scam words in it are seen ("urgnet"); no names here.
+    reply, changes = spelling.correct(body.answer.strip())
     draft.replies.append(reply)
-    _traces.event(draft_id, "answer", field="purpose", answer=reply)
+    _traces.event(draft_id, "answer", field="purpose", answer=reply,
+                  **({"autocorrect": [{"typed": a, "read_as": b} for a, b in changes]}
+                     if changes else {}))
     # A reply that doesn't answer ("no", "ok") is asked again, never taken as
     # a calm answer; out of tries, the missing answer is scored as risk. One
     # with scam wording in it is scored now: it has said enough.
@@ -2134,7 +2177,7 @@ def _recurring_setup_start(req: DraftRequest) -> dict:
     fields = recurring_parse.extract(req.transcript, billers=billers,
                                      today=recurring_schedule.local_date(now, DEFAULT_TIMEZONE))
     tid = DraftStore.new_id()
-    _traces.start(tid, transcript=req.transcript, route="recurring_bill", user_id=req.user_id)
+    _trace_start(tid, req, "recurring_bill")
     _traces.event(tid, "recurring_parse", note="rules only; the model is not called",
                   fields=fields.to_dict(), missing=fields.missing())
     import re as _re
