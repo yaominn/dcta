@@ -72,11 +72,15 @@ def classify_request(transcript: str) -> str:
     return "payment"
 
 
-# A money verb AND an amount: a payment the parser failed to read, not a
-# question. It keeps "I didn't catch a payment" and never reaches the question
-# classifier, so a payment makes no extra model call even when parsing fails.
+# A money verb AND an amount, and not asked as a question: a payment the
+# parser failed to read. It keeps "I didn't catch a payment" and never reaches
+# the question classifier, so a payment makes no extra model call even when
+# parsing fails. "why didn't my $50 send go through?" and "give me all my
+# transactions" are questions, not payments.
 _MONEY_VERB = re.compile(
-    r"\b(?:pay|paid|send|sent|transfer|give|buy|purchase|wire|remit|move|top\s*up)\b", re.I)
+    r"\b(?:pay|paid|send|sent|transfer|give(?!\s+me\b)|buy|purchase|wire|remit|move|top\s*up)\b",
+    re.I)
+_ASKED = re.compile(r"^\s*(?:why|what|how|where|when|which|who|whose)\b", re.I)
 _AMOUNT = re.compile(
     r"\d|\$|\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
     r"fifteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|"
@@ -84,4 +88,5 @@ _AMOUNT = re.compile(
 
 
 def looks_like_payment(transcript: str) -> bool:
-    return bool(_MONEY_VERB.search(transcript) and _AMOUNT.search(transcript))
+    return bool(_MONEY_VERB.search(transcript) and _AMOUNT.search(transcript)
+                and not _ASKED.search(transcript))

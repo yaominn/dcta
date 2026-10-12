@@ -47,9 +47,11 @@ PHRASINGS = {
     "balance": ["how much money do I have", "am I broke", "balance pls",
                 "what's in my savings?", "How much is left in my account"],
     "recent_payments": ["what did I pay recently", "show me my last payments",
+                        "give me all my transactions",
                         "recent transactions", "where did my money go",
                         "what have I spent this week"],
     "why_stopped": ["why did you stop that", "why was my payment blocked",
+                    "why didn't my $50 send go through?",
                     "why didn't it go through", "why won't you let me pay"],
     "contacts": ["who can I send money to", "who do I have saved",
                  "which people can I pay"],
@@ -220,7 +222,25 @@ def test_a_payment_the_parser_misses_still_asks_for_the_payment(client, monkeypa
     ("send 50 dollars to mom", True), ("pay landlord fifteen hundred", True),
     ("buy $200 of apple", True), ("transfer half my savings to john", True),
     ("why won't you let me pay", False), ("how much money do I have", False),
-    ("what did I pay recently", False)])
+    ("what did I pay recently", False), ("why didn't my $50 send go through?", False),
+    ("give me all my transactions", False), ("what did I send mom, 50?", False)])
 def test_what_looks_like_a_payment(text, payment):
     from backend.agent import looks_like_payment
     assert looks_like_payment(text) is payment
+
+
+@pytest.mark.parametrize("text,label", [("why didn't my $50 send go through?", "why_stopped"),
+                                        ("give me all my transactions", "recent_payments")])
+def test_a_question_with_an_amount_in_it_is_still_answered(client, text, label):
+    import backend.main as main
+    from backend.models.schemas import IntentPlan
+    monkey = pytest.MonkeyPatch()
+    monkey.setattr(main, "parse_transcript",
+                   lambda *a, **k: IntentPlan.model_validate({"plan": [], "unresolved": []}))
+    monkey.setattr(main, "unknown_payee_fallback", lambda *a, **k: None)
+    try:
+        d = _ask(client, text)
+    finally:
+        monkey.undo()
+    assert d["status"] == "info"
+    assert client.get("/api/data").json()["traces"][0]["events"][-1]["label"] == label
