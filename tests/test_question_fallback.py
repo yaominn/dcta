@@ -280,9 +280,15 @@ def test_the_parser_is_told_a_past_payment_is_not_a_request():
     ("make sure mom gets paid 500 today", False),       # obligations are requests
     ("Is mom paid? if not pay her 500", False), ("mom paid for dinner, send her 30", False),
     ("I sent 50 to mom but it failed, send it again", False),
-    ("I sent 50 to mom but it failed, resend it", False), ("repeat the 50 I sent mom yesterday", False)])
+    ("I sent 50 to mom but it failed, resend it", False), ("repeat the 50 I sent mom yesterday", False),
+    ("I had to pay mom 500 yesterday, did it go through?", True),   # "had to": the past
+    ("if I have enough then pay mom 50", False), ("I have savings so pay uncle bob 50", False),
+    ("once my salary has come in pay mom 50", False), ("can you check what I have and pay mom 50", False),
+    ("I sent mom 50 but it failed, try again", False), ("I haven't paid mom 500 yet, do it now", False),
+    ("I never paid mom the 500, please do", False), ("I paid mom 500 yesterday, do the same for dad", False),
+    ("mom paid for dinner, reimburse her 30", False), ("mom needs to be paid 500", False)])
 def test_the_rules_tell_a_past_payment_from_a_new_one(text, past):
-    from backend.agent.stub import asks_only_about_past_payments
+    from backend.agent.router import asks_only_about_past_payments
     assert asks_only_about_past_payments(text) is past
 
 
@@ -327,3 +333,22 @@ def test_a_past_payment_question_still_gets_the_scam_warning(client):
 def test_a_request_is_still_a_payment(client, text):
     d = _ask(client, text)
     assert d["status"] == "ready" and d["resolved_plan"]["plan"][0]["amount_cents"] == 5000
+
+
+
+def test_the_rules_engine_itself_still_reads_every_clause():
+    """The past-payment rule sits where the rules stand in for the model, not
+    inside the shared engine: one false match can't blank a whole request."""
+    from backend.agent.stub import rules_plan
+    from backend.agent.context import build_context
+    ctx = build_context(payees=[{"id": "payee_17", "nickname": "Mom", "legal_name": "x", "last4": "3310"}],
+                        billers=[], accounts=[], equities=[]).to_prompt_json()
+    assert rules_plan("I have savings so pay mom 50 then pay mom 20", ctx)["plan"]
+
+
+@pytest.mark.parametrize("text,payment", [("make sure mom gets paid 500 today", True),
+                                          ("mom needs to be paid 500", True),
+                                          ("can you check if I sent 50 to mom?", False)])
+def test_obligations_still_look_like_payments(text, payment):
+    from backend.agent import looks_like_payment
+    assert looks_like_payment(text) is payment

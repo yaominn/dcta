@@ -23,7 +23,6 @@ import re
 # The words the rules act on. A typo near one of these is corrected to it.
 VOCAB = frozenset("""
 send pay transfer give buy purchase move wire remit paid sent bill bills
-gave given bought transferred wired moved remitted received owed owe
 balance balances money funds account accounts savings spending joint invest
 investment investments shares share stock stocks equity
 recent recently last history transactions transaction spent statement payments payment
@@ -44,6 +43,7 @@ hundred thousand dollars cents bucks
 # Common words that are already right and sit one typo from a VOCAB word
 # ("there" / "three", "says" / "pays", "tent" / "ten"). Never corrected.
 KNOWN = frozenset("""
+gave given bought brought transferred wired wiped moved remitted received receive owed owe owned
 about after again all also always and another any anyone are aren around ask
 asked back bank because been before being best better between both but bye
 call called came can cannot card cash come could day days did didn does doesn

@@ -43,7 +43,10 @@ class StubProvider:
             return json.dumps(_rules_scam(transcript, _extract_facts(user)))
         if system == prompts.question_system_prompt():
             return json.dumps({"label": _rules_question(transcript)})
-        plan = _rules_plan(transcript, context)
+        # The stand-in follows prompts.py rule 9 like the model: a payment
+        # asked about, not asked for, is an empty plan.
+        plan = ({"plan": [], "unresolved": []} if asks_only_about_past_payments(transcript)
+                else _rules_plan(transcript, context))
         return json.dumps(plan)
 
 
@@ -239,9 +242,6 @@ def _unknown_name(rest: str) -> str | None:
 
 # --------------------------------------------------------------------------- the rule engine
 def _rules_plan(transcript: str, context: dict) -> dict:
-    # Asked ABOUT, not asked FOR: nothing to draft (backend/agent/router.py).
-    if asks_only_about_past_payments(transcript):
-        return {"plan": [], "unresolved": []}
     clauses = [c.strip() for c in re.split(r"\bthen\b", transcript, flags=re.I) if c.strip()]
     nicknames = [p["nickname"] for p in context.get("payees", [])]
     biller_names = [b["name"] for b in context.get("billers", [])]

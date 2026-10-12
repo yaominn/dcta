@@ -72,8 +72,11 @@ def unknown_payee_fallback(transcript: str, context: PromptContext) -> IntentPla
     resolver asks whether to add them. Used only for that: when every
     transfer the rules read goes to an existing payee, this returns None and
     the model's reading stands — the rules never draft a payment it didn't."""
+    from backend.agent.router import asks_only_about_past_payments
     from backend.agent.stub import rules_plan
     from backend.resolver import names_a_payee
+    if asks_only_about_past_payments(transcript):     # left out on purpose (prompt rule 9)
+        return None
     rules = rules_plan(transcript, context.to_prompt_json())
     nicknames = [p["nickname"] for p in context.payees]
     if not any(leg["type"] == "TRANSFER"
