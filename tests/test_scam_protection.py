@@ -1104,8 +1104,9 @@ def test_the_gateway_scores_a_draft_that_never_was(client):
 
 def test_a_question_the_user_never_saw_is_refused(asking_client):
     """A new passkey after drafting (facts 4) would now ask what it's for: the
-    payment is refused so the new draft asks."""
-    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+    payment is refused so the new draft asks. $500 isn't small, so the line is
+    4 at any hour (a small payment's 5 is only reached after midnight)."""
+    d = asking_client.post("/api/drafts", json={"transcript": "pay mom 500 dollars"}).json()
     assert d["status"] == "ready"
     _add_passkeys_now()
     nonce = asking_client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
