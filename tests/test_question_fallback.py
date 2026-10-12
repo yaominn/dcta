@@ -128,6 +128,19 @@ def test_recent_payments_lists_the_last_five(client):
         assert re.fullmatch(r"\$[\d,]+\.\d\d (to .+ ··\d{4}|for a bill|for shares) · \d{1,2} \w{3}", line), line
 
 
+def test_recent_payments_are_the_newest(client):
+    """By date, not by row order: the seed writes its history out of date order."""
+    conn = connect()
+    try:
+        newest = conn.execute("SELECT amount, ts FROM transaction_history WHERE user_id='u_alice' "
+                              "ORDER BY ts DESC LIMIT 5").fetchall()
+    finally:
+        conn.close()
+    from backend.answers import _day
+    lines = _ask(client, "what did I pay recently")["message"].split("\n")
+    assert [l.rsplit(" · ", 1)[1] for l in lines] == [_day(r["ts"]) for r in newest]
+
+
 def test_recent_payments_when_there_are_none(client):
     conn = connect()
     try:

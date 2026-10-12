@@ -70,7 +70,10 @@ def recent_payments(user_id: str, *, db_path: Path | None = None) -> str:
         rows = conn.execute(
             "SELECT h.leg_type, h.amount, h.ts, p.nickname, p.last4 "
             "FROM transaction_history h LEFT JOIN payees p ON p.id = h.payee_id "
-            "WHERE h.user_id=? ORDER BY h.id DESC LIMIT ?", (user_id, RECENT_COUNT)).fetchall()
+            # Newest first by when it happened (rows aren't inserted in date
+            # order: the seed writes its history oldest-last). ts is ISO-8601 UTC.
+            "WHERE h.user_id=? ORDER BY h.ts DESC, h.id DESC LIMIT ?",
+            (user_id, RECENT_COUNT)).fetchall()
     finally:
         conn.close()
     if not rows:
