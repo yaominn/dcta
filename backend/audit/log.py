@@ -37,6 +37,7 @@ class AuditEntryType(str, Enum):
     CONFIRMATION = "CONFIRMATION"   # out-of-band step-up (gateway/stepup.py)
     CONTACT_UPDATE = "CONTACT_UPDATE"   # a signed payee rename / phone change
     CONTACT_ADD = "CONTACT_ADD"         # a signed new payee (and its safeguards)
+    CONTACT_REMOVE = "CONTACT_REMOVE"   # a payee removed from the contacts card
     SIGNATURE = "SIGNATURE"
     EXECUTION = "EXECUTION"
     EXECUTION_SCHEDULED = "EXECUTION_SCHEDULED"   # a large payment waiting before it runs

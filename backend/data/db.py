@@ -171,7 +171,8 @@ def migrate(conn: sqlite3.Connection) -> None:
     Idempotent; called at app startup."""
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
     for col in ("phone TEXT", "added_at INTEGER", "hold_until INTEGER",
-                "dest_version INTEGER NOT NULL DEFAULT 1", "dest_changed_at INTEGER"):
+                "dest_version INTEGER NOT NULL DEFAULT 1", "dest_changed_at INTEGER",
+                "removed_at INTEGER"):
         if cols and col.split()[0] not in cols:
             conn.execute(f"ALTER TABLE payees ADD COLUMN {col}")
             conn.commit()
@@ -225,7 +226,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
             -- bumps on every routing change (a new phone number), and the time
             -- of that change. A transfer signs the version it was drafted for.
             dest_version    INTEGER NOT NULL DEFAULT 1,
-            dest_changed_at INTEGER                      -- Unix s; NULL = unchanged since set up
+            dest_changed_at INTEGER,                     -- Unix s; NULL = unchanged since set up
+            -- Unix s; removed from the contacts card. The row stays: payment
+            -- history and the scam rules point at it. Gone from the list,
+            -- payments and edits; a payment drafted before is SUPERSEDED.
+            removed_at      INTEGER
         );
 
         CREATE TABLE IF NOT EXISTS billers (

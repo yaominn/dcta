@@ -267,6 +267,22 @@ details.sec[open] summary::before { transform: rotate(90deg); }
            font-weight: 700; background: var(--accent-soft); color: var(--accent); flex: none; }
 .cname { font-weight: 600; }
 .cphone { font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.contact-list li { flex-wrap: wrap; }
+.cwho { flex: 1; min-width: 0; }
+/* Remove, then "Remove Mom ··3310?" Yes / Cancel on a line of its own */
+.cacts { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; }
+.cacts.asking { flex-basis: 100%; }
+.cask { margin-right: auto; font-size: 12px; color: var(--muted); }
+.cacts .chip { padding: 5px 10px; font-size: 12px; }
+.chip.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 35%, transparent); }
+.chip.danger:hover:not(:disabled) { background: var(--bad-soft); }
+.cadd { margin-top: 8px; }
+.cadd-form { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.cadd-form input {
+  min-width: 0; font: inherit; font-size: 14px; padding: 9px 10px; border-radius: 12px;
+  border: 1px solid var(--line); background: var(--surface); color: var(--fg);
+}
+.cadd-form .btn { padding: 9px 14px; margin-top: 0; }
 
 /* new contact: why we're careful, and what the user must do */
 .risk {

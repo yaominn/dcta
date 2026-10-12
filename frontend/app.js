@@ -516,13 +516,107 @@ function buildContactsCard(contacts) {
     const who = el("div", "cwho");
     who.append(el("div", "cname", c.display), el("div", "cphone",
       (c.phone || "No phone number") + (c.hold_until ? " \u00b7 payments open " + atTime(c.hold_until) : "")));
-    li.append(av, who);
+    const acts = el("div", "cacts");
+    li.append(av, who, acts);
+    contactRemoveButton(acts, c, li);
     ul.append(li);
   }
-  card.append(ul);
-  card.append(el("p", "hint", "Say \"add Bob as a contact, 9123 4567\", \"rename John to Johnny\" "
-    + "or \"change Mom's number to 9123 4567\"."));
+  card.append(ul, buildAddContactForm());
+  card.append(el("p", "hint", "To rename someone or change a number, just say it."));
   return card;
+}
+
+/* Remove: a confirm tap, not a passkey — removing someone only narrows who
+   can be paid, and the server refuses any payment drafted to them before.
+   The contact is named as the card shows it (name + last 4). */
+function contactRemoveButton(acts, c, li) {
+  acts.replaceChildren();
+  acts.classList.remove("asking");
+  const b = el("button", "chip cremove", "Remove");
+  b.type = "button";
+  b.onclick = () => {
+    acts.replaceChildren();
+    acts.classList.add("asking");           // its own line, under the contact
+    const yes = el("button", "chip danger", "Yes, remove");
+    const no = el("button", "chip", "Cancel");
+    yes.type = no.type = "button";
+    no.onclick = () => contactRemoveButton(acts, c, li);
+    yes.onclick = async () => {
+      yes.disabled = no.disabled = true;
+      let r;
+      try {
+        r = await jpost(API + "/api/contacts/remove",
+                        { nickname: c.nickname, last4: c.last4, user_id: DEMO_USER });
+      } catch (e) {
+        r = { status: 0, json: {} };
+      }
+      if (r.status === 200) {
+        li.remove();
+        botSay(r.json.removed + " is no longer in your contacts.");
+        return;
+      }
+      contactRemoveButton(acts, c, li);
+      showErr(r.status === 0 ? "Couldn't remove " + c.display + " (no connection). Nothing changed."
+        : (typeof r.json.detail === "string" ? r.json.detail : "Couldn't remove " + c.display + "."));
+    };
+    acts.append(el("span", "cask", "Remove " + c.display + "?"), yes, no);
+  };
+  acts.append(b);
+}
+
+/* Add: the same request as saying "add Bob as a contact, 9123 4567", so a new
+   contact gets every check a spoken one does — the scam list, the hold, the
+   phone code and the passkey. Always a fresh request: not the answer to a
+   question still waiting further up. */
+function buildAddContactForm() {
+  const wrap = el("div", "cadd");
+  const open = el("button", "chip add", "+ Add contact");
+  open.type = "button";
+  const form = el("form", "cadd-form");
+  form.hidden = true;
+  const name = el("input");
+  name.placeholder = "Name";
+  name.autocomplete = "off";
+  name.maxLength = 40;
+  const phone = el("input");
+  phone.placeholder = "Mobile number";
+  phone.inputMode = "tel";
+  phone.autocomplete = "off";
+  phone.maxLength = 20;
+  const add = el("button", "btn primary", "Add");
+  add.type = "submit";
+  const cancel = el("button", "btn secondary", "Cancel");
+  cancel.type = "button";
+  form.append(name, phone, add, cancel);
+  open.onclick = () => { form.hidden = false; open.hidden = true; name.focus(); };
+  cancel.onclick = () => { form.hidden = true; open.hidden = false; };
+  form.onsubmit = (e) => {
+    e.preventDefault();
+    const n = name.value.trim(), p = phone.value.trim();
+    if (!n || !p) { (n ? phone : name).focus(); return; }
+    name.value = phone.value = "";
+    form.hidden = true;
+    open.hidden = false;
+    stopAwaitingNumber();
+    submitTranscript("add " + n + " as a contact, " + p);
+  };
+  wrap.append(open, form);
+  return wrap;
+}
+
+function showContactsCard(contacts) {
+  addMsg("bot", el("div", "bubble", "Here are your saved contacts."), buildContactsCard(contacts));
+}
+
+/* The greeting's one button: the list, straight from the server (no model). */
+async function showContacts() {
+  userSay("Show my contacts");
+  try {
+    const body = await jget(API + "/api/contacts?user_id=" + DEMO_USER);
+    showContactsCard(body.contacts || []);
+  } catch (e) {
+    showErr("Couldn't load your contacts (no connection). Try again.");
+  }
 }
 
 /* A NEW contact. Same template rules as the other cards: the name and number
@@ -1187,9 +1281,8 @@ function handleDraft(res) {
     return;
   }
 
-  if (body.kind === "contacts") {                  // read-only list
-    addMsg("bot", el("div", "bubble", "Here are your saved contacts."),
-           buildContactsCard(body.contacts || []));
+  if (body.kind === "contacts") {
+    showContactsCard(body.contacts || []);
     return;
   }
   const conf = body.requires_extra_confirmation ? (body.confirmation || {}) : null;
@@ -1963,27 +2056,15 @@ function wireVoice() {
   };
 }
 
-const SUGGESTIONS = [
-  "Pay mom five hundred then buy Apple with the rest",
-  "Pay SP Group S$85 from savings every month, starting 1 November, for six months",
-  "Send fifty to John",
-  "Send five thousand to John",
-  "Send 200 to Uncle Bob",
-  "Show my contacts",
-  "Change Mom's number to 9123 4567",
-];
-
 function greet() {
   const m = botSay("Hi Alice. Tell me what you'd like to do — pay someone, "
     + "pay a bill, buy shares, or update a contact. I'll draft it, and nothing moves until you "
     + "approve it with your biometric.");
   const chips = el("div", "chips");
-  for (const s of SUGGESTIONS) {
-    const b = el("button", "chip", s);
-    b.type = "button";
-    b.onclick = () => submitTranscript(s);
-    chips.append(b);
-  }
+  const b = el("button", "chip", "Show my contacts");
+  b.type = "button";
+  b.onclick = showContacts;
+  chips.append(b);
   m.append(chips);
 }
 

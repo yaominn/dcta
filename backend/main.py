@@ -644,7 +644,8 @@ def create_plan(req: PlanRequest):
     conn = get_conn()
     try:
         payees = [dict(r) for r in conn.execute(
-            "SELECT * FROM payees WHERE user_id=?", (req.user_id,)).fetchall()]
+            "SELECT * FROM payees WHERE user_id=? AND removed_at IS NULL",
+            (req.user_id,)).fetchall()]
         billers = [dict(r) for r in conn.execute("SELECT * FROM billers").fetchall()]
         accounts = [dict(r) for r in conn.execute(
             "SELECT * FROM accounts WHERE user_id=?", (req.user_id,)).fetchall()]
@@ -1037,7 +1038,8 @@ def create_draft(req: DraftRequest):
     conn = get_conn()
     try:
         payees = [dict(r) for r in conn.execute(
-            "SELECT * FROM payees WHERE user_id=?", (req.user_id,)).fetchall()]
+            "SELECT * FROM payees WHERE user_id=? AND removed_at IS NULL",
+            (req.user_id,)).fetchall()]
         billers = [dict(r) for r in conn.execute("SELECT * FROM billers").fetchall()]
         accounts = [dict(r) for r in conn.execute(
             "SELECT * FROM accounts WHERE user_id=?", (req.user_id,)).fetchall()]
@@ -1305,6 +1307,8 @@ def _contact_add_pipeline(draft: Draft) -> dict:
 
     conn = get_conn()
     try:
+        # Removed contacts too, in both: "remove Mom, then add Mom on a new
+        # number" is still a name clash, and removing doesn't undo an addition.
         existing = [dict(r) for r in conn.execute(
             "SELECT nickname, phone FROM payees WHERE user_id=?", (draft.user_id,))]
         recent = conn.execute(
@@ -1403,7 +1407,7 @@ def _contacts_view(user_id: str) -> dict:
     try:
         rows = conn.execute(
             "SELECT nickname, last4, phone, hold_until FROM payees WHERE user_id=? "
-            "ORDER BY nickname, last4", (user_id,)).fetchall()
+            "AND removed_at IS NULL ORDER BY nickname, last4", (user_id,)).fetchall()
     finally:
         conn.close()
     return {"status": "info", "kind": "contacts", "contacts": [
@@ -1899,6 +1903,42 @@ class ContactAddWebAuthnRequest(BaseModel):
     assertion: dict
     nonce: str
     credential_id: str
+
+
+class ContactRemoveRequest(BaseModel):
+    """The contact as the card shows it: name and last 4 digits (the list
+    never carries ids)."""
+    nickname: str
+    last4: str
+    user_id: str = DEMO_USER_ID
+
+
+@app.post("/api/contacts/remove")
+def contacts_remove(req: ContactRemoveRequest):
+    """A confirm tap, not a signature: removing someone only narrows who can be
+    paid. The row stays (history and the scam rules point at it); the contact
+    leaves the list, payments and edits, and a payment drafted to them before
+    now is SUPERSEDED at the gateway (backend/data/destinations.py)."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM payees WHERE user_id=? AND nickname=? AND last4=? "
+            "AND removed_at IS NULL", (req.user_id, req.nickname, req.last4)).fetchall()
+        if len(rows) != 1:
+            # Two the same on the card: removing either could be the wrong one.
+            raise HTTPException(404 if not rows else 409,
+                                "No such contact." if not rows else
+                                "Two contacts have that name and number ending. "
+                                "Rename one first.")
+        conn.execute("UPDATE payees SET removed_at=? WHERE id=?",
+                     (int(time.time()), rows[0]["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    # The id, not the name or number: the chain is append-only (as CONTACT_ADD).
+    _audit.append(AuditEntryType.CONTACT_REMOVE, {"payee_id": rows[0]["id"],
+                                                  "outcome": "REMOVED"})
+    return {"removed": f"{req.nickname} \u00b7\u00b7{req.last4}"}
 
 
 @app.post("/api/contacts/add-webauthn")

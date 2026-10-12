@@ -592,7 +592,8 @@ def _resolve_account(conn, mention, user_id, answers, field, resume):
 
 def _resolve_payee(conn, mention, user_id, answers, field, resume):
     rows = conn.execute(
-        "SELECT id, nickname, last4 FROM payees WHERE user_id=?", (user_id,)
+        "SELECT id, nickname, last4 FROM payees WHERE user_id=? AND removed_at IS NULL",
+        (user_id,)
     ).fetchall()
     # payee_display is built from OUR DB only: nickname + last4. Never from the
     # LLM, never from legal_name or biller reference_text (attacker-controllable;

@@ -10,10 +10,11 @@ longer counts as "first-ever". A full `python -m backend.data.seed` fixes that
 but also DROPS the registered passkeys, so the presenter must re-enroll Touch
 ID minutes before going on stage.
 
-This restores exactly two things to their seeded state:
+This restores exactly three things to their seeded state:
   - account balances
   - the transaction history (the baseline for anomaly, daily-limit and
     velocity checks)
+  - demo contacts removed from the contacts card (Mom, the two Johns, Landlord)
 
 and deliberately keeps everything else:
   - registered passkeys          (no re-enrolling)
@@ -28,7 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from backend.data.db import DB_PATH, connect
-from backend.data.seed import ACCOUNTS, _history_rows
+from backend.data.seed import ACCOUNTS, PAYEES, _history_rows
 
 
 def reset_demo(db_path: Path = DB_PATH) -> dict:
@@ -41,6 +42,14 @@ def reset_demo(db_path: Path = DB_PATH) -> dict:
         for acct_id, _user, _alias, balance, _type in ACCOUNTS:
             conn.execute("UPDATE accounts SET balance=? WHERE id=?", (balance, acct_id))
         conn.execute("DELETE FROM transaction_history")
+        # Demo contacts removed while practising come back, unless their number
+        # has been saved again as a new contact since (one number, one contact).
+        conn.execute(
+            "UPDATE payees SET removed_at=NULL WHERE removed_at IS NOT NULL "
+            f"AND id IN ({','.join('?' * len(PAYEES))}) AND NOT EXISTS ("
+            "SELECT 1 FROM payees AS p WHERE p.user_id=payees.user_id "
+            "AND p.phone=payees.phone AND p.removed_at IS NULL)",
+            [p[0] for p in PAYEES])
         # A large payment still waiting to run would land on the reset balances.
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='delayed_payments'").fetchone() is not None:

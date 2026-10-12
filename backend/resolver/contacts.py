@@ -119,7 +119,8 @@ def resolve_contact_edit(plan: ContactEditPlan, *, transcript: str, user_id: str
     conn = connect(db_path) if db_path else get_conn()
     try:
         rows = conn.execute(
-            "SELECT id, nickname, last4, phone FROM payees WHERE user_id=?", (user_id,)
+            "SELECT id, nickname, last4, phone FROM payees WHERE user_id=? "
+            "AND removed_at IS NULL", (user_id,)
         ).fetchall()
         resolved: list[ResolvedContactEdit] = []
         for i, e in enumerate(plan.edits, start=1):
@@ -214,7 +215,8 @@ def resolve_contact_add(plan: ContactAddPlan, *, user_id: str, name_hint: str | 
     conn = connect(db_path) if db_path else get_conn()
     try:
         taken = conn.execute(
-            "SELECT nickname, last4 FROM payees WHERE user_id=? AND phone=?",
+            "SELECT nickname, last4 FROM payees WHERE user_id=? AND phone=? "
+            "AND removed_at IS NULL",
             (user_id, phone)).fetchone()
     finally:
         conn.close()

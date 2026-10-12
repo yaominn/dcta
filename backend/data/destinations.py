@@ -51,8 +51,10 @@ _COLUMNS = "id, phone, last4, dest_version, dest_changed_at"
 
 
 def current(conn, payee_id: str) -> Destination | None:
-    """The payee's destination as the ledger holds it NOW."""
-    row = conn.execute(f"SELECT {_COLUMNS} FROM payees WHERE id=?", (payee_id,)).fetchone()
+    """The payee's destination as the ledger holds it NOW. None for a removed
+    contact: a transfer drafted to them is SUPERSEDED."""
+    row = conn.execute(f"SELECT {_COLUMNS} FROM payees WHERE id=? AND removed_at IS NULL",
+                       (payee_id,)).fetchone()
     return _from_row(row) if row is not None else None
 
 

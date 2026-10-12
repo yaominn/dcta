@@ -1,5 +1,6 @@
 """
-`python -m backend.data.reset_demo` restores the demo's money and nothing else.
+`python -m backend.data.reset_demo` restores the demo's money (and any demo
+contacts removed while practising) and nothing else.
 
 A full re-seed also drops registered passkeys, forcing the presenter to
 re-enroll Touch ID right before the demo. This resets balances and the
@@ -65,3 +66,30 @@ def test_an_unseeded_ledger_gets_a_clear_message(tmp_path):
     import pytest
     with pytest.raises(SystemExit, match="run `python -m backend.data.seed` first"):
         reset_demo(tmp_path / "empty.db")
+
+
+def test_contacts_removed_in_a_rehearsal_come_back(tmp_path):
+    """Removing Mom while practising mustn't break the demo. A demo contact
+    whose number was saved again as a new contact stays removed: one number,
+    one contact."""
+    db = tmp_path / "ledger.db"
+    with contextlib.redirect_stdout(io.StringIO()):
+        seed(db)
+    conn = connect(db)
+    try:
+        conn.execute("UPDATE payees SET removed_at=1 WHERE id IN ('payee_17', 'payee_30')")
+        conn.execute("INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone, added_at) "
+                     "VALUES ('payee_re', 'u_alice', 'Landlord', '', '7001', '+65 6123 7001', 1)")
+        conn.commit()
+    finally:
+        conn.close()
+
+    reset_demo(db)
+
+    conn = connect(db)
+    try:
+        removed = {r["id"]: r["removed_at"] for r in conn.execute("SELECT id, removed_at FROM payees")}
+    finally:
+        conn.close()
+    assert removed["payee_17"] is None                           # Mom is back
+    assert removed["payee_30"] is not None and removed["payee_re"] is None

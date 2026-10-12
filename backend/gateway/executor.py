@@ -254,13 +254,16 @@ class MockExecutor:
             for e in change.edits:
                 col = _CONTACT_COLUMNS[e.field]
                 cur = conn.execute(
-                    f"UPDATE payees SET {col}=? WHERE id=? AND COALESCE({col}, '')=?",
-                    (e.new_value, e.payee_id, e.old_value))
+                    f"UPDATE payees SET {col}=? WHERE id=? AND COALESCE({col}, '')=? "
+                    "AND removed_at IS NULL", (e.new_value, e.payee_id, e.old_value))
                 if cur.rowcount != 1:
                     conn.execute("ROLLBACK TO SAVEPOINT edits")
+                    removed = conn.execute("SELECT 1 FROM payees WHERE id=? AND removed_at "
+                                           "IS NOT NULL", (e.payee_id,)).fetchone()
+                    what = " was removed from your contacts" if removed else f"'s {e.field} changed"
                     result = {"draft_id": change.draft_id, "status": "FAILED",
-                              "error": f"{e.payee_display}'s {e.field} changed since this "
-                                       "draft was made — nothing was updated",
+                              "error": f"{e.payee_display}{what} since this draft was made "
+                                       "— nothing was updated",
                               "changes": []}
                     break
                 if e.field == "phone":
@@ -297,8 +300,8 @@ class MockExecutor:
         try:
             self._claim(conn, add.draft_id, "contact_add", payload_hash)
             now = int(time.time())
-            taken = conn.execute("SELECT nickname, last4 FROM payees WHERE user_id=? AND phone=?",
-                                 (add.user_id, add.phone)).fetchone()
+            taken = conn.execute("SELECT nickname, last4 FROM payees WHERE user_id=? AND phone=? "
+                                 "AND removed_at IS NULL", (add.user_id, add.phone)).fetchone()
             if taken is not None:
                 result = {"draft_id": add.draft_id, "status": "FAILED",
                           "error": f"that number was saved as {taken['nickname']} "

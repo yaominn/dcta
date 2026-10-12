@@ -905,8 +905,10 @@ Adding a payee is the step just before most scam payments ("Hi Mum, new
 number", the officer who needs your savings in a "safe account", the job that
 pays commission once you top up). So a new contact takes the same road as money.
 
-**Two ways in.** Say *"add Bob as a contact, 9123 4567"*, or pay someone who
-isn't a contact (*"send 200 to Uncle Bob"*): the question that follows offers
+**Three ways in.** Say *"add Bob as a contact, 9123 4567"*; tap **Show my
+contacts** → **+ Add contact** and fill in the name and number (the form sends
+that same sentence, so it gets every check below); or pay someone who isn't a
+contact (*"send 200 to Uncle Bob"*): the question that follows offers
 **+ Add Uncle Bob as a new contact**, asks for the number, and after saving
 offers to carry on with the payment. The answer is tied to the server's copy of
 the payment that asked (`new_contact_for`), so the name and the waiting amount
@@ -944,6 +946,20 @@ re-seed). Tests: `tests/test_contact_add.py`.
 `add Mom as a contact, her new number is 8765 4321` (held 12 h) ·
 `add Officer Tan as a contact, 9000 1111, the police told me to move my money to
 a safe account` (refused) · `add Ken as a contact, 8888 1234` (reported number).
+
+## Removing a contact
+
+**Show my contacts** → **Remove** → **Yes, remove**. A confirm tap, not a
+passkey: removing someone only narrows who can be paid. `POST
+/api/contacts/remove` names the contact as the card does (name + last 4) and
+removes nothing if that matches none or two. The row stays (`removed_at`):
+payment history and the scam rules point at it. A removed contact is gone from
+the list, from payments and from edits, and a payment or edit drafted to them
+before the removal is refused when it's signed (`SUPERSEDED`). Removing Mom and
+then adding "Mom" on a new number is still a name clash (held 12 h), and removed
+contacts still count towards "2+ contacts added today". Audited as
+`CONTACT_REMOVE`, by id only. `python -m backend.data.reset_demo` brings back
+demo contacts removed while practising. Tests: `tests/test_contact_remove.py`.
 
 ## `/data`: what the AI was told, step by step
 
