@@ -61,6 +61,7 @@ for (const id of ["thread", "say"]) {
 
 const calls = [];
 let removeReply = null;               // what POST /api/contacts/remove answers
+let listReply = null;                 // what GET /api/contacts answers
 const reply = (status, json) => ({ status, json: async () => json });
 const CONTACTS = [
   { display: "Landlord ··7001", nickname: "Landlord", last4: "7001", phone: "+65 6123 7001", hold_until: null },
@@ -75,11 +76,12 @@ const env = {
   fetch: async (url, opts) => {
     const body = opts && opts.body ? JSON.parse(opts.body) : null;
     calls.push({ url, method: (opts && opts.method) || "GET", body });
-    if (url.split("?")[0].endsWith("/api/contacts")) return reply(200, { status: "info", kind: "contacts", contacts: CONTACTS });
+    if (url.split("?")[0].endsWith("/api/contacts")) return listReply();
     if (url.endsWith("/api/contacts/remove")) return removeReply();
     return new Promise(() => {});     // a draft: never answered here
   },
 };
+listReply = async () => reply(200, { status: "info", kind: "contacts", contacts: CONTACTS });
 const app = new Function(...Object.keys(env), SRC + `
   return { greet, PENDING: () => ({ purpose: PURPOSE_FOR, number: NEW_CONTACT }),
            awaitPurpose };`)(...Object.values(env));
@@ -89,8 +91,10 @@ const all = () => descendants(thread());
 const buttons = (node) => descendants(node).filter((d) => d.tagName === "BUTTON");
 const texts = (node) => descendants(node).map((d) => d.textContent).filter(Boolean);
 const lastCard = () => all().filter((d) => d.classList.contains("contacts")).pop();
-const rowOf = (name) => descendants(lastCard()).find(
+const cards = () => all().filter((d) => d.classList.contains("contacts"));
+const rowIn = (card, name) => descendants(card).find(
   (d) => d.tagName === "LI" && texts(d).some((t) => t.startsWith(name)));
+const rowOf = (name) => rowIn(lastCard(), name);
 const byText = (node, t) => buttons(node).find((b) => b.textContent === t);
 
 (async () => {
@@ -102,6 +106,8 @@ const byText = (node, t) => buttons(node).find((b) => b.textContent === t);
   byText(thread(), "Show my contacts").onclick();
   await settle();
   out.showCalls = calls.map((c) => c.method + " " + c.url);
+  byText(thread(), "Show my contacts").onclick();         // a second card, further down
+  await settle();
   const card = lastCard();
   out.cardRows = descendants(card).filter((d) => d.tagName === "LI").length;
   out.rowButtons = buttons(rowOf("Landlord")).map((b) => b.textContent);
@@ -138,6 +144,7 @@ const byText = (node, t) => buttons(node).find((b) => b.textContent === t);
   await settle();
   const sent = calls.filter((c) => c.url.endsWith("/remove")).pop();
   out.removed = { body: sent.body, stillListed: !!rowOf("Landlord"), momListed: !!rowOf("Mom"),
+                  olderCardStillListed: !!rowIn(cards()[0], "Landlord"),
                   said: texts(thread()).filter((t) => t.includes("Landlord ··7001")).pop() || null };
 
   // Add contact: a form; empty fields send nothing; a filled one is a fresh
@@ -159,6 +166,17 @@ const byText = (node, t) => buttons(node).find((b) => b.textContent === t);
   const draft = calls.filter((c) => c.method === "POST").pop();
   out.added = { url: draft.url, transcript: draft.body.transcript, formHidden: form.hidden,
                 pending: app.PENDING() };
+
+  // The list can't be read: say so, never an empty list.
+  for (const [name, fail] of [["serverError", async () => reply(500, { detail: "boom" })],
+                              ["offline", async () => { throw new TypeError("Failed to fetch"); }]]) {
+    listReply = fail;
+    const before = cards().length;
+    byText(thread(), "Show my contacts").onclick();
+    await settle();
+    out["load_" + name] = { newCard: cards().length !== before,
+      error: texts(thread()).filter((t) => t.startsWith("Couldn't load")).pop() || null };
+  }
 
   process.stdout.write(JSON.stringify(out));
 })();

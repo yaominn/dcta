@@ -518,7 +518,8 @@ function buildContactsCard(contacts) {
       (c.phone || "No phone number") + (c.hold_until ? " \u00b7 payments open " + atTime(c.hold_until) : "")));
     const acts = el("div", "cacts");
     li.append(av, who, acts);
-    contactRemoveButton(acts, c, li);
+    contactRemoveButton(acts, c);
+    CONTACT_ROWS.push({ display: c.display, li });
     ul.append(li);
   }
   card.append(ul, buildAddContactForm());
@@ -526,10 +527,14 @@ function buildContactsCard(contacts) {
   return card;
 }
 
+/* Every contact row on screen, in every contacts card: a removal takes the
+   contact off all of them, so no older card keeps a Remove for it. */
+const CONTACT_ROWS = [];
+
 /* Remove: a confirm tap, not a passkey — removing someone only narrows who
    can be paid, and the server refuses any payment drafted to them before.
    The contact is named as the card shows it (name + last 4). */
-function contactRemoveButton(acts, c, li) {
+function contactRemoveButton(acts, c) {
   acts.replaceChildren();
   acts.classList.remove("asking");
   const b = el("button", "chip cremove", "Remove");
@@ -540,7 +545,7 @@ function contactRemoveButton(acts, c, li) {
     const yes = el("button", "chip danger", "Yes, remove");
     const no = el("button", "chip", "Cancel");
     yes.type = no.type = "button";
-    no.onclick = () => contactRemoveButton(acts, c, li);
+    no.onclick = () => contactRemoveButton(acts, c);
     yes.onclick = async () => {
       yes.disabled = no.disabled = true;
       let r;
@@ -551,11 +556,11 @@ function contactRemoveButton(acts, c, li) {
         r = { status: 0, json: {} };
       }
       if (r.status === 200) {
-        li.remove();
+        CONTACT_ROWS.filter((x) => x.display === c.display).forEach((x) => x.li.remove());
         botSay(r.json.removed + " is no longer in your contacts.");
         return;
       }
-      contactRemoveButton(acts, c, li);
+      contactRemoveButton(acts, c);
       showErr(r.status === 0 ? "Couldn't remove " + c.display + " (no connection). Nothing changed."
         : (typeof r.json.detail === "string" ? r.json.detail : "Couldn't remove " + c.display + "."));
     };
@@ -611,12 +616,16 @@ function showContactsCard(contacts) {
 /* The greeting's one button: the list, straight from the server (no model). */
 async function showContacts() {
   userSay("Show my contacts");
+  let body = null;
   try {
-    const body = await jget(API + "/api/contacts?user_id=" + DEMO_USER);
-    showContactsCard(body.contacts || []);
-  } catch (e) {
-    showErr("Couldn't load your contacts (no connection). Try again.");
+    body = await jget(API + "/api/contacts?user_id=" + DEMO_USER);
+  } catch (e) { /* below */ }
+  // Never an empty card for a list that couldn't be read.
+  if (!body || !Array.isArray(body.contacts)) {
+    showErr("Couldn't load your contacts. Try again.");
+    return;
   }
+  showContactsCard(body.contacts);
 }
 
 /* A NEW contact. Same template rules as the other cards: the name and number

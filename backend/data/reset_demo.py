@@ -14,7 +14,8 @@ This restores exactly three things to their seeded state:
   - account balances
   - the transaction history (the baseline for anomaly, daily-limit and
     velocity checks)
-  - demo contacts removed from the contacts card (Mom, the two Johns, Landlord)
+  - demo contacts removed from the contacts card (Mom, the two Johns,
+    Landlord), unless a newer contact has taken the name or number
 
 and deliberately keeps everything else:
   - registered passkeys          (no re-enrolling)
@@ -28,7 +29,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from backend.data.db import DB_PATH, connect
+from backend.data.db import DB_PATH, connect, migrate
 from backend.data.seed import ACCOUNTS, PAYEES, _history_rows
 
 
@@ -39,17 +40,23 @@ def reset_demo(db_path: Path = DB_PATH) -> dict:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='accounts'").fetchone() is None:
             raise SystemExit("No demo ledger yet — run `python -m backend.data.seed` first.")
+        migrate(conn)                 # run before the new server ever has: removed_at
         for acct_id, _user, _alias, balance, _type in ACCOUNTS:
             conn.execute("UPDATE accounts SET balance=? WHERE id=?", (balance, acct_id))
         conn.execute("DELETE FROM transaction_history")
-        # Demo contacts removed while practising come back, unless their number
-        # has been saved again as a new contact since (one number, one contact).
-        conn.execute(
-            "UPDATE payees SET removed_at=NULL WHERE removed_at IS NOT NULL "
-            f"AND id IN ({','.join('?' * len(PAYEES))}) AND NOT EXISTS ("
-            "SELECT 1 FROM payees AS p WHERE p.user_id=payees.user_id "
-            "AND p.phone=payees.phone AND p.removed_at IS NULL)",
-            [p[0] for p in PAYEES])
+        # Demo contacts removed while practising come back, unless a contact
+        # added since has the same number (one number, one contact) or the same
+        # name (no second "Mom" to choose between). Those are reported instead.
+        seeded = [p[0] for p in PAYEES]
+        marks = ",".join("?" * len(seeded))
+        clash = ("EXISTS (SELECT 1 FROM payees AS p WHERE p.user_id=payees.user_id "
+                 "AND p.removed_at IS NULL AND (p.phone=payees.phone OR "
+                 f"(lower(p.nickname)=lower(payees.nickname) AND p.id NOT IN ({marks}))))")
+        not_restored = [f"{r['nickname']} \u00b7\u00b7{r['last4']}" for r in conn.execute(
+            f"SELECT nickname, last4 FROM payees WHERE removed_at IS NOT NULL AND id IN ({marks}) "
+            f"AND {clash} ORDER BY nickname, last4", seeded + seeded)]
+        conn.execute(f"UPDATE payees SET removed_at=NULL WHERE removed_at IS NOT NULL "
+                     f"AND id IN ({marks}) AND NOT {clash}", seeded + seeded)
         # A large payment still waiting to run would land on the reset balances.
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='delayed_payments'").fetchone() is not None:
@@ -70,7 +77,8 @@ def reset_demo(db_path: Path = DB_PATH) -> dict:
         passkeys = conn.execute("SELECT COUNT(*) FROM webauthn_credentials").fetchone()[0]
     finally:
         conn.close()
-    return {"balances": balances, "history_rows": history, "passkeys_kept": passkeys}
+    return {"balances": balances, "history_rows": history, "passkeys_kept": passkeys,
+            "not_restored": not_restored}
 
 
 if __name__ == "__main__":
@@ -82,3 +90,6 @@ if __name__ == "__main__":
         print(f"  {account_label(acct_id):12} ${cents_to_display(cents)}")
     print(f"  history: {out['history_rows']} seeded payments")
     print(f"  kept: {out['passkeys_kept']} registered passkey(s), contact names, audit log")
+    for name in out["not_restored"]:
+        print(f"  not restored: {name} (a newer contact has its name or number; "
+              "remove that one and run this again)")

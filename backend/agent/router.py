@@ -22,6 +22,7 @@ _ADD = re.compile(
     r"\b(?:add|save|create|new)\b.*\b(?:contacts?|payees?)\b"
     r"|^\s*(?:please\s+)?(?:add|save)\s+.+\b(?:number|phone|mobile|\d{4})",
     re.I)
+_ADD_FIRST = re.compile(r"^\s*(?:please\s+)?(?:add|save|create)\b", re.I)
 _LIST = re.compile(
     r"\b(?:show|list|see|view|display|what\s+are|who\s+are)\b.*\b(?:contacts?|payees?)\b"
     r"|^\s*(?:my\s+)?(?:contacts?|payees?)\s*[?.!]*\s*$",
@@ -54,6 +55,10 @@ _BARE_BILL = re.compile(
 def classify_request(transcript: str) -> str:
     """'contact_list' | 'contact_add' | 'contact_edit' | 'recurring_bill' |
     'bill_ambiguous' | 'payment'."""
+    # A request that starts with "add"/"save" is an addition, whatever the
+    # name: "add See Toh as a contact" is not "see contacts".
+    if _ADD_FIRST.search(transcript) and _ADD.search(transcript):
+        return "contact_add"
     if _LIST.search(transcript):
         return "contact_list"
     if _ADD.search(transcript):

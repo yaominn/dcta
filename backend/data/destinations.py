@@ -52,7 +52,7 @@ _COLUMNS = "id, phone, last4, dest_version, dest_changed_at"
 
 def current(conn, payee_id: str) -> Destination | None:
     """The payee's destination as the ledger holds it NOW. None for a removed
-    contact: a transfer drafted to them is SUPERSEDED."""
+    contact, so the executor refuses a transfer to them under its lock too."""
     row = conn.execute(f"SELECT {_COLUMNS} FROM payees WHERE id=? AND removed_at IS NULL",
                        (payee_id,)).fetchone()
     return _from_row(row) if row is not None else None
@@ -62,6 +62,16 @@ def for_user(conn, user_id: str) -> dict[str, Destination]:
     """Every payee's current destination for this user, in one query."""
     return {r["id"]: _from_row(r) for r in conn.execute(
         f"SELECT {_COLUMNS} FROM payees WHERE user_id=?", (user_id,))}
+
+
+def removed(conn, payee_ids) -> set[str]:
+    """The ones removed from the contacts card since (`removed_at`)."""
+    ids = list(payee_ids)
+    if not ids:
+        return set()
+    return {r["id"] for r in conn.execute(
+        f"SELECT id FROM payees WHERE removed_at IS NOT NULL AND id IN ({','.join('?' * len(ids))})",
+        ids)}
 
 
 def superseded(conn, plan) -> bool:

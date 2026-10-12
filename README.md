@@ -955,7 +955,7 @@ passkey: removing someone only narrows who can be paid. `POST
 removes nothing if that matches none or two. The row stays (`removed_at`):
 payment history and the scam rules point at it. A removed contact is gone from
 the list, from payments and from edits, and a payment or edit drafted to them
-before the removal is refused when it's signed (`SUPERSEDED`). Removing Mom and
+before the removal is refused before the fingerprint is asked (`REMOVED`). Removing Mom and
 then adding "Mom" on a new number is still a name clash (held 12 h), and removed
 contacts still count towards "2+ contacts added today". Audited as
 `CONTACT_REMOVE`, by id only. `python -m backend.data.reset_demo` brings back
@@ -1098,10 +1098,12 @@ spending sentence in a real browser.
 python -m backend.data.reset_demo
 ```
 
-It restores the seeded balances (Savings $8,420.50, Spending $1,200.00) and
-the payment history the anomaly and limit rules read, and **keeps** your
-registered passkey, contact edits, the audit log and the record of executed
-drafts. (`python -m backend.data.seed` resets everything, passkeys included.)
+It restores the seeded balances (Savings $8,420.50, Spending $1,200.00), the
+payment history the anomaly and limit rules read, and any demo contact you
+removed while practising (unless a newer contact has its name or number; it
+tells you). It **keeps** your registered passkey, contact edits, the audit log
+and the record of executed drafts. (`python -m backend.data.seed` resets
+everything, passkeys included.)
 
 ## Demo script (brief Section 10)
 

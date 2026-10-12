@@ -63,7 +63,21 @@ _FROZEN_CONTACTS = ("your payments are frozen, so contacts can't be added or cha
 
 
 _SUPERSEDED = "the payee's payment details changed after this was drafted — nothing was sent"
+_REMOVED_PAYEE = "the payee was removed from your contacts after this was drafted — nothing was sent"
 _REPORTED_PAYEE = "the payee's number has been reported for scams — nothing was sent"
+
+
+def _transfer_payees(plan: ResolvedPlan) -> list[str]:
+    return [leg.payee_id for leg in plan.plan if leg.type == "TRANSFER"]
+
+
+def _removed_since(plan: ResolvedPlan, db_path) -> bool:
+    """For the executor's late DestinationChanged: removed, or a new number?"""
+    conn = connect(db_path)
+    try:
+        return bool(destinations.removed(conn, _transfer_payees(plan)))
+    finally:
+        conn.close()
 
 
 def destination_refusal(plan: ResolvedPlan, db_path) -> tuple[str, str] | None:
@@ -78,6 +92,8 @@ def destination_refusal(plan: ResolvedPlan, db_path) -> tuple[str, str] | None:
         return ("DESTINATION", "this transfer is not bound to a destination — nothing was sent")
     conn = connect(db_path)
     try:
+        if destinations.removed(conn, _transfer_payees(plan)):
+            return ("REMOVED", _REMOVED_PAYEE)
         if destinations.superseded(conn, plan):
             return ("SUPERSEDED", _SUPERSEDED)
         # A payee reported for scams since it was saved (or drafted). Asked
@@ -246,7 +262,9 @@ class Gateway:
             result = self.executor.execute(resolved_plan, payload_hash=p_hash)
         except AlreadyExecuted as exc:     # lost a race to a concurrent submit
             return self._already_final(draft_id, p_hash, exc.prior)
-        except DestinationChanged:         # a new number landed after step 3e
+        except DestinationChanged:         # a new number, or a removal, after step 3e
+            if _removed_since(resolved_plan, self.executor.db_path):
+                return self._reject(draft_id, p_hash, "REMOVED", _REMOVED_PAYEE)
             return self._reject(draft_id, p_hash, "SUPERSEDED", _SUPERSEDED)
         except MandateRefused as exc:      # a recurring occurrence its mandate no longer allows
             return self._reject(draft_id, p_hash, "MANDATE", exc.reason + " — nothing was sent")
@@ -724,7 +742,8 @@ class Gateway:
                     done.append({"draft_id": draft_id, "status": "CANCELLED"})
                     continue
                 except DestinationChanged:
-                    stop = "the payee's number changed"
+                    stop = ("the payee was removed from your contacts" if _removed_since(plan, db)
+                            else "the payee's number changed")
                 except MandateRefused as exc:
                     stop = exc.reason
                 else:

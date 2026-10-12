@@ -66,6 +66,7 @@ from backend.trace import RecordingProvider, TraceStore
 from backend.display import (account_label, add_summary, change_summary, cents_to_display,
                              plan_summary)
 from backend.data import billers as _billers
+from backend.data import destinations
 from backend.models.mandates import DEFAULT_TIMEZONE, RecurringBillMandate
 from backend.recurring import approve as recurring_approve
 from backend.recurring import clock as recurring_clock
@@ -322,6 +323,17 @@ def _reported_contact(draft: Draft) -> str | None:
     return None
 
 
+def _removed_from_contacts(change: ResolvedContactChange) -> str | None:
+    """The contact an edit was drafted for, if it has been removed since. The
+    executor refuses the edit regardless; this keeps the fingerprint unasked."""
+    conn = get_conn()
+    try:
+        gone = destinations.removed(conn, {e.payee_id for e in change.edits})
+    finally:
+        conn.close()
+    return next((e.payee_display for e in change.edits if e.payee_id in gone), None)
+
+
 @app.get("/api/auth/nonce")
 def issue_nonce(draft_id: str = Query(...)):
     """Issue a draft-bound, single-use, 120s-TTL nonce (brief 4.5).
@@ -406,6 +418,13 @@ def issue_nonce(draft_id: str = Query(...)):
             raise HTTPException(status_code=409, detail={
                 "error": _STALE_DESTINATION[stale[0]], "draft_id": draft_id,
                 "rejection": stale[0]})
+    if draft.kind == "contact_edit" and draft.resolved_change is not None:
+        gone = _removed_from_contacts(draft.resolved_change)
+        if gone is not None:                   # removed since it was drafted
+            _traces.event(draft_id, "nonce", issued=False, reason="contact removed")
+            raise HTTPException(status_code=409, detail={
+                "error": f"{gone} was removed from your contacts — nothing to change",
+                "draft_id": draft_id, "rejection": "REMOVED"})
     reported = _reported_contact(draft)
     if reported is not None:                   # reported since it was drafted
         _traces.event(draft_id, "nonce", issued=False, reason="reported number")
@@ -1162,6 +1181,7 @@ def create_draft(req: DraftRequest):
 # The page adds "Nothing was sent." to a refused signing challenge itself.
 _STALE_DESTINATION = {
     "SUPERSEDED": "the payee's payment details changed after this was drafted — ask again",
+    "REMOVED": "the payee was removed from your contacts after this was drafted",
     "DESTINATION": "this transfer is not bound to a destination",
     "REPORTED": "the payee's number has been reported for scams",
 }
@@ -1917,8 +1937,8 @@ class ContactRemoveRequest(BaseModel):
 def contacts_remove(req: ContactRemoveRequest):
     """A confirm tap, not a signature: removing someone only narrows who can be
     paid. The row stays (history and the scam rules point at it); the contact
-    leaves the list, payments and edits, and a payment drafted to them before
-    now is SUPERSEDED at the gateway (backend/data/destinations.py)."""
+    leaves the list, payments and edits, and anything drafted to them before
+    now is refused as REMOVED (backend/gateway/gateway.py)."""
     conn = get_conn()
     try:
         rows = conn.execute(
@@ -1930,8 +1950,10 @@ def contacts_remove(req: ContactRemoveRequest):
                                 "No such contact." if not rows else
                                 "Two contacts have that name and number ending. "
                                 "Rename one first.")
-        conn.execute("UPDATE payees SET removed_at=? WHERE id=?",
-                     (int(time.time()), rows[0]["id"]))
+        # Only if still there: two taps racing each other remove (and audit) once.
+        if conn.execute("UPDATE payees SET removed_at=? WHERE id=? AND removed_at IS NULL",
+                        (int(time.time()), rows[0]["id"])).rowcount != 1:
+            raise HTTPException(404, "No such contact.")
         conn.commit()
     finally:
         conn.close()

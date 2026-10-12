@@ -21,6 +21,7 @@ import json
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -86,12 +87,30 @@ def test_a_removed_contact_cannot_be_paid(client):
     assert d["status"] != "ready" and "resolved_plan" not in d
 
 
-def test_a_payment_drafted_before_the_removal_is_refused(client):
+def test_a_payment_drafted_before_the_removal_is_refused_as_removed(client):
+    """Refused for the right reason: "removed", never "their number changed"
+    (on a scam-protection app that reads like a hijack)."""
     d = client.post("/api/drafts", json={"transcript": "pay landlord 50 dollars"}).json()
     assert d["status"] == "ready"
     _remove(client)
-    assert client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]}).status_code == 409
-    assert _execute(client, d)["rejection"] == "SUPERSEDED"
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]})
+    assert nonce.status_code == 409 and nonce.json()["detail"]["rejection"] == "REMOVED"
+    assert "removed from your contacts" in nonce.json()["detail"]["error"]
+    out = _execute(client, d)
+    assert out["rejection"] == "REMOVED" and "removed from your contacts" in out["reason"]
+
+
+def test_a_waiting_payment_to_a_removed_contact_is_cancelled_as_removed(client, monkeypatch):
+    from backend.main import _gateway
+    from backend.policy import scam
+    from tests.test_scam_protection import _scheduled
+    monkeypatch.setattr(scam, "RELEASE_DELAY_SECONDS", 60)
+    d = _scheduled(client)                                   # $1,500 to Landlord, waiting
+    _remove(client)
+    done = [x for x in _gateway.release_due(now=int(time.time()) + 61)
+            if x["draft_id"] == d["draft_id"]]
+    assert done == [{"draft_id": d["draft_id"], "status": "CANCELLED",
+                     "reason": "the payee was removed from your contacts"}]
 
 
 def test_a_removed_contact_cannot_be_renamed(client):
@@ -102,15 +121,21 @@ def test_a_removed_contact_cannot_be_renamed(client):
 
 def test_an_edit_drafted_before_the_removal_writes_nothing(client):
     from backend.main import _signer
+    from backend.main import _nonce_store
     d = client.post("/api/drafts", json={"transcript": "rename landlord to Mr Lee"}).json()
     assert d["status"] == "ready"
     _remove(client)
     change = ResolvedContactChange.model_validate(d["contact_change"])
-    nonce = client.get("/api/auth/nonce", params={"draft_id": change.draft_id}).json()["nonce"]
+    # No fingerprint asked for an edit that can only fail ...
+    asked = client.get("/api/auth/nonce", params={"draft_id": change.draft_id})
+    assert asked.status_code == 409 and asked.json()["detail"]["rejection"] == "REMOVED"
+    # ... and straight at the gateway, nothing is written.
+    nonce = _nonce_store.issue(change.draft_id)
     r = client.post("/api/contacts/apply", json={
         "contact_change": d["contact_change"], "nonce": nonce, "credential_id": "cred_alice",
         "signature": _signer.sign(challenge_hash(payload_hash(change), nonce))}).json()
     assert r["execution"]["status"] == "FAILED"
+    assert "was removed from your contacts" in r["execution"]["error"]
     conn = connect()
     try:
         assert conn.execute("SELECT nickname FROM payees WHERE id='payee_30'").fetchone()[0] == "Landlord"
@@ -255,7 +280,14 @@ def test_a_refused_or_failed_removal_keeps_the_contact(page):
 def test_a_removed_contact_leaves_the_card(page):
     assert page["removed"]["body"] == {"nickname": "Landlord", "last4": "7001", "user_id": "u_alice"}
     assert not page["removed"]["stillListed"] and page["removed"]["momListed"]
+    assert not page["removed"]["olderCardStillListed"]      # no stale Remove further up
     assert page["removed"]["said"] == "Landlord ··7001 is no longer in your contacts."
+
+
+def test_a_list_that_cannot_be_read_is_never_shown_empty(page):
+    for case in ("load_serverError", "load_offline"):
+        assert page[case] == {"newCard": False,
+                              "error": "Couldn't load your contacts. Try again."}
 
 
 def test_the_add_form_drafts_a_new_contact(page):

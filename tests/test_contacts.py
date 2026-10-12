@@ -77,6 +77,8 @@ def _code(client):
     ("change mom's number to 9123 4567", "contact_edit"),
     ("update the phone number for landlord to 6123 0000", "contact_edit"),
     ("show my contacts", "contact_list"),
+    ("add See Toh as a contact, 9123 4567", "contact_add"),     # a surname, not "see"
+    ("save Show Lim's number 8123 0000", "contact_add"),
     ("pay mom five hundred", "payment"),
     ("send the change to mom", "payment"),
 ])

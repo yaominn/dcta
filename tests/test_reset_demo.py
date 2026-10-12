@@ -69,27 +69,55 @@ def test_an_unseeded_ledger_gets_a_clear_message(tmp_path):
 
 
 def test_contacts_removed_in_a_rehearsal_come_back(tmp_path):
-    """Removing Mom while practising mustn't break the demo. A demo contact
-    whose number was saved again as a new contact stays removed: one number,
-    one contact."""
+    """Removing Mom while practising mustn't break the demo. Not if a contact
+    added since has the same number or name: one number, one contact, and no
+    second "Mom" to choose between. The seeded Johns share a name on purpose."""
     db = tmp_path / "ledger.db"
     with contextlib.redirect_stdout(io.StringIO()):
         seed(db)
     conn = connect(db)
     try:
-        conn.execute("UPDATE payees SET removed_at=1 WHERE id IN ('payee_17', 'payee_30')")
-        conn.execute("INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone, added_at) "
-                     "VALUES ('payee_re', 'u_alice', 'Landlord', '', '7001', '+65 6123 7001', 1)")
+        conn.execute("UPDATE payees SET removed_at=1 WHERE id IN "
+                     "('payee_17', 'payee_21', 'payee_30')")
+        conn.executemany(
+            "INSERT INTO payees (id, user_id, nickname, legal_name, last4, phone, added_at) "
+            "VALUES (?, 'u_alice', ?, '', ?, ?, 1)",
+            [("payee_re", "Landlord", "7001", "+65 6123 7001"),      # same number
+             ("payee_mum", "mom", "4321", "+65 8765 4321")])         # same name
         conn.commit()
     finally:
         conn.close()
 
-    reset_demo(db)
+    out = reset_demo(db)
 
     conn = connect(db)
     try:
         removed = {r["id"]: r["removed_at"] for r in conn.execute("SELECT id, removed_at FROM payees")}
     finally:
         conn.close()
-    assert removed["payee_17"] is None                           # Mom is back
-    assert removed["payee_30"] is not None and removed["payee_re"] is None
+    assert removed["payee_21"] is None                           # John ··4521 is back
+    assert removed["payee_17"] is not None and removed["payee_30"] is not None
+    assert removed["payee_re"] is None and removed["payee_mum"] is None
+    assert out["not_restored"] == ["Landlord ··7001", "Mom ··3310"]
+
+
+def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
+    """Run before the new server has ever started: no removed_at column yet."""
+    db = tmp_path / "ledger.db"
+    with contextlib.redirect_stdout(io.StringIO()):
+        seed(db)
+    conn = connect(db)
+    try:
+        conn.execute("ALTER TABLE payees DROP COLUMN removed_at")
+        conn.commit()
+    finally:
+        conn.close()
+
+    out = reset_demo(db)
+
+    conn = connect(db)
+    try:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(payees)")}
+    finally:
+        conn.close()
+    assert "removed_at" in cols and out["not_restored"] == []

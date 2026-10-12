@@ -229,7 +229,7 @@ def init_schema(conn: sqlite3.Connection) -> None:
             dest_changed_at INTEGER,                     -- Unix s; NULL = unchanged since set up
             -- Unix s; removed from the contacts card. The row stays: payment
             -- history and the scam rules point at it. Gone from the list,
-            -- payments and edits; a payment drafted before is SUPERSEDED.
+            -- payments and edits; anything drafted before is REMOVED.
             removed_at      INTEGER
         );
 
