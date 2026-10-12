@@ -130,3 +130,13 @@ def test_balance_table_has_a_total(client):
 
 def test_a_one_line_answer_has_no_table(client):
     assert "table" not in _ask(client, "what can you do")
+
+
+@pytest.mark.parametrize("word", ["gave", "given", "bought", "transferred", "wired", "moved",
+                                  "received", "owed", "owe"])
+def test_past_money_words_are_left_alone(word):
+    """A real word is never "corrected" into another: "the officer gave me"
+    became "give me", and "I bought" would become "I buy" (a new payment)."""
+    from backend.spelling import correct
+    text = f"I {word} mom 50"
+    assert correct(text)[0] == text

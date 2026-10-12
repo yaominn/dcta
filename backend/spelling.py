@@ -23,6 +23,7 @@ import re
 # The words the rules act on. A typo near one of these is corrected to it.
 VOCAB = frozenset("""
 send pay transfer give buy purchase move wire remit paid sent bill bills
+gave given bought transferred wired moved remitted received owed owe
 balance balances money funds account accounts savings spending joint invest
 investment investments shares share stock stocks equity
 recent recently last history transactions transaction spent statement payments payment

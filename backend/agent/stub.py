@@ -21,6 +21,8 @@ from __future__ import annotations
 import json
 import re
 
+from backend.agent.router import asks_only_about_past_payments
+
 from backend.agent import prompts
 from backend.resolver import ACCOUNT_TYPE_SYNONYMS
 
@@ -237,6 +239,9 @@ def _unknown_name(rest: str) -> str | None:
 
 # --------------------------------------------------------------------------- the rule engine
 def _rules_plan(transcript: str, context: dict) -> dict:
+    # Asked ABOUT, not asked FOR: nothing to draft (backend/agent/router.py).
+    if asks_only_about_past_payments(transcript):
+        return {"plan": [], "unresolved": []}
     clauses = [c.strip() for c in re.split(r"\bthen\b", transcript, flags=re.I) if c.strip()]
     nicknames = [p["nickname"] for p in context.get("payees", [])]
     biller_names = [b["name"] for b in context.get("billers", [])]

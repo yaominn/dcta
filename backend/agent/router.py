@@ -72,13 +72,14 @@ def classify_request(transcript: str) -> str:
     return "payment"
 
 
-# A money verb AND an amount, and not asked as a question: a payment the
+# A money verb asking for a payment (present tense: "sent" and "paid" are
+# about the past) AND an amount, and not asked as a question: a payment the
 # parser failed to read. It keeps "I didn't catch a payment" and never reaches
 # the question classifier, so a payment makes no extra model call even when
 # parsing fails. "why didn't my $50 send go through?" and "give me all my
 # transactions" are questions, not payments.
 _MONEY_VERB = re.compile(
-    r"\b(?:pay|paid|send|sent|transfer|give(?!\s+me\b)|buy|purchase|wire|remit|move|top\s*up)\b",
+    r"\b(?:pay|send|transfer|give(?!\s+me\b)|buy|purchase|wire|remit|move|top\s*up)\b",
     re.I)
 _ASKED = re.compile(r"^\s*(?:why|what|how|where|when|which|who|whose)\b", re.I)
 _AMOUNT = re.compile(
@@ -89,25 +90,25 @@ _AMOUNT = re.compile(
 
 def looks_like_payment(transcript: str) -> bool:
     return bool(_MONEY_VERB.search(transcript) and _AMOUNT.search(transcript)
-                and not _ASKED.search(transcript))
+                and not _ASKED.search(transcript) and not asks_only_about_past_payments(transcript))
 
 
-# Money mentioned only in the past: "I paid mom 500 yesterday right?", "can
-# you check if I sent 50 to mom?", "did I pay mom?". Asked about, not asked
-# for, so the payment reader must not turn it into a new draft (it did: a
-# $500 one). Any present-tense request beside it ("mom paid for dinner, send
-# her 30", "resend it", "if not pay her 500") keeps it a payment. Not a
-# security decision: a miss is a read-only answer, or a draft still to sign.
-_PAST_MONEY = re.compile(
+# Payments asked ABOUT, not asked FOR ("I paid mom 500 yesterday right?",
+# "did I send 50 to mom?"): the rules draft nothing, as the model is told
+# (prompts.py rule 9). The rules engine (the stand-in, and
+# unknown_payee_fallback, which must not bring back a payment the model left
+# out) and looks_like_payment read it this way. Obligations ("have to pay", "gets paid") are requests.
+_PAY_VERBS = r"pay|send|transfer|give(?!\s+me\b)|buy|purchase|wire|remit|move|top\s*up"
+_PAST_PAYMENT = re.compile(
     r"\b(?:paid|sent|transferred|gave|bought|purchased|wired|remitted|moved|topped\s+up)\b"
-    r"|\b(?:did|didn'?t|have|haven'?t|has|hasn'?t|had)\s+(?:\w+\s+){1,2}?"
-    r"(?:pay|send|transfer|give|buy|wire|move)\b", re.I)
-_REQUEST = re.compile(
-    r"\b(?:pay|send|transfer|give(?!\s+me\b)|buy|purchase|wire|remit|move|top\s*up|"
-    r"re-?send|re-?pay|repeat|redo|retry|again)\b", re.I)
+    r"|\b(?:did|didn['\u2019]?t|have|haven['\u2019]?t|has|hasn['\u2019]?t|had)\s+(?!to\b|better\b)"
+    rf"(?:\w+\s+){{0,2}}?(?:{_PAY_VERBS})\b", re.I)
+_OBLIGATION = re.compile(r"\b(?:be|get|gets|got|getting)\s+(?:paid|sent)\b"
+                         r"|\b(?:have|has|had)\s+to\b|\bhad\s+better\b", re.I)
+_ASKED_FOR = re.compile(rf"\b(?:{_PAY_VERBS}|re-?send|re-?pay|repeat|redo|retry)\b", re.I)
 
 
-def only_past_payments(transcript: str) -> bool:
-    if not _PAST_MONEY.search(transcript):
+def asks_only_about_past_payments(transcript: str) -> bool:
+    if _OBLIGATION.search(transcript) or not _PAST_PAYMENT.search(transcript):
         return False
-    return not _REQUEST.search(_PAST_MONEY.sub(" ", transcript))
+    return not _ASKED_FOR.search(_PAST_PAYMENT.sub(" ", transcript))

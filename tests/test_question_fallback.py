@@ -260,59 +260,70 @@ def test_a_question_with_an_amount_in_it_is_still_answered(client, text, label):
 
 
 # --------------------------------------------------------------------------- questions about past payments
+# The model is told to draft only payments asked for NOW (prompts.py rule 9);
+# the rules (the stand-in, and the unknown-payee fallback) read the same way.
+def test_the_parser_is_told_a_past_payment_is_not_a_request():
+    from backend.agent import prompts
+    rule = prompts.system_prompt()
+    assert "already made" in rule and '{"plan": [], "unresolved": []}' in rule
+
+
 @pytest.mark.parametrize("text,past", [
-    ("can you check if I sent 50 to mom?", True),       # asked politely, about the past
-    ("I paid mom 500 yesterday right?", True),
+    ("can you check if I sent 50 to mom?", True), ("I paid mom 500 yesterday right?", True),
     ("did I pay mom 500?", True), ("have I paid the landlord this month", True),
+    ("did I pay mom 500 again?", True),                 # asks about a duplicate
+    ("I didn't pay mom 500 yesterday right?", True), ("didn\u2019t I pay mom 500?", True),
     ("I transferred 50 to John, did it arrive", True),
-    ("can you pay mom 50?", False),                     # a polite request IS a payment
-    ("could you send 50 to John", False), ("are you able to send 50 to mom?", False),
+    ("can you pay mom 50?", False), ("are you able to send 50 to mom?", False),
     ("is it possible to pay mom 50 now?", False), ("pay mom 50 dollars", False),
-    ("is it safe to pay landlord 1500?", False),        # scored as a payment, as before
-    ("Is mom paid? if not pay her 500", False),         # an instruction after the question
-    ("mom paid for dinner, send her 30", False),        # a new payment beside a past one
+    ("I have to pay mom 500 today", False), ("Mom has to be paid 500 today", False),
+    ("make sure mom gets paid 500 today", False),       # obligations are requests
+    ("Is mom paid? if not pay her 500", False), ("mom paid for dinner, send her 30", False),
     ("I sent 50 to mom but it failed, send it again", False),
-    ("I sent 50 to mom but it failed, resend it", False),
-    ("repeat the 50 I sent mom yesterday", False)])
-def test_a_mention_of_a_past_payment_is_told_apart_from_a_new_one(text, past):
-    from backend.agent.router import only_past_payments
-    assert only_past_payments(text) is past
+    ("I sent 50 to mom but it failed, resend it", False), ("repeat the 50 I sent mom yesterday", False)])
+def test_the_rules_tell_a_past_payment_from_a_new_one(text, past):
+    from backend.agent.stub import asks_only_about_past_payments
+    assert asks_only_about_past_payments(text) is past
 
 
-def _no_parse(text, client):
+@pytest.mark.parametrize("text", ["can you check if I sent 50 to mom?", "I paid mom 500 yesterday right?"])
+def test_a_past_payment_is_answered_not_drafted(client, text):
+    """The model leaves it out (as told); the question lane answers it instead
+    of "I didn't catch a payment". It used to become a new $500 draft."""
     import backend.main as main
-    parsed = []
+    from backend.models.schemas import IntentPlan
     monkey = pytest.MonkeyPatch()
-    monkey.setattr(main, "parse_transcript", lambda *a, **k: parsed.append(a))
+    monkey.setattr(main, "parse_transcript",
+                   lambda *a, **k: IntentPlan.model_validate({"plan": [], "unresolved": []}))
     try:
-        return _ask(client, text), parsed
+        d = _ask(client, text)
     finally:
         monkey.undo()
+    assert d["status"] == "info" and "resolved_plan" not in d
 
 
-@pytest.mark.parametrize("text", ["can you check if I sent 50 to mom?",
-                                  "I paid mom 500 yesterday right?"])
-def test_a_question_about_a_past_payment_never_drafts_one(client, text):
-    """Answered as a question without the payment reader: "I paid mom 500
-    yesterday right?" used to become a new $500 draft."""
-    d, parsed = _no_parse(text, client)
-    assert d["status"] == "info" and "resolved_plan" not in d and parsed == []
+@pytest.mark.parametrize("text", ["I paid mom 500 yesterday right?", "did I send 200 to uncle bob?"])
+def test_the_rules_never_bring_a_past_payment_back(client, text):
+    """With the stand-in, and through the unknown-payee fallback (uncle bob
+    isn't a contact): no draft, no "add them?"."""
+    d = _ask(client, text)
+    assert d["status"] == "info" and "resolved_plan" not in d and "new_contact" not in d
 
 
 def test_a_past_payment_question_is_still_audited(client):
     from backend.main import _audit
     before = len([e for e in _audit.all_entries() if e["entry_type"] == "TRANSCRIPT"])
-    _no_parse("did I pay mom 500?", client)
+    _ask(client, "did I pay mom 500?")
     assert len([e for e in _audit.all_entries() if e["entry_type"] == "TRANSCRIPT"]) == before + 1
 
 
 def test_a_past_payment_question_still_gets_the_scam_warning(client):
-    """A coached victim asking about the past still hears the warning."""
-    d, _ = _no_parse("did I send 5000 to the safe account the police officer gave me?", client)
+    d = _ask(client, "did I send 5000 to the safe account the police officer gave me?")
     assert d["status"] == "info" and d.get("scam_language", {}).get("warning")
 
 
-@pytest.mark.parametrize("text", ["can you pay mom 50 dollars?", "are you able to send 50 to mom?"])
-def test_a_polite_payment_is_still_a_payment(client, text):
+@pytest.mark.parametrize("text", ["can you pay mom 50 dollars?", "are you able to send 50 to mom?",
+                                  "I have to pay mom 50 dollars today"])
+def test_a_request_is_still_a_payment(client, text):
     d = _ask(client, text)
     assert d["status"] == "ready" and d["resolved_plan"]["plan"][0]["amount_cents"] == 5000
