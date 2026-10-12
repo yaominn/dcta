@@ -1,0 +1,8 @@
+{
+  "pid": 56691,
+  "port": 59132,
+  "startedAt": "2026-10-12T14:16:47.907Z",
+  "version": "e23f7b807ff4788f6d7c90af2ab82960bd8c5851",
+  "serverPath": "/$bunfs/root/design",
+  "cmdlineMarker": "gstack-design-daemon"
+}
