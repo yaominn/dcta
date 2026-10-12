@@ -953,6 +953,35 @@ contacts still count towards "2+ contacts added today". Audited as
 `CONTACT_REMOVE`, by id only. `python -m backend.data.reset_demo` brings back
 demo contacts removed while practising. Tests: `tests/test_contact_remove.py`.
 
+## How DCTA lines up with MAS rules in Singapore
+
+The **Shared Responsibility Framework (SRF)** from MAS and IMDA has applied
+since 16 December 2024. It gives banks a set of anti-phishing duties. If a
+bank skipped a duty, it pays the victim's loss. The table matches each bank
+duty with what DCTA does, and says where we stop short. **This is not a
+compliance claim.** DCTA is a demo, and its phone is simulated.
+
+| SRF duty for the bank | What DCTA does | Status |
+|---|---|---|
+| **12-hour cooling period** after a new digital token or device: no high-risk actions (adding payees, changing contact details) | A passkey registered while another exists counts as a risk sign for 12 hours (`CREDENTIAL_COOLING_HOURS`), so payments are questioned or held. A new contact can be held for 12 hours before it can be paid (`NEW_CONTACT_HOLD_MINUTES`). | Partial: a new passkey raises the score but doesn't block high-risk actions outright |
+| **Real-time alerts** when a token is activated or a high-risk action happens | Unusual payments, new contacts and number changes send a code to the phone. The message describes the action from the bank's own copy, so a tampered screen can't change it. | Partial: registering a passkey sends no alert |
+| **Real-time alerts for every outgoing payment** | An in-app notification after every payment. Recurring payments also message the phone. | Partial: one-off payments don't message the phone |
+| **24/7 reporting channel and a self-service kill switch** | **Freeze** stops every outgoing payment at once and cancels waiting ones; only a phone code unfreezes it. Risky screens have tap-to-call buttons for the DBS Fraud Hotline (1800 339 6963) and ScamShield (1799). | ✅ |
+| **Fraud surveillance** for accounts drained fast (SGD 50,000 or more, over half sent out within 24 hours) | Limits of $20,000 per payment and $50,000 a day, more than 5 transfers in 10 minutes blocked, a scam score on every payment, and large payments wait before sending (and can be cancelled). | Partial: not the SRF's exact rapid-drain trigger |
+
+**Beyond the SRF.** The SRF covers phishing (stolen logins) and leaves out
+scams where victims send the money themselves. Those are what DCTA's scam
+protection targets: officials giving orders (police, MAS, CPF, IRAS, ICA),
+"safe accounts", job and investment scams, the "new number" message, OTP and
+screen-sharing requests, and money mules. DCTA asks questions, holds and
+delays payments, and points to ScamShield before money moves (see "Scam
+protection" above). Recurring bills were also checked against the MAS
+**E-Payments User Protection Guidelines** (`docs/RECURRING_BILLS.md`, again
+not a compliance claim).
+
+Sources: [Reed Smith on the SRF](https://www.reedsmith.com/fr/perspectives/2024/11/singapore-to-implement-shared-responsibility-framework-for-phishing-scams),
+[Mondaq on the SRF](https://mondaq.com/financial-services/1569162/combatting-payment-account-fraud-singapores-shared-responsibility-framework).
+
 ## `/data`: what the AI was told, step by step
 
 Open **http://localhost:8000/data** next to the assistant. For every request it
