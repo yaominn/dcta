@@ -64,6 +64,8 @@ def _recipient(ileg, rleg) -> tuple[str, str | None]:
         return _name(rleg.payee_display), ileg.target.mention
     if rleg.type == "PAY_BILL":
         return rleg.biller_display, ileg.target.mention
+    if rleg.type == "OWN_TRANSFER":
+        return f"your {rleg.to_display} account", ileg.target.mention
     return rleg.ticker, ileg.ticker.mention
 
 

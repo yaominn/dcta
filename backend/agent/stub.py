@@ -136,6 +136,10 @@ _DIGIT_AMOUNT = re.compile(
 )
 
 
+_GRAND = re.compile(r"\b(a|an|\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten)\s+grand\b",
+                    re.I)
+
+
 def _digit_to_cents(m: re.Match) -> int:
     """String composition only — NO float ever touches money (L2).
     "$500" / "500" / "500 dollars" -> 50000; "50.25" -> 5025; "50 cents" -> 50."""
@@ -174,6 +178,13 @@ def _extract_amount(clause: str) -> tuple[dict | None, str]:
         m = pat.search(clause)
         if m:
             return {"after_leg": None, "op": op}, (clause[:m.start()] + " " + clause[m.end():])
+
+    m = _GRAND.search(clause)            # "a grand", "2 grand": thousands of dollars
+    if m:
+        word = m.group(1).lower()
+        n = int(word) if word.isdigit() else (1 if word in ("a", "an") else _ONES.get(word, 0))
+        if n:
+            return {"literal_cents": n * 100_000}, clause[:m.start()] + " " + clause[m.end():]
 
     m = _DIGIT_AMOUNT.search(clause)
     if m:
@@ -241,19 +252,25 @@ def _find_source_account(clause: str, account_types: list[str]) -> str:
         if any(re.search(r"\b" + re.escape(w) + r"\b", words, re.I)
                for w in ACCOUNT_TYPE_SYNONYMS):
             return words
-    for t in account_types:  # "savings account", "my joint"
-        if re.search(r"\b" + re.escape(t) + r"\b", clause, re.I):
+    # "savings account", "my joint" — but not the account money goes TO
+    # ("move a grand to my joint account": joint is where it lands).
+    named = re.sub(r"\bto\s+(?:my|our|the)?\s*[a-z]+\s+account\b", " ", clause, flags=re.I)
+    for t in account_types:
+        if re.search(r"\b" + re.escape(t) + r"\b", named, re.I):
             return t
     return "default"
 
 
 def _unknown_name(rest: str) -> str | None:
     """Who a transfer goes to when it's nobody in the context: "... to uncle
-    bob", "... to uncle bob from savings", "pay uncle bob". The resolver then
-    asks, and offers to add them as a contact."""
-    words = re.sub(r"\s+(?:from|out of)\s+.*$", "", rest.strip(), flags=re.I)
-    m = (re.search(r"\bto\s+([\w\- ]+)$", words, re.I)
-         or re.search(r"\b(?:pay|send|give|transfer)\s+([\w\- ]+)$", words, re.I))
+    bob", "... to uncle bob from savings", "... from savings to my spending
+    account", "pay uncle bob". The resolver then asks, offers to add them as a
+    contact, or finds one of the user's own accounts."""
+    text = re.sub(r"[\s,.;]*(?:\band\b)?[\s,.;]*$", "", rest.strip(), flags=re.I)  # "..., and"
+    m = re.search(r"\bto\s+([\w\- ]+?)(?:\s+(?:from|out of)\b.*)?$", text, re.I)
+    if m is None:
+        words = re.sub(r"\s+(?:from|out of)\s+.*$", "", text, flags=re.I)
+        m = re.search(r"\b(?:pay|send|give|transfer|move)\s+([\w\- ]+)$", words, re.I)
     return " ".join(m.group(1).split()) if m else None
 
 
@@ -287,7 +304,7 @@ def _rules_plan(transcript: str, context: dict) -> dict:
             if target is None:
                 m = re.search(r"\bbuy\s+([a-z]+)", rest, re.I)
                 target = m.group(1) if m else None
-        elif payee or re.search(r"\b(pay|send|transfer|give)\b", rest, re.I):
+        elif payee or re.search(r"\b(pay|send|transfer|give|move)\b", rest, re.I):
             kind, target = "TRANSFER", payee
             if target is None:  # user named someone/something unknown -> resolver clarifies (4.4)
                 target = _unknown_name(rest)

@@ -43,6 +43,8 @@ def plan_summary(plan) -> str:
             parts.append(f"send {amt} to {leg.payee_display} from {src}")
         elif leg.type == "PAY_BILL":
             parts.append(f"pay {amt} to {leg.biller_display} from {src}")
+        elif leg.type == "OWN_TRANSFER":
+            parts.append(f"move {amt} from {src} to your {leg.to_display} account")
         else:
             parts.append(f"buy {leg.estimated_shares} {leg.ticker} for {amt} from {src}")
     return "; then ".join(parts)

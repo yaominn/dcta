@@ -39,6 +39,7 @@ from typing import TYPE_CHECKING
 from backend.models.schemas import (
     AmountOp,
     ResolvedBuyEquity,
+    ResolvedOwnTransfer,
     ResolvedPayBill,
     ResolvedTransfer,
     SymbolicAmount,
@@ -445,7 +446,9 @@ def recompute_symbolic(
     resolved_by_id = {leg.id: leg for leg in resolved_plan.plan}
 
     # fresh ledger: copy the starting balances of every account this plan touches.
-    acct_ids = {leg.source_account for leg in resolved_plan.plan}
+    acct_ids = ({leg.source_account for leg in resolved_plan.plan}
+                | {leg.to_account for leg in resolved_plan.plan
+                   if isinstance(leg, ResolvedOwnTransfer)})
     placeholders = ",".join("?" for _ in acct_ids) or "''"
     balances: dict[str, int] = {}
     if acct_ids:
@@ -464,6 +467,10 @@ def recompute_symbolic(
             ref = resolved_by_id.get(ileg.amount.after_leg)
             ref_acct = ref.source_account if ref is not None else rleg.source_account
             balance_now = balances.get(ref_acct, 0)
+            if isinstance(ref, ResolvedOwnTransfer):
+                # after a move between the user's own accounts, "it" is the
+                # money moved ("buy shares with half of it"), not what is left
+                balance_now = ref.amount_cents
             if ileg.amount.op == AmountOp.ALL:
                 allocated = balance_now
             else:                            # HALF — integer division by design
@@ -481,4 +488,6 @@ def recompute_symbolic(
             debit = rleg.amount_cents
         recomputed[ileg.id] = debit
         balances[rleg.source_account] = balances.get(rleg.source_account, 0) - debit
+        if isinstance(rleg, ResolvedOwnTransfer):
+            balances[rleg.to_account] = balances.get(rleg.to_account, 0) + debit
     return recomputed

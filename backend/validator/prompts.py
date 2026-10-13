@@ -35,6 +35,7 @@ from typing import TYPE_CHECKING
 from backend.display import cents_to_display
 from backend.models.schemas import (
     ResolvedBuyEquity,
+    ResolvedOwnTransfer,
     ResolvedPayBill,
     ResolvedTransfer,
 )
@@ -121,6 +122,9 @@ def render_plan(resolved_plan: "ResolvedPlan", conn: "sqlite3.Connection") -> st
             lines.append(
                 f"Step {i}: buy {leg.ticker} for {amt} from {acct}."
             )
+        elif isinstance(leg, ResolvedOwnTransfer):
+            lines.append(f"Step {i}: move {amt} from {acct} to the user's own "
+                         f"{_account_type(conn, leg.to_account)} account.")
         else:  # pragma: no cover - schema-constrained, unreachable
             lines.append(f"Step {i}: unknown leg type {leg.type}.")
     return "\n".join(lines)

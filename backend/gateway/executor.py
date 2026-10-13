@@ -176,6 +176,16 @@ class MockExecutor:
                     elif leg.type == "BUY_EQUITY":
                         self._debit(conn, leg.source_account, leg.amount_cents)
                         # MOCK: whole shares would settle into acct_invest (M4 resolves the count).
+                    elif leg.type == "OWN_TRANSFER":
+                        # Between two of the same customer's accounts, asked
+                        # again here: the money never lands in someone else's.
+                        owners = {r["user_id"] for r in conn.execute(
+                            "SELECT user_id FROM accounts WHERE id IN (?, ?)",
+                            (leg.source_account, leg.to_account))}
+                        if len(owners) != 1 or leg.source_account == leg.to_account:
+                            raise RuntimeError("both accounts must be the same customer's")
+                        self._debit(conn, leg.source_account, leg.amount_cents)
+                        self._credit(conn, leg.to_account, leg.amount_cents)
                     else:  # pragma: no cover - schema-constrained, unreachable
                         raise RuntimeError(f"unknown intent type {leg.type}")
                     # Recorded here, after the switch, so every executed leg
@@ -354,6 +364,11 @@ class MockExecutor:
              leg.amount_cents, datetime.now(timezone.utc).isoformat(),
              getattr(leg, "destination_version", None)),   # which destination was paid
         )
+
+    def _credit(self, conn, account_id: str, amount_cents: int) -> None:
+        if conn.execute("UPDATE accounts SET balance = balance + ? WHERE id=?",
+                        (amount_cents, account_id)).rowcount != 1:
+            raise RuntimeError(f"unknown account {account_id}")
 
     def _debit(self, conn, account_id: str, amount_cents: int) -> None:
         row = conn.execute("SELECT balance FROM accounts WHERE id=?", (account_id,)).fetchone()

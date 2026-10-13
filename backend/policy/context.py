@@ -58,7 +58,11 @@ def owner_of(plan: ResolvedPlan, *, db_path=None) -> str | None:
     Returns None if any account is unknown or the legs span more than one user —
     both of which the caller must treat as a rejection, not as "no policy".
     """
-    account_ids = {leg.source_account for leg in plan.plan}
+    # Every account the plan touches: the ones it debits, and the one a move
+    # between the user's own accounts lands in. Alice's money moved "to my
+    # spending account" that is really Bob's spans two users: rejected.
+    account_ids = ({leg.source_account for leg in plan.plan}
+                   | {leg.to_account for leg in plan.plan if leg.type == "OWN_TRANSFER"})
     if not account_ids:
         return None
     conn = connect(db_path or DB_PATH)

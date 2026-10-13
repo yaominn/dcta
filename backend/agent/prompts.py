@@ -51,7 +51,10 @@ Choosing the type — the VERB does not decide it, the RECIPIENT does:
              when mom / john / landlord is a payee, and "send 200 to uncle
              bob" is a TRANSFER with target {"mention": "uncle bob"} even when
              there is no such payee: the app then offers to add them as a
-             contact.
+             contact. Money moved between the user's OWN accounts ("move a
+             grand to my joint account") is a TRANSFER too, with target
+             {"mention": "joint account"}; "half of it" after it is
+             {"after_leg": <that leg>, "op": "HALF"}.
   PAY_BILL   a bill to one of the BILLERS (the companies in the context's
              "billers"), e.g. "pay the SP Group bill", "pay my electricity".
   BUY_EQUITY buying shares of a ticker.

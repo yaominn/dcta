@@ -399,3 +399,132 @@ def test_managing_a_recurring_payment_opens_bills_not_a_new_one(client, said):
 
 def test_setting_one_up_still_opens_the_form(client):
     assert _ask(client, "set up a monthly payment to SP Group")["status"] == "recurring_setup"
+
+
+# --------------------------------------------------------------------------- your own accounts
+def _balance(acct):
+    conn = get_conn()
+    try:
+        return conn.execute("SELECT balance FROM accounts WHERE id=?", (acct,)).fetchone()[0]
+    finally:
+        conn.close()
+
+
+def _sign_and_run(client, d):
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d["draft_id"]}).json()["nonce"]
+    sig = client.post("/api/auth/mock-sign", json={"resolved_plan": d["resolved_plan"],
+                                                   "nonce": nonce}).json()
+    return client.post("/api/gateway/execute", json={
+        "resolved_plan": d["resolved_plan"], "signature": sig["signature"], "nonce": nonce,
+        "credential_id": sig["credential_id"]}).json()
+
+
+@pytest.mark.parametrize("mention,to", [("joint account", "acct_joint"),
+                                        ("my spending account", "acct_joint"),
+                                        ("savings", "acct_savings")])
+def test_an_own_account_is_a_destination(client, mention, to):
+    """"move a grand to my joint account" asked "Joint isn't in your contacts
+    yet. Do you want to add them?"."""
+    from backend.resolver import Resolved, resolve
+    plan = _transfer_plan(mention, 100000)
+    if to == "acct_savings":
+        plan.plan[0].source_account.mention = "spending"
+    res = resolve(plan, transcript=f"move 1000 to {mention}", user_id="u_alice")
+    assert isinstance(res, Resolved), res
+    leg = res.plan.plan[0]
+    assert (leg.type, leg.to_account, leg.amount_cents) == ("OWN_TRANSFER", to, 100000)
+
+
+def test_moving_money_to_spending_end_to_end(client):
+    r = _ask(client, "move 200 from savings to my spending account")
+    assert r["status"] == "ready", r
+    leg = r["resolved_plan"]["plan"][0]
+    assert (leg["type"], leg["source_account"], leg["to_account"]) == (
+        "OWN_TRANSFER", "acct_savings", "acct_joint")
+    assert not r["validation"]["frozen"] and not r["requires_extra_confirmation"]
+    before = (_balance("acct_savings"), _balance("acct_joint"))
+    assert _sign_and_run(client, r)["accepted"] is True
+    assert (_balance("acct_savings"), _balance("acct_joint")) == (before[0] - 20000,
+                                                                  before[1] + 20000)
+
+
+def test_the_briefs_move_then_buy_with_half_of_it(client):
+    """Brief §2: "Move a grand to my joint account and then buy DBS shares with
+    half of it". "It" is the money just moved: $500 of D05, from the joint
+    account, where the grand now is."""
+    r = _ask(client, "Move a grand to my joint account and then buy D05 shares with half of it")
+    assert r["status"] == "ready", r
+    move, buy = r["resolved_plan"]["plan"]
+    assert (move["type"], move["to_account"], move["amount_cents"]) == (
+        "OWN_TRANSFER", "acct_joint", 100000)
+    assert (buy["type"], buy["source_account"], buy["estimated_shares"]) == (
+        "BUY_EQUITY", "acct_joint", 50000 // 4580)
+    assert not r["validation"]["frozen"], r["validation"]["checks"]
+    joint = _balance("acct_joint")
+    assert _sign_and_run(client, r)["accepted"] is True
+    assert _balance("acct_joint") == joint + 100000 - buy["amount_cents"]
+
+
+def test_moving_to_the_same_account_is_asked_about(client):
+    from backend.resolver import Clarify, resolve
+    plan = _transfer_plan("savings", 10000)
+    plan.plan[0].source_account.mention = "savings"
+    res = resolve(plan, transcript="move 100 from savings to savings", user_id="u_alice")
+    assert isinstance(res, Clarify)
+    assert res.question == "That's the same account. Which account should it go to?"
+
+
+def test_another_customers_account_is_refused_at_the_gateway(client):
+    """Both ends must be the signer's: a plan moving Alice's money into Bob's
+    account spans two customers and is rejected before anything runs."""
+    r = _ask(client, "move 200 from savings to my spending account")
+    r["resolved_plan"]["plan"][0]["to_account"] = "acct_bob"
+    out = _sign_and_run(client, r)
+    assert out["accepted"] is False
+    assert _balance("acct_bob") == 30000
+
+
+def test_a_swapped_destination_account_is_frozen(client):
+    from backend.models.schemas import ResolvedPlan
+    from backend.resolver import resolve
+    from backend.validator import validate
+    plan = _transfer_plan("joint account", 10000)
+    res = resolve(plan, transcript="move 100 to my joint account", user_id="u_alice")
+    tampered = res.plan.model_copy(update={"plan": [res.plan.plan[0].model_copy(
+        update={"to_account": "acct_invest", "to_display": "Investments"})]})
+    report = validate(plan, ResolvedPlan.model_validate(tampered.model_dump()),
+                      "move 100 to my joint account", provider=None)
+    assert report.frozen
+
+
+def _own_move_to(to_account):
+    from backend.models.schemas import ResolvedPlan
+    from backend.resolver import resolve
+    res = resolve(_transfer_plan("my spending account", 20000), transcript="move 200 to spending",
+                  user_id="u_alice")
+    data = res.plan.model_dump()
+    data["plan"][0]["to_account"] = to_account
+    return ResolvedPlan.model_validate(data)
+
+
+def test_a_plan_spanning_two_customers_has_no_owner(client):
+    from backend.policy import owner_of
+    assert owner_of(_own_move_to("acct_joint")) == "u_alice"
+    assert owner_of(_own_move_to("acct_bob")) is None
+
+
+def test_the_executor_never_credits_another_customer(client):
+    from backend.gateway.executor import MockExecutor
+    from backend.audit.canonical import payload_hash
+    plan = _own_move_to("acct_bob")
+    out = MockExecutor().execute(plan, payload_hash=payload_hash(plan))
+    assert out["status"] == "FAILED"
+    assert (_balance("acct_savings"), _balance("acct_bob")) == (842050, 30000)
+
+
+def test_a_move_between_accounts_is_named_in_recent_payments(client):
+    r = _ask(client, "move 200 from savings to my spending account")
+    _sign_and_run(client, r)
+    from backend import answers
+    assert answers.recent_payments("u_alice").splitlines()[0].startswith(
+        "$200.00 moved between your accounts")

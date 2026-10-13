@@ -265,8 +265,22 @@ class ResolvedBuyEquity(BaseModel):
     estimated_fill_price_cents: int             # per-share price, in cents
 
 
+class ResolvedOwnTransfer(BaseModel):
+    """Money moved between two of the user's OWN accounts ("move a grand to my
+    joint account"). The model said a TRANSFER to a mention; the resolver found
+    the mention names one of the user's accounts, not a payee. No payee and no
+    outside destination: the gateway checks both accounts belong to the signer."""
+    model_config = ConfigDict(extra="forbid")
+    id: str
+    type: Literal["OWN_TRANSFER"] = "OWN_TRANSFER"
+    source_account: str
+    to_account: str
+    to_display: str          # "Spending" — the account as the page names it
+    amount_cents: int = Field(gt=0, le=MAX_AMOUNT_CENTS)
+
+
 ResolvedIntent = Annotated[
-    Union[ResolvedTransfer, ResolvedPayBill, ResolvedBuyEquity],
+    Union[ResolvedTransfer, ResolvedPayBill, ResolvedBuyEquity, ResolvedOwnTransfer],
     Field(discriminator="type"),
 ]
 

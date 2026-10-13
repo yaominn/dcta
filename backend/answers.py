@@ -88,6 +88,8 @@ def _recent_rows(user_id: str, db_path: Path | None) -> list[tuple[str, str, int
             who = "A bill"
         elif r["leg_type"] == "BUY_EQUITY":
             who = "Shares"
+        elif r["leg_type"] == "OWN_TRANSFER":
+            who = "Your accounts"
         else:
             who = f"{r['nickname']} ··{r['last4']}" if r["nickname"] else "A payee"
         out.append((_day(r["ts"]), who, r["amount"]))
@@ -95,7 +97,8 @@ def _recent_rows(user_id: str, db_path: Path | None) -> list[tuple[str, str, int
 
 
 # A row with no payee, as the sentence says it.
-_SAID = {"A bill": "for a bill", "Shares": "for shares", "A payee": "to a payee"}
+_SAID = {"A bill": "for a bill", "Shares": "for shares", "A payee": "to a payee",
+         "Your accounts": "moved between your accounts"}
 
 
 def recent_payments(user_id: str, *, db_path: Path | None = None) -> str:

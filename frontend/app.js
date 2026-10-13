@@ -270,8 +270,9 @@ function windowLabel(created, expires) {
   });
   return `${mins} min — expires ${until}`;
 }
-const LEG_ICON = { TRANSFER: "→", PAY_BILL: "≡", BUY_EQUITY: "↗" };
-const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "Buy shares" };
+const LEG_ICON = { TRANSFER: "→", PAY_BILL: "≡", BUY_EQUITY: "↗", OWN_TRANSFER: "⇄" };
+const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "Buy shares",
+                   OWN_TRANSFER: "Move between your accounts" };
 
 // Where each field of a payment came from, as one short line. Quotes are the
 // user's OWN words, cut from the transcript by the server (backend/narrate.py);
@@ -367,11 +368,14 @@ function legRow(leg, ev) {
   // payee_display / biller_display are already the safe DB-sourced labels
   // (nickname + last 4). Raw ids are internal and never shown.
   const who = leg.payee_display || leg.biller_display;
-  const kind = leg.type === "PAY_BILL" ? "bill" : leg.type === "BUY_EQUITY" ? "equity" : "person";
+  const kind = leg.type === "PAY_BILL" ? "bill" : leg.type === "BUY_EQUITY" ? "equity"
+    : leg.type === "OWN_TRANSFER" ? "own" : "person";
   row.append(el("div", "icon " + kind,
-    leg.type === "BUY_EQUITY" ? LEG_ICON.BUY_EQUITY : who ? who.charAt(0).toUpperCase() : LEG_ICON[leg.type] || "•"));
+    leg.type === "BUY_EQUITY" || leg.type === "OWN_TRANSFER" ? LEG_ICON[leg.type]
+      : who ? who.charAt(0).toUpperCase() : LEG_ICON[leg.type] || "•"));
   let title = LEG_NAME[leg.type] || leg.type;
   if (who) title = who;
+  if (leg.type === "OWN_TRANSFER") title = "Your " + acctLabel(leg.to_account) + " account";
   if (leg.type === "BUY_EQUITY" && leg.ticker) {
     title = (leg.estimated_shares != null ? leg.estimated_shares + " × " : "") + leg.ticker;
   }
@@ -916,6 +920,7 @@ function executedLines(exec, plan) {
     if (leg.type === "TRANSFER") lines.push(amount + " to " + (p.payee_display || "payee") + from);
     else if (leg.type === "PAY_BILL") lines.push(amount + " to " + (p.biller_display || "biller") + from);
     else if (leg.type === "BUY_EQUITY") lines.push(amount + " of " + (p.ticker || "shares") + from);
+    else if (leg.type === "OWN_TRANSFER") lines.push(amount + " to your " + acctLabel(p.to_account) + " account" + from);
   }
   return lines;
 }

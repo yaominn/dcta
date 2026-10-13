@@ -63,6 +63,7 @@ from backend.models.schemas import (
     IntentPlan,
     LiteralAmount,
     ResolvedBuyEquity,
+    ResolvedOwnTransfer,
     ResolvedPayBill,
     ResolvedPlan,
     ResolvedTransfer,
@@ -437,6 +438,14 @@ def _check_beneficiary(rleg, transcript: str, conn) -> dict:
         ).fetchone()
         label = row["name"] if row else ""
         ok = _word_in(label, transcript)
+    elif isinstance(rleg, ResolvedOwnTransfer):
+        # One of the user's own accounts: a word for it must be said ("joint",
+        # "spending"), by the validator's own list, not the resolver's.
+        row = conn.execute("SELECT type FROM accounts WHERE id=?", (rleg.to_account,)).fetchone()
+        acct_type = row["type"] if row else ""
+        label = rleg.to_display
+        ok = bool(acct_type) and any(_word_in(w, transcript)
+                                     for w in _ACCOUNT_WORDS.get(acct_type, (acct_type,)))
     elif isinstance(rleg, ResolvedBuyEquity):
         label = rleg.ticker
         ok = _word_in(rleg.ticker, transcript) or any(
@@ -454,6 +463,8 @@ def _check_beneficiary(rleg, transcript: str, conn) -> dict:
                f"Say the name as it's saved in your contacts.")
     elif isinstance(rleg, ResolvedPayBill):
         say = f"The draft pays your {label} bill, but you didn't say {label}."
+    elif isinstance(rleg, ResolvedOwnTransfer):
+        say = f"The draft moves the money to your {label} account, but you didn't name it."
     else:
         say = f"The draft buys {label}, but you didn't name it."
     return _fail(

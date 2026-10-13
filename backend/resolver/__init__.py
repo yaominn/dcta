@@ -60,6 +60,7 @@ from backend.models.schemas import (
     LiteralAmount,
     PayBillIntent,
     ResolvedBuyEquity,
+    ResolvedOwnTransfer,
     ResolvedPayBill,
     ResolvedPlan,
     ResolvedTransfer,
@@ -178,8 +179,10 @@ class Resolved:
 class _LegResult:
     """Internal: a resolved leg plus the simulated-ledger effects to apply."""
     resolved: Any                  # a ResolvedTransfer | ResolvedPayBill | ResolvedBuyEquity
+                                   # | ResolvedOwnTransfer
     source_acct: str               # the concrete account id this leg debited
     debit: int                     # cents actually debited (== spend for BUY_EQUITY)
+    credit_acct: str | None = None # OWN_TRANSFER: the user's account it lands in
 
 
 # --------------------------------------------------------------------------- public API
@@ -244,6 +247,9 @@ def resolve(
             ).fetchall()
         }
         leg_source: dict[str, str] = {}          # leg id -> resolved source acct id
+        # leg id -> (account, cents) for money moved between the user's own
+        # accounts: "it" in a later "buy shares with half of it" is that money.
+        moved: dict[str, tuple[str, int]] = {}
         resolved_legs: list[Any] = []
 
         # Two amounts for one payment ("50 no wait 500"): ask, never pick. The
@@ -283,12 +289,15 @@ def resolve(
 
         for leg in intent_plan.plan:
             result = _resolve_leg(
-                conn, leg, user_id, balances, leg_source, answers, resume
+                conn, leg, user_id, balances, leg_source, answers, resume, moved
             )
             if isinstance(result, Clarify):
                 return result
             # apply this leg's debit to the simulated ledger, in plan order
             balances[result.source_acct] -= result.debit
+            if result.credit_acct is not None:
+                balances[result.credit_acct] += result.debit
+                moved[leg.id] = (result.credit_acct, result.debit)
             leg_source[leg.id] = result.source_acct
             resolved_legs.append(result.resolved)
     finally:
@@ -316,8 +325,14 @@ def _resolve_leg(
     leg_source: dict[str, str],
     answers: dict[str, str],
     resume: dict[str, Any],
+    moved: dict[str, tuple[str, int]] | None = None,
 ) -> _LegResult | Clarify:
     is_symbolic = isinstance(leg.amount, SymbolicAmount)
+    moved = moved or {}
+    # "Move a grand to my joint account and then buy DBS shares with half of
+    # it": after money moved between the user's own accounts, "it" is THAT
+    # money, in the account it moved to — not what is left behind.
+    from_move = moved.get(leg.amount.after_leg) if is_symbolic else None
 
     # 1. SOURCE ACCOUNT ------------------------------------------------------
     # For a symbolic-amount leg the account is DERIVED from the referenced leg's
@@ -326,7 +341,9 @@ def _resolve_leg(
     # mention (the schema requires it) but for symbolic legs we ignore it for
     # the debit — the stub parser may fill it with "default" when the user said
     # nothing; deriving keeps that from becoming a spurious clarify.
-    if is_symbolic:
+    if from_move is not None:
+        source_acct = from_move[0]
+    elif is_symbolic:
         source_acct = leg_source.get(leg.amount.after_leg)
         # after_leg is guaranteed by the schema to be an EARLIER leg, so its
         # source is already resolved and present. Unreachable in practice.
@@ -348,7 +365,14 @@ def _resolve_leg(
         source_acct = acct
 
     # 2. TARGET --------------------------------------------------------------
-    if isinstance(leg, TransferIntent):
+    own = (_own_account(conn, leg.target.mention, user_id)
+           if isinstance(leg, TransferIntent) else None)
+    if own is not None:
+        if own == source_acct:
+            return Clarify(
+                question="That's the same account. Which account should it go to?",
+                field=f"{leg.id}.target", kind="account", choices=[], resume_state=resume)
+    elif isinstance(leg, TransferIntent):
         tgt = _resolve_payee(
             conn, leg.target.mention, user_id,
             answers, f"{leg.id}.target", resume,
@@ -376,7 +400,11 @@ def _resolve_leg(
         raise RuntimeError(f"unknown intent type {leg.type!r}")
 
     # 3. AMOUNT -------------------------------------------------------------
-    if is_symbolic:
+    if from_move is not None:
+        # of the money just moved: "half of it" is half the grand
+        balance_now = from_move[1]
+        amount = balance_now if leg.amount.op == AmountOp.ALL else balance_now // 2
+    elif is_symbolic:
         # the balance of the referenced leg's OWN source account, from the
         # simulated ledger at this point (i.e. after that leg — and any
         # intervening legs that also debited it — have executed).
@@ -453,6 +481,12 @@ def _resolve_leg(
         )
 
     # 6. BUILD THE RESOLVED LEG ---------------------------------------------
+    if own is not None:
+        rleg = ResolvedOwnTransfer(
+            id=leg.id, type="OWN_TRANSFER", source_account=source_acct,
+            to_account=own, to_display=account_label(own), amount_cents=debit,
+        )
+        return _LegResult(rleg, source_acct, debit, credit_acct=own)
     if isinstance(leg, TransferIntent):
         # Bind the DESTINATION as it is now: a routing change after this draft
         # (a new number for "Mom") makes it SUPERSEDED at the gateway.
@@ -597,6 +631,22 @@ def _resolve_account(conn, mention, user_id, answers, field, resume):
         fallback=rows,
         zero_question=zero_question,
     )
+
+
+def _own_account(conn, mention: str, user_id: str) -> str | None:
+    """The user's own account a transfer's target names ("my joint account",
+    "spending", "savings"), or None. A payee whose nickname or name matches
+    wins, so a contact called "Savings" is still that contact."""
+    if _normalize(mention) in _DEFAULT_ACCOUNT_MENTIONS:
+        return None
+    payees = conn.execute(
+        "SELECT nickname, legal_name FROM payees WHERE user_id=? AND removed_at IS NULL",
+        (user_id,)).fetchall()
+    if _match(payees, mention, "nickname") or _match(payees, mention, "legal_name"):
+        return None
+    rows = conn.execute("SELECT id, type FROM accounts WHERE user_id=?", (user_id,)).fetchall()
+    matched = _match(rows, mention, "type", ACCOUNT_TYPE_SYNONYMS)
+    return matched[0]["id"] if len(matched) == 1 else None
 
 
 def _resolve_payee(conn, mention, user_id, answers, field, resume):
