@@ -22,7 +22,7 @@ from typing import Literal
 from fastapi import Depends, FastAPI, File, HTTPException, Request, UploadFile, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 from backend.config import settings
 from backend.data.db import DB_PATH, get_conn, migrate
@@ -58,7 +58,7 @@ from backend.validator.contacts import validate_contact_add, validate_contact_ch
 from backend.asr import (MAX_AUDIO_BYTES,
                          ASRNoSpeech, ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
-from backend import answers, spelling
+from backend import answers, ingest, spelling
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
@@ -645,6 +645,9 @@ class PlanRequest(BaseModel):
     transcript: str
     user_id: str = DEMO_USER_ID
 
+    _clean = field_validator("transcript", mode="before")(
+        lambda v: ingest.clean(v) if isinstance(v, str) else v)
+
 
 @app.post("/api/plan", response_model=None)
 def create_plan(req: PlanRequest):
@@ -836,6 +839,11 @@ class DraftRequest(BaseModel):
     fine"). The transcript is user speech: untrusted but authorized."""
     transcript: str
     user_id: str = DEMO_USER_ID
+    # Cleaned before anything reads it (backend/ingest.py): the router, the
+    # model, the rules and the transcript hash the signature binds all see the
+    # same normalised text.
+    _clean = field_validator("transcript", mode="before")(
+        lambda v: ingest.clean(v) if isinstance(v, str) else v)
     # Set when this message answers "what's Bob's number?": the id of the draft
     # that asked (a payment that named an unknown payee, or a new contact still
     # missing its number). The server reads the name and any waiting payment
@@ -1087,9 +1095,21 @@ def _pipeline(draft: Draft) -> dict:
     }
 
 
+NOTHING_HEARD = "I didn't catch anything — what would you like to do?"
+TOO_LONG = ("That's too long for me. Please say one or two payments at a time, "
+            "like \"send $50 to Mom\".")
+
+
 @app.post("/api/drafts", response_model=None)
 def create_draft(req: DraftRequest):
     """transcript -> a signable draft, a question, a policy refusal or a freeze."""
+    # Nothing to read, or far more than a request: answered here, before the
+    # model is called (and paid for).
+    if not req.transcript or len(req.transcript) > ingest.MAX_CHARS:
+        kind = "empty" if not req.transcript else "too_long"
+        return {"status": "clarify", "kind": kind, "draft_id": None, "field": kind,
+                "transcript": req.transcript[:ingest.MAX_CHARS], "choices": [],
+                "question": NOTHING_HEARD if kind == "empty" else TOO_LONG}
     conn = get_conn()
     try:
         payees = [dict(r) for r in conn.execute(
@@ -1659,6 +1679,9 @@ def _release_loop(stop: threading.Event) -> None:
 class PurposeAnswer(BaseModel):
     """The user's own words for what a risky payment is for."""
     answer: str = Field(min_length=1, max_length=300)
+
+    _clean = field_validator("answer", mode="before")(
+        lambda v: ingest.clean(v) if isinstance(v, str) else v)
 
 
 @app.post("/api/drafts/{draft_id}/purpose", response_model=None)

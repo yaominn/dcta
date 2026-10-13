@@ -126,3 +126,47 @@ def test_an_account_is_not_offered_as_a_new_contact(client, said):
     assert r["question"] == ("I can only send money to people saved in your contacts. "
                              "Who is it for?")
     assert r["choices"]
+
+
+# --------------------------------------------------------------------------- input cleaning
+@pytest.fixture
+def no_model(monkeypatch):
+    """Fails the test if anything asks for the model."""
+    import backend.main as m
+    def boom(*a, **k):
+        raise AssertionError("the model was called")
+    monkeypatch.setattr(m, "get_provider", boom)
+
+
+def test_hidden_characters_are_removed_before_anything_reads_them(client):
+    """A zero-width space inside "mom" froze the draft: "you didn't say Mom"."""
+    r = _ask(client, "send 50 to m​om‮")
+    assert r["status"] == "ready", r
+    assert r["transcript"] == "send 50 to mom"
+    assert r["resolved_plan"]["plan"][0]["payee_id"] == "payee_17"
+
+
+def test_full_width_letters_are_read_as_plain_ones(client):
+    r = _ask(client, "ｓｅｎｄ  50   to mom")
+    assert r["transcript"] == "send 50 to mom"
+
+
+@pytest.mark.parametrize("said", ["", "   ", "​​", "\n\t"])
+def test_an_empty_message_is_answered_without_the_model(client, no_model, said):
+    r = _ask(client, said)
+    assert r["status"] == "clarify" and r["kind"] == "empty"
+    assert r["question"] == "I didn't catch anything — what would you like to do?"
+
+
+def test_a_very_long_message_is_turned_away_without_the_model(client, no_model):
+    """A 6,000-character message went to the model whole: on a public link,
+    anyone could run up the bill. Requests are short; 500 characters is plenty."""
+    r = _ask(client, "send 50 to mom " * 100)
+    assert r["status"] == "clarify" and r["kind"] == "too_long"
+    assert r["question"] == ("That's too long for me. Please say one or two payments at a "
+                             "time, like \"send $50 to Mom\".")
+
+
+def test_a_purpose_answer_is_cleaned_too(client):
+    from backend.main import PurposeAnswer
+    assert PurposeAnswer(answer="rent​ for  mom").answer == "rent for mom"
