@@ -51,8 +51,9 @@ from backend.models.schemas import MAX_AUTH_WINDOW_S
 from backend.policy.new_contact import (NewContactFacts, decide as decide_new_contact,
                                         required_at_gateway)
 from backend.policy import contact_change_refusal, contact_change_step_up
-from backend.resolver.contacts import (InvalidValue, NewContact, normalize_nickname,
-                                       resolve_contact_add, resolve_contact_edit)
+from backend.resolver.contacts import (InvalidValue, NewContact, contact_name,
+                                       normalize_nickname, resolve_contact_add,
+                                       resolve_contact_edit)
 from backend.validator.contacts import validate_contact_add, validate_contact_change
 from backend.asr import (MAX_AUDIO_BYTES,
                          ASRNoSpeech, ASRUnavailable, get_asr_provider)
@@ -908,7 +909,7 @@ def _pipeline(draft: Draft) -> dict:
             # — unless the name is one typo from a contact ("Mon" / "Mom"):
             # then that contact is asked about first. Asked, never assumed.
             choices = draft.question["choices"]
-            name_of = lambda c: c["display"].rsplit(" ··", 1)[0]   # the resolver's "Mom ··3310"
+            name_of = lambda c: c.get("name") or c["display"].rsplit(" ··", 1)[0]   # "Mom"
             near = spelling.closest(offer["name"], [name_of(c) for c in choices])
             if near:
                 draft.question["choices"] = sorted(choices, key=lambda c: name_of(c) != near)
@@ -920,6 +921,9 @@ def _pipeline(draft: Draft) -> dict:
                 draft.question["question"] = (
                     f"{offer['name']} isn't in your contacts yet. Do you want to add them?"
                     + (" If you meant someone else, pick them below." if outcome.choices else ""))
+        elif outcome.kind == "payee" and outcome.unknown_mention:
+            # Money to "this new account": no one to add, and no guess either.
+            draft.question["question"] = NO_NAME_QUESTION
         _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
         return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
 
@@ -1352,6 +1356,10 @@ def _run(draft: Draft) -> dict:
 
 
 # --------------------------------------------------------------------------- adding a contact
+NO_NAME_QUESTION = ("I can only send money to people saved in your contacts. "
+                    "Who is it for?")
+
+
 def _new_contact_offer(plan: IntentPlan, q: Clarify) -> dict | None:
     """A payment named someone who is not a contact: offer to add them, next to
     the existing contacts. Transfers only — a bill or a share has no "new
@@ -1361,9 +1369,8 @@ def _new_contact_offer(plan: IntentPlan, q: Clarify) -> dict | None:
     leg = next((l for l in plan.plan if q.field == f"{l.id}.target"), None)
     if leg is None or leg.type != "TRANSFER":
         return None
-    try:
-        name = normalize_nickname(q.unknown_mention)
-    except InvalidValue:
+    name = contact_name(q.unknown_mention)
+    if name is None:                      # "this new account" names no one
         return None
     return {"name": name, "awaiting": "phone"}
 

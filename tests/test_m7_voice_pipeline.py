@@ -80,7 +80,7 @@ def test_utterance_produces_a_signable_draft():
 def test_ambiguous_payee_asks_rather_than_guessing():
     body = _draft("send fifty to john from savings").json()
     assert body["status"] == "clarify"
-    assert {c["display"] for c in body["choices"]} == {"John ··4521", "John ··8892"}
+    assert {c["display"] for c in body["choices"]} == {"John Doe ··4521", "John Smith ··8892"}
 
 
 def test_clarify_round_trip_the_ui_performs():

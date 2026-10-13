@@ -400,14 +400,17 @@ def _check_competing(ileg, rleg, transcript: str, offered: list[int], answers: d
 def _check_beneficiary(rleg, transcript: str, conn) -> dict:
     """The resolved id maps to a nickname/name/ticker in OUR DB. That label (or a
     close variant) must appear in the transcript. Match against OUR rows only —
-    never legal_name, last4, or biller reference_text (brief §4.2)."""
+    never last4 or biller reference_text (brief §4.2). A payee's full legal name
+    counts too, but only as the user's own words: "send 50 to John Doe" names
+    the John whose legal name is John Doe (the resolver matches it the same way)."""
     name = "beneficiary"
     if isinstance(rleg, ResolvedTransfer):
         row = conn.execute(
-            "SELECT nickname FROM payees WHERE id=?", (rleg.payee_id,)
+            "SELECT nickname, legal_name FROM payees WHERE id=?", (rleg.payee_id,)
         ).fetchone()
         label = row["nickname"] if row else ""
-        ok = _word_in(label, transcript)
+        ok = _word_in(label, transcript) or bool(
+            row and row["legal_name"] and _word_in(row["legal_name"], transcript))
     elif isinstance(rleg, ResolvedPayBill):
         row = conn.execute(
             "SELECT name FROM billers WHERE id=?", (rleg.biller_id,)

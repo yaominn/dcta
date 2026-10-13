@@ -107,7 +107,7 @@ def test_a_misspelled_contact_is_asked_about_never_assumed(client):
 
 def test_two_contacts_with_the_near_name_are_both_offered(client):
     q = _ask(client, "send 50 to Jon")["question"]
-    assert q.count("John ··") == 2
+    assert "John Doe ··4521" in q and "John Smith ··8892" in q
 
 
 # --------------------------------------------------------------------------- tables

@@ -489,6 +489,7 @@ def _pick(
     ident: Callable[[Any], str],
     fallback: list | None = None,
     zero_question: str | None = None,
+    name: Callable[[Any], str] | None = None,
 ) -> Any:
     """0 / 1 / 2+ logic shared by every mention kind.
 
@@ -516,7 +517,8 @@ def _pick(
                 return value(r)
         # an id that is not among the candidates is ignored -> re-clarify
 
-    choices = [{"id": ident(r), "display": display(r)} for r in candidates]
+    choices = [{"id": ident(r), "display": display(r), **({"name": name(r)} if name else {})}
+               for r in candidates]
     if not rows:
         opts = " or ".join(c["display"] for c in choices[:4])
         question = zero_question or (
@@ -592,20 +594,34 @@ def _resolve_account(conn, mention, user_id, answers, field, resume):
 
 def _resolve_payee(conn, mention, user_id, answers, field, resume):
     rows = conn.execute(
-        "SELECT id, nickname, last4 FROM payees WHERE user_id=? AND removed_at IS NULL",
-        (user_id,)
+        "SELECT id, nickname, legal_name, last4 FROM payees WHERE user_id=? "
+        "AND removed_at IS NULL", (user_id,)
     ).fetchall()
-    # payee_display is built from OUR DB only: nickname + last4. Never from the
-    # LLM, never from legal_name or biller reference_text (attacker-controllable;
-    # biller_07.reference_text carries a live injection). Same format for the
-    # disambiguation question and the signed payee_display, for a single
-    # provenance-safe surface.
+    # The signed payee_display is built from OUR DB only: nickname + last4.
+    # Never from the LLM, never from legal_name or biller reference_text
+    # (attacker-controllable; biller_07.reference_text carries a live injection).
+    #
+    # Two exceptions, both for the user's own words and neither signed:
+    #   - a full name the user SAID ("send 50 to John Doe") matches the contact
+    #     whose legal name it is, when no nickname matches;
+    #   - contacts sharing a nickname are told apart on the question's buttons
+    #     by legal name ("John Doe ··4521 or John Smith ··8892?"), the way the
+    #     brief asks. Every other button, and the card, shows the nickname.
+    matched = _match(rows, mention, "nickname") or _match(rows, mention, "legal_name")
+    shared = {_normalize(r["nickname"]) for r in rows
+              if sum(_normalize(o["nickname"]) == _normalize(r["nickname"]) for o in rows) > 1}
+
+    def display(r) -> str:
+        who = r["legal_name"] if _normalize(r["nickname"]) in shared and r["legal_name"] else r["nickname"]
+        return f"{who} ··{r['last4']}"
+
     return _pick(
-        _match(rows, mention, "nickname"), mention, "payee", field, resume, answers,
-        display=lambda r: f"{r['nickname']} ··{r['last4']}",
+        matched, mention, "payee", field, resume, answers,
+        display=display,
         value=lambda r: (r["id"], f"{r['nickname']} ··{r['last4']}"),
         ident=lambda r: r["id"],
         fallback=rows,
+        name=lambda r: r["nickname"],
     )
 
 

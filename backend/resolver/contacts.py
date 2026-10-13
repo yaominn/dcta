@@ -104,6 +104,32 @@ def normalize_nickname(raw: str) -> str:
     return name.title() if name == name.lower() else name
 
 
+# Words that say where money goes without naming anyone: "this new account",
+# "an account", "the new bank account", "them". Offered as a new contact, the
+# words of a scam script ("transfer $8,000 to this new account") became a payee
+# called "This New Account".
+_NOT_A_NAME = re.compile(
+    r"^(?:(?:new|other|another|different|bank|his|her|their|that|this|these|those)\s+)*"
+    r"(?:accounts?|acct|numbers?|bank|person|people|someone|somebody|them|him|her|it"
+    r"|recipients?|beneficiar(?:y|ies)|payees?|contacts?)$", re.I)
+_LEADING_WORD = re.compile(r"^(?:my|our|the|a|an)\s+", re.I)
+
+
+def contact_name(mention: str) -> str | None:
+    """What a payment's unknown recipient would be saved as: "my sister" ->
+    "Sister", "uncle bob" -> "Uncle Bob". None when the words name no one
+    ("this new account") or can't be a name."""
+    words = " ".join((mention or "").split())
+    while (m := _LEADING_WORD.match(words)):
+        words = words[m.end():]
+    if not words or _NOT_A_NAME.match(words):
+        return None
+    try:
+        return normalize_nickname(words)
+    except InvalidValue:
+        return None
+
+
 # --------------------------------------------------------------------------- resolve
 def resolve_contact_edit(plan: ContactEditPlan, *, transcript: str, user_id: str,
                          draft_id: str | None = None, answers: dict[str, str] | None = None,
