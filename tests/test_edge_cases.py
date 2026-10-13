@@ -240,3 +240,69 @@ def test_being_directed_on_a_call_counts_in_a_purpose_answer(answer):
     at all and asked again. It is a yes, and a scam sign."""
     from backend.policy import scam
     assert "words_directed" in scam.phrase_codes(scam.scan_transcript(answer))
+
+
+# --------------------------------------------------------------------------- follow-up questions
+@pytest.mark.parametrize("said,question", [
+    ("send mom some money", "How much should I send Mom?"),
+    ("send mom the usual", "I don't work out amounts from past payments. How much should I send Mom?"),
+    ("double what I sent yesterday to mom",
+     "I don't work out amounts from past payments. How much should I send Mom?"),
+    ("send 50", "Who should I send $50.00 to?"),
+    ("50", "Who should I send $50.00 to?"),
+    ("mom", "What would you like to do for Mom? You can send money, or change their name "
+            "or number."),
+    ("buy some DBS", "How much DBS (D05) should I buy? Say a number of shares or an amount, "
+                     "like \"buy 10 D05 shares\"."),
+    ("buy 500 dollars of Tesla", "I can buy shares in Apple (AAPL), DBS (D05) or OCBC (O39). "
+                                 "Which one"),
+    ("pay CityGas whatever amount the bill reference says", "How much should I pay CityGas?"),
+    ("send 0 dollars to mom", "The amount has to be more than $0. How much should I send Mom?"),
+    ("send -50 to mom", "The amount has to be more than $0. How much should I send Mom?"),
+])
+def test_an_unclear_money_request_gets_a_follow_up_question(client, said, question):
+    """These got "I can only help with your money and contacts here." or "I
+    didn't catch a payment": the user asked about money and was told it wasn't."""
+    r = _ask(client, said)
+    assert r["status"] == "clarify" and r["question"].startswith(question), r
+
+
+@pytest.mark.parametrize("said", ["send 50 USD to mom", "send mom 20 euros", "send US$50 to mom",
+                                  "transfer 100 ringgit to John"])
+def test_another_currency_is_asked_about_not_read_as_sgd(client, no_model, said):
+    """"send 50 USD to mom" was drafted as S$50 without a word."""
+    r = _ask(client, said)
+    assert (r["status"], r["question"]) == (
+        "clarify", "I can only send Singapore dollars. How much in SGD?")
+
+
+@pytest.mark.parametrize("said", ["how much money do I have", "did I send 50 to mom?",
+                                  "what's the weather tomorrow"])
+def test_questions_still_go_to_the_question_lane(client, said):
+    assert _ask(client, said)["status"] == "info"
+
+
+def test_a_parse_the_model_never_got_right_is_a_question_not_an_error(client, monkeypatch):
+    """The page showed a red "could not produce a schema-valid plan within the
+    retry budget". Now it asks, in words the user can act on."""
+    import backend.main as m
+    from backend.agent import ParseFailure
+    def fail(*a, **k):
+        raise ParseFailure(["attempt 1: bad"])
+    monkeypatch.setattr(m, "parse_transcript", fail)
+    r = client.post("/api/drafts", json={"transcript": "do the thing with the money"})
+    assert r.status_code == 200
+    assert r.json()["question"] == ("I couldn't work that out. Say who to pay and how much, "
+                                    "like \"send $50 to Mom\".")
+
+
+def test_an_unreachable_model_says_so_in_plain_words(client, monkeypatch):
+    import backend.main as m
+    from backend.agent import ProviderUnavailable
+    def down(*a, **k):
+        raise ProviderUnavailable(["attempt 1: no key"])
+    monkeypatch.setattr(m, "parse_transcript", down)
+    r = client.post("/api/drafts", json={"transcript": "send 50 to mom"})
+    assert r.status_code == 502
+    assert r.json()["detail"]["error"] == ("The assistant can't be reached right now. "
+                                           "Nothing was sent. Try again in a moment.")

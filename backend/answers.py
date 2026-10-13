@@ -12,6 +12,7 @@ reach the ledger directly (tests/test_import_boundary.py).
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -172,3 +173,116 @@ def reply(label: str, user_id: str, *, stopped: list[str] | None = None,
     if table:
         out["table"] = table
     return out
+
+
+# --------------------------------------------------------------------------- follow-up questions
+# A request about money that didn't become a payment ("send mom some money",
+# "send 50", "buy some DBS"): the question that would make it one, instead of
+# "I can only help with your money" or "I didn't catch a payment". Fixed
+# sentences, filled from the user's own contacts and the share list; rules
+# only, so it never adds a model call. A question about payments ("did I send
+# 50 to mom?") is the caller's to keep out: this reads requests.
+FOREIGN_CURRENCY = "I can only send Singapore dollars. How much in SGD?"
+COULD_NOT_READ = ("I couldn't work that out. Say who to pay and how much, "
+                  "like \"send $50 to Mom\".")
+
+_MONEY_WORD = re.compile(
+    r"\b(?:pay|send|transfer|give|wire|remit|move|top\s*up|buy|purchase|invest|money|cash"
+    r"|shares?|stocks?)\b", re.I)
+_BUY_WORD = re.compile(r"\b(?:buy|purchase|invest|shares?|stocks?)\b", re.I)
+_FROM_HISTORY = re.compile(
+    r"\b(?:the\s+usual|as\s+usual|usual\s+amount|same\s+(?:as|amount)|again|double|twice"
+    r"|triple|what\s+i\s+(?:sent|paid|gave))\b", re.I)
+_FOREIGN = re.compile(
+    r"\b(?:usd|us\s*dollars?|american\s+dollars?|eur|euros?|gbp|pounds?\s+sterling|pounds"
+    r"|yen|jpy|rmb|yuan|cny|myr|ringgit|aud|hkd|idr|rupiah|rupees?|inr|baht|thb|won|krw)\b"
+    r"|\bUS\$|€|£|¥", re.I)
+_NOT_POSITIVE = re.compile(
+    r"(?<![\w.$])-\s*\$?\d|(?<![\w.,$])\$?0+(?:\.0+)?(?![\w.,])|\bzero\s+(?:dollars?|bucks|sgd)\b",
+    re.I)
+
+
+def _name_in(text: str, names) -> str | None:
+    """The first of `names` said as words in `text` (case-insensitive)."""
+    for name in names:
+        if name and re.search(r"\b" + re.escape(name) + r"\b", text, re.I):
+            return name
+    return None
+
+
+def shares_on_offer(tickers: list[str]) -> str:
+    """'I can buy shares in Apple (AAPL), DBS (D05) or OCBC (O39).'"""
+    from backend.resolver import EQUITY_DISPLAY
+    listed = [f"{EQUITY_DISPLAY.get(tk, tk)} ({tk})" for tk in tickers]
+    return ("I can buy shares in " + (", ".join(listed[:-1]) + " or " if len(listed) > 1 else "")
+            + listed[-1] + ".")
+
+
+def from_history(transcript: str) -> bool:
+    """An amount the user wants worked out from past payments ("the usual",
+    "double what I sent yesterday"): a request, though it names a past one."""
+    return bool(_FROM_HISTORY.search(transcript))
+
+
+def foreign_currency(transcript: str) -> bool:
+    """A money amount in another currency: asked about before the model reads
+    it, because a model reads "50 USD" as 50 and the card would show S$50."""
+    return bool(_FOREIGN.search(transcript) and _MONEY_WORD.search(transcript))
+
+
+def before_model(transcript: str, *, payees: list[dict]) -> str | None:
+    """Questions asked before the model reads the request, because a model
+    reads past them: "50 USD" becomes S$50, "-50" becomes $50."""
+    if foreign_currency(transcript):
+        return FOREIGN_CURRENCY
+    if _MONEY_WORD.search(transcript) and _NOT_POSITIVE.search(transcript):
+        who = next((p["nickname"] for p in payees
+                    if _name_in(transcript, [p.get("nickname"), p.get("legal_name")])), None)
+        return ("The amount has to be more than $0."
+                + (f" How much should I send {who}?" if who else " How much should it be?"))
+    return None
+
+
+def follow_up(transcript: str, *, payees: list[dict], billers: list[dict],
+              equities: list[dict]) -> str | None:
+    """The one question that would turn this into a payment, or None."""
+    from backend.resolver import EQUITY_DISPLAY, EQUITY_NAME_TO_TICKER   # the resolver's names
+    from backend.validator.amounts import extract_literal_cents
+
+    t = transcript
+    who = None
+    for p in payees:
+        if _name_in(t, [p.get("nickname"), p.get("legal_name")]):
+            who = p["nickname"]
+            break
+    bill = _name_in(t, [b["name"] for b in billers])
+    tickers = {e["ticker"] for e in equities}
+    names = {n: tk for n, tk in EQUITY_NAME_TO_TICKER.items() if tk in tickers}
+    stock_name = _name_in(t, list(names) + sorted(tickers))
+    ticker = names.get(stock_name.lower(), stock_name.upper()) if stock_name else None
+    amounts = sorted(c for c in extract_literal_cents(t) if c > 0)
+    money = bool(_MONEY_WORD.search(t))
+    words = len(t.split())
+
+    asked = before_model(t, payees=payees)
+    if asked:
+        return asked
+    if bill and not amounts:
+        return f"How much should I pay {bill}?"
+    if ticker and not amounts:
+        return (f"How much {EQUITY_DISPLAY.get(ticker, ticker)} ({ticker}) should I buy? Say a number "
+                f"of shares or an amount, like \"buy 10 {ticker} shares\".")
+    if _BUY_WORD.search(t) and not (ticker or who or bill):
+        return shares_on_offer(sorted(tickers)) + " Which one, and how much?"
+    if who and not amounts:
+        if _FROM_HISTORY.search(t):
+            return (f"I don't work out amounts from past payments. "
+                    f"How much should I send {who}?")
+        if money:
+            return f"How much should I send {who}?"
+        if words <= 3:
+            return (f"What would you like to do for {who}? You can send money, or change "
+                    f"their name or number.")
+    if len(amounts) == 1 and not (who or bill or ticker) and (money or words <= 3):
+        return f"Who should I send {_money(amounts[0])} to?"
+    return None

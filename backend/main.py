@@ -13,6 +13,7 @@ gateway -> audit) is built in Milestones 1-8.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 from contextlib import asynccontextmanager
 import time
@@ -59,6 +60,7 @@ from backend.asr import (MAX_AUDIO_BYTES,
                          ASRNoSpeech, ASRUnavailable, get_asr_provider)
 from backend.resolver import Clarify, resolve
 from backend import answers, ingest, spelling
+from backend.agent.router import asks_only_about_past_payments
 from backend.validator import default_freeze_set, validate
 from backend.resolver import Clarify, Resolved, resolve
 from backend.policy import Decision, evaluate, load_context
@@ -1098,6 +1100,12 @@ def _pipeline(draft: Draft) -> dict:
 INJECTION_REFUSAL = ("Your message had instructions aimed at the app itself, so I haven't "
                      "acted on it and nothing was drafted. To make a payment, just say it, "
                      "like \"send $50 to Mom\".")
+MODEL_UNREACHABLE = ("The assistant can't be reached right now. Nothing was sent. "
+                     "Try again in a moment.")
+# Asked, not requested: "how much do I have?", "do I have enough for...?".
+# Not "can you send mom 50": that is a request.
+_ASKS = re.compile(r"^\s*(?:why|what|how|where|when|which|who|whose|did|do|does|have|has"
+                   r"|is|are|was|were)\b", re.I)
 NOTHING_HEARD = "I didn't catch anything — what would you like to do?"
 TOO_LONG = ("That's too long for me. Please say one or two payments at a time, "
             "like \"send $50 to Mom\".")
@@ -1170,6 +1178,9 @@ def create_draft(req: DraftRequest):
                             {"id": "recurring", "display": "Set up a recurring payment"}]}
     if route == "recurring_bill":
         return _recurring_setup_start(req)
+    if route == "payment" and (asked := answers.before_model(req.transcript, payees=payees)):
+        # Read by a model, "50 USD" becomes S$50 and "-50" becomes $50.
+        return _follow_up_reply(req, route, asked)
     if route == "contact_list":
         view = _contacts_view(req.user_id)
         tid = "list-" + DraftStore.new_id()
@@ -1200,11 +1211,17 @@ def create_draft(req: DraftRequest):
         _traces.event(tid, "parse", provider=provider.name, llm_calls=provider.calls,
                       error=str(exc))
         if isinstance(exc, ParseFailure):
-            raise HTTPException(status_code=422, detail={
-                "error": "could not produce a schema-valid plan within the retry budget",
-                "attempts": exc.errors})
+            # The model never produced a valid plan (often: no amount, which
+            # the schema requires). Ask, in words the user can act on; the
+            # attempts stay on the trace for /data.
+            question = (answers.follow_up(req.transcript, payees=payees, billers=billers,
+                                          equities=equities)
+                        if route == "payment" else None)
+            return {"status": "clarify", "kind": "empty", "draft_id": None,
+                    "field": "__empty__", "transcript": req.transcript, "choices": [],
+                    "question": question or answers.COULD_NOT_READ}
         raise HTTPException(status_code=502, detail={
-            "error": "LLM provider unavailable", "provider": provider.name,
+            "error": MODEL_UNREACHABLE, "provider": provider.name,
             "attempts": exc.errors})
 
     draft = _drafts.put(Draft(
@@ -1251,9 +1268,21 @@ def create_draft(req: DraftRequest):
     # parser failed to read ("send 50 to mom" still gets "I didn't catch a
     # payment") — so a payment makes no extra model call.
     question_calls: list = []
-    if (route == "payment" and out.get("status") == "clarify" and out.get("kind") == "empty"
-            and not looks_like_payment(req.transcript)):
-        out, question_calls = _answer_question(req, draft)
+    follow = None
+    if route == "payment" and out.get("status") == "clarify" and out.get("kind") == "empty":
+        # About money but not yet a payment ("send mom some money", "send 50"):
+        # the question that would make it one. Questions ABOUT payments
+        # ("did I send 50 to mom?") still go to the question lane.
+        if not _ASKS.search(req.transcript) and not (
+                asks_only_about_past_payments(req.transcript)
+                and not answers.from_history(req.transcript)):
+            follow = answers.follow_up(req.transcript, payees=payees, billers=billers,
+                                       equities=equities)
+        if follow:
+            draft.question = {**(draft.question or {}), "question": follow}
+            out = {**out, "question": follow}
+        elif not looks_like_payment(req.transcript):
+            out, question_calls = _answer_question(req, draft)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
     # A refused new contact already carries its own warning: no second one.
@@ -1265,6 +1294,16 @@ def create_draft(req: DraftRequest):
                                     "warning": scam.warning_for(found)}
     return _with_debug(out, draft,
                        provider.calls + question_calls + getattr(draft, "llm_calls", []))
+
+
+def _follow_up_reply(req: DraftRequest, route: str, question: str) -> dict:
+    """A question asked before any draft exists (no model call), on the trace."""
+    tid = "asked-" + DraftStore.new_id()
+    _trace_start(tid, req, route)
+    _traces.event(tid, "follow_up", note="asked by the rules; the model was not called",
+                  question=question)
+    return {"status": "clarify", "kind": "empty", "draft_id": None, "field": "__empty__",
+            "transcript": req.transcript, "choices": [], "question": question}
 
 
 def _answer_question(req: DraftRequest, draft: Draft) -> tuple[dict, list]:

@@ -142,6 +142,8 @@ EQUITY_NAME_TO_TICKER: dict[str, str] = {
     "dbs": "D05",
     "ocbc": "O39",
 }
+# ...and how each is said back to the user ("DBS (D05)").
+EQUITY_DISPLAY: dict[str, str] = {"AAPL": "Apple", "D05": "DBS", "O39": "OCBC"}
 
 
 # --------------------------------------------------------------------------- result types
@@ -649,8 +651,12 @@ def _resolve_equity(conn, mention, answers, field, resume):
         tk = EQUITY_NAME_TO_TICKER.get(_normalize(mention))
         if tk:
             matched = [r for r in rows if r["ticker"] == tk]
+    listed = [f"{EQUITY_DISPLAY.get(r['ticker'], r['ticker'])} ({r['ticker']})" for r in rows]
     return _pick(
         matched, mention, "equity", field, resume, answers,
+        zero_question=("I can buy shares in " + (", ".join(listed[:-1]) + " or " if len(listed) > 1
+                                                  else "") + listed[-1] + ". Which one?")
+                      if rows else None,
         display=lambda r: r["ticker"],
         value=lambda r: (r["ticker"], r["price"]),
         ident=lambda r: r["ticker"],
