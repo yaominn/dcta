@@ -1,0 +1,22 @@
+[Unit]
+Description=DCTA demo (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=dcta
+Group=dcta
+WorkingDirectory=/opt/dcta
+# One worker only: drafts, nonces and traces live in this process's memory, so a
+# second worker would not know a draft the first one made. No --reload.
+ExecStart=/opt/dcta/.venv/bin/uvicorn backend.main:app --host 127.0.0.1 --port 8000 --workers 1 --proxy-headers
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/dcta/backend/data
+
+[Install]
+WantedBy=multi-user.target

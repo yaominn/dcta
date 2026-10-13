@@ -1301,8 +1301,8 @@ def _rescore(draft: Draft, plan: ResolvedPlan, now: int):
 
 def _public_scam(assessment, hold_release: int | None, stored: dict | None) -> dict | None:
     """What the page needs from a scam assessment: the outcome (never below
-    what this draft was shown before), the fixed warnings, the hold's time
-    left, and the name to type for HOLD_STEP_UP."""
+    what this draft was shown before), the fixed warnings and the hold's time
+    left."""
     if assessment is None:
         return None
     out = {"outcome": stored["outcome"], "score": assessment.score,

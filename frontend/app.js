@@ -277,7 +277,7 @@ const LEG_NAME = { TRANSFER: "Transfer", PAY_BILL: "Bill payment", BUY_EQUITY: "
 // user's OWN words, cut from the transcript by the server (backend/narrate.py);
 // "by default" / "calculated" say what the assistant filled in. Pure — the
 // review card's evidence is tested under Node (tests/js/app_runner.js).
-/* ---------- scam protection: the sign gate, the hold, the name check ---------- */
+/* ---------- scam protection: the sign gate and the hold ---------- */
 const SIGN_LABEL = "Confirm with biometric";
 
 // Help lines the user can call themselves. Check against the live pages
