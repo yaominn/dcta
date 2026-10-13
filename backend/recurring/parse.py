@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from backend.recurring import schedule
-from backend.validator.amounts import money_occurrences
+from backend.validator.amounts import extract_literal_cents, money_occurrences
 
 _NUMBER_WORDS = {
     "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
@@ -128,7 +128,12 @@ def extract(transcript: str, *, billers: list, today: date) -> SetupFields:
     if len(accounts) == 1:
         out.source_account = accounts.pop()
 
-    amounts = set(money_occurrences(_without_schedule(text)))
+    # "pay CityGas 80 every month": a bare 80 before "every" doesn't read as
+    # money to money_occurrences (it reads "80 every" like "2 tickets"), so
+    # with nothing that does, the plain reading counts, still only when
+    # exactly one amount was said.
+    amounts = (set(money_occurrences(_without_schedule(text)))
+               or set(extract_literal_cents(_without_schedule(text))))
     if len(amounts) == 1:
         out.amount_cents = amounts.pop()
 

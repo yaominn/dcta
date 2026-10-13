@@ -52,9 +52,19 @@ _BARE_BILL = re.compile(
     re.I)
 
 
+# Changing or looking at an arrangement that exists, not setting one up:
+# "cancel my CityGas recurring payment", "stop paying CityGas every month",
+# "show my recurring payments". Opens the Bills list, where each one has its
+# own Cancel and Pause; nothing is changed by the words alone.
+_MANAGE_RECURRING = re.compile(
+    r"\b(?:cancel|stop|pause|resume|unpause|turn\s+off|show|list|see|view)\b", re.I)
+_MY_BILLS = re.compile(r"\b(?:show|list|see|view|check)\s+(?:me\s+)?(?:my|the)\s+"
+                       r"(?:recurring\s+|monthly\s+|weekly\s+)?bills\b", re.I)
+
+
 def classify_request(transcript: str) -> str:
-    """'contact_list' | 'contact_add' | 'contact_edit' | 'recurring_bill' |
-    'bill_ambiguous' | 'payment'."""
+    """'contact_list' | 'contact_add' | 'contact_edit' | 'recurring_manage' |
+    'recurring_bill' | 'bill_ambiguous' | 'payment'."""
     # A request that starts with "add"/"save" is an addition, whatever the
     # name: "add See Toh as a contact" is not "see contacts".
     if _ADD_FIRST.search(transcript) and _ADD.search(transcript):
@@ -65,8 +75,10 @@ def classify_request(transcript: str) -> str:
         return "contact_add"
     if _EDIT.search(transcript):
         return "contact_edit"
+    if _MY_BILLS.search(transcript):
+        return "recurring_manage"
     if _RECURRING.search(transcript):
-        return "recurring_bill"
+        return "recurring_manage" if _MANAGE_RECURRING.search(transcript) else "recurring_bill"
     if _BARE_BILL.search(transcript):
         return "bill_ambiguous"
     return "payment"

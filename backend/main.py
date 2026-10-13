@@ -1106,6 +1106,8 @@ MODEL_UNREACHABLE = ("The assistant can't be reached right now. Nothing was sent
 # Not "can you send mom 50": that is a request.
 _ASKS = re.compile(r"^\s*(?:why|what|how|where|when|which|who|whose|did|do|does|have|has"
                    r"|is|are|was|were)\b", re.I)
+MANAGE_BILLS = ("Here are your recurring payments. Tap Cancel or Pause on the one you want "
+                "to change. Nothing changes until you do.")
 NOTHING_HEARD = "I didn't catch anything — what would you like to do?"
 TOO_LONG = ("That's too long for me. Please say one or two payments at a time, "
             "like \"send $50 to Mom\".")
@@ -1178,6 +1180,11 @@ def create_draft(req: DraftRequest):
                             {"id": "recurring", "display": "Set up a recurring payment"}]}
     if route == "recurring_bill":
         return _recurring_setup_start(req)
+    if route == "recurring_manage":
+        tid = "bills-" + DraftStore.new_id()
+        _trace_start(tid, req, route)
+        _traces.event(tid, "bills", note="the Bills list; the LLM is not called")
+        return {"status": "info", "kind": "bills", "draft_id": None, "message": MANAGE_BILLS}
     if route == "payment" and (asked := answers.before_model(req.transcript, payees=payees)):
         # Read by a model, "50 USD" becomes S$50 and "-50" becomes $50.
         return _follow_up_reply(req, route, asked)

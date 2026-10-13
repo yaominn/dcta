@@ -373,3 +373,29 @@ def test_too_little_for_one_share_says_dollars(client):
     assert isinstance(res, Clarify)
     assert res.question == ("$10.00 isn't enough for a whole share of AAPL at $241.50 — "
                             "a different amount or account?")
+
+
+# --------------------------------------------------------------------------- recurring bills
+@pytest.mark.parametrize("said", ["pay CityGas 80 every month", "pay CityGas $80 every month",
+                                  "pay CityGas eighty dollars monthly"])
+def test_the_amount_of_a_recurring_bill_is_kept(client, said):
+    """"pay CityGas 80 every month" opened the form asking "How much is each
+    payment?": "80 every" didn't read as money."""
+    r = _ask(client, said)
+    assert r["status"] == "recurring_setup"
+    assert r["fields"]["amount_cents"] == 8000
+
+
+@pytest.mark.parametrize("said", ["cancel my CityGas recurring payment",
+                                  "stop paying CityGas every month",
+                                  "show my recurring payments", "pause my monthly SP Group bill"])
+def test_managing_a_recurring_payment_opens_bills_not_a_new_one(client, said):
+    """"cancel my CityGas recurring payment" opened the form to SET UP a new one."""
+    r = _ask(client, said)
+    assert (r["status"], r["kind"]) == ("info", "bills")
+    assert r["message"] == ("Here are your recurring payments. Tap Cancel or Pause on the one "
+                            "you want to change. Nothing changes until you do.")
+
+
+def test_setting_one_up_still_opens_the_form(client):
+    assert _ask(client, "set up a monthly payment to SP Group")["status"] == "recurring_setup"

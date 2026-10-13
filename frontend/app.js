@@ -1291,6 +1291,11 @@ function handleDraft(res) {
     return;
   }
   // A contacts list is "info" too: it is drawn as the list, further down.
+  if (body.status === "info" && body.kind === "bills") {      // "cancel my recurring payment"
+    botSay(body.message);
+    showBills();
+    return;
+  }
   if (body.status === "info" && body.kind !== "contacts") {   // nothing to draft: a line to say
     if (body.table && body.table.rows && body.table.rows.length) addMsg("bot", buildTable(body.table));
     else botSay(body.message);
