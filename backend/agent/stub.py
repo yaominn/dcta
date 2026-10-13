@@ -476,7 +476,9 @@ _QUESTION_RULES = (
         r"didn'?t|did\s+not|won'?t|wouldn'?t|not\s+go|let\s+me)", re.I)),
     ("recent_payments", re.compile(
         r"\b(?:recent|recently|last|history|transactions?|spent|spend|spending|"
-        r"where\s+did\s+my\s+money|statement)\b", re.I)),
+        r"where\s+did\s+my\s+money|statement)\b"
+        # "did I send 50 to mom?", as the model labels it
+        r"|\b(?:did|have)\s+i\s+(?:pay|paid|send|sent|transfer(?:red)?|give|gave)\b", re.I)),
     ("balance", re.compile(
         r"\b(?:balance|how\s+much\s+(?:money\s+)?(?:do\s+i|is|have\s+i)|broke|"
         r"what'?s\s+in\s+my|left\s+in|funds|money\s+do\s+i\s+have)\b", re.I)),

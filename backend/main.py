@@ -1289,7 +1289,7 @@ def create_draft(req: DraftRequest):
             draft.question = {**(draft.question or {}), "question": follow}
             out = {**out, "question": follow}
         elif not looks_like_payment(req.transcript):
-            out, question_calls = _answer_question(req, draft)
+            out, question_calls = _answer_question(req, draft, payees=payees)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
     # A refused new contact already carries its own warning: no second one.
@@ -1313,7 +1313,8 @@ def _follow_up_reply(req: DraftRequest, route: str, question: str) -> dict:
             "transcript": req.transcript, "choices": [], "question": question}
 
 
-def _answer_question(req: DraftRequest, draft: Draft) -> tuple[dict, list]:
+def _answer_question(req: DraftRequest, draft: Draft, *,
+                     payees: list[dict] | None = None) -> tuple[dict, list]:
     """Which question a request with no payment is asking. The model picks ONE
     label (backend/agent/question.py) from the user's words alone; the answer
     is fixed sentences from the ledger (backend/answers.py), or the contacts
@@ -1324,7 +1325,9 @@ def _answer_question(req: DraftRequest, draft: Draft) -> tuple[dict, list]:
         out = _contacts_view(req.user_id)
         said = f"the contacts list ({len(out['contacts'])} contacts)"
     else:
-        out = answers.reply(label, req.user_id, stopped=_stopped.get(req.user_id))
+        # "did I pay mom?": only Mom's payments, if the question names one contact
+        out = answers.reply(label, req.user_id, stopped=_stopped.get(req.user_id),
+                            payee=answers.named_payee(req.transcript, payees or []))
         said = out["message"]
     _traces.event(draft.draft_id, "question", provider=classifier.name,
                   llm_calls=classifier.calls, label=label, reply=said)

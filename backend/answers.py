@@ -68,8 +68,10 @@ def _day(ts: str) -> str:
         return "earlier"
 
 
-def _recent_rows(user_id: str, db_path: Path | None) -> list[tuple[str, str, int]]:
-    """(day, who it went to, cents) for the last few payments, newest first.
+def _recent_rows(user_id: str, db_path: Path | None,
+                 payee_id: str | None = None) -> list[tuple[str, str, int]]:
+    """(day, who it went to, cents) for the last few payments, newest first;
+    only those to `payee_id` when given ("did I pay mom?").
     A bill or a share purchase has no payee on record, so it says what it was."""
     conn = _conn(db_path)
     try:
@@ -78,8 +80,9 @@ def _recent_rows(user_id: str, db_path: Path | None) -> list[tuple[str, str, int
             "FROM transaction_history h LEFT JOIN payees p ON p.id = h.payee_id "
             # Newest first by when it happened (rows aren't inserted in date
             # order: the seed writes its history oldest-last). ts is ISO-8601 UTC.
-            "WHERE h.user_id=? ORDER BY h.ts DESC, h.id DESC LIMIT ?",
-            (user_id, RECENT_COUNT)).fetchall()
+            "WHERE h.user_id=? AND (? IS NULL OR h.payee_id=?) "
+            "ORDER BY h.ts DESC, h.id DESC LIMIT ?",
+            (user_id, payee_id, payee_id, RECENT_COUNT)).fetchall()
     finally:
         conn.close()
     out = []
@@ -101,12 +104,13 @@ _SAID = {"A bill": "for a bill", "Shares": "for shares", "A payee": "to a payee"
          "Your accounts": "moved between your accounts"}
 
 
-def recent_payments(user_id: str, *, db_path: Path | None = None) -> str:
+def recent_payments(user_id: str, *, db_path: Path | None = None,
+                    payee: dict | None = None) -> str:
     """The last few payments, newest first, one per line:
-    '$50.00 to Mom ··3310 · 12 Oct'."""
-    rows = _recent_rows(user_id, db_path)
+    '$50.00 to Mom ··3310 · 12 Oct'. Only those to `payee` when given."""
+    rows = _recent_rows(user_id, db_path, payee["id"] if payee else None)
     if not rows:
-        return NO_PAYMENTS
+        return f"No payments to {payee['nickname']} yet." if payee else NO_PAYMENTS
     lines = []
     for day, who, cents in rows:
         what = _SAID.get(who, "to " + who)
@@ -135,8 +139,9 @@ def balance_table(user_id: str, *, db_path: Path | None = None) -> dict | None:
                   [[name, _money(cents)] for name, cents in rows], footer=total)
 
 
-def recent_table(user_id: str, *, db_path: Path | None = None) -> dict | None:
-    rows = _recent_rows(user_id, db_path)
+def recent_table(user_id: str, *, db_path: Path | None = None,
+                 payee: dict | None = None) -> dict | None:
+    rows = _recent_rows(user_id, db_path, payee["id"] if payee else None)
     if not rows:
         return None
     return _table("Recent payments", [("Date", False), ("Paid to", False), ("Amount", True)],
@@ -154,7 +159,7 @@ def why_stopped(reasons: list[str] | None) -> str:
 
 
 def reply(label: str, user_id: str, *, stopped: list[str] | None = None,
-          db_path: Path | None = None) -> dict:
+          db_path: Path | None = None, payee: dict | None = None) -> dict:
     """The info reply for a label. "contacts" is handled by the caller (it is
     the contacts list itself, not a sentence). An answer with several rows
     also carries them as a `table` for the app to draw; `message` stays the
@@ -164,8 +169,8 @@ def reply(label: str, user_id: str, *, stopped: list[str] | None = None,
         message = balance(user_id, db_path=db_path)
         table = balance_table(user_id, db_path=db_path)
     elif label == "recent_payments":
-        message = recent_payments(user_id, db_path=db_path)
-        table = recent_table(user_id, db_path=db_path)
+        message = recent_payments(user_id, db_path=db_path, payee=payee)
+        table = recent_table(user_id, db_path=db_path, payee=payee)
     elif label == "why_stopped":
         message = why_stopped(stopped)
     elif label == "what_can_you_do":
@@ -219,6 +224,13 @@ def shares_on_offer(tickers: list[str]) -> str:
     listed = [f"{EQUITY_DISPLAY.get(tk, tk)} ({tk})" for tk in tickers]
     return ("I can buy shares in " + (", ".join(listed[:-1]) + " or " if len(listed) > 1 else "")
             + listed[-1] + ".")
+
+
+def named_payee(transcript: str, payees: list[dict]) -> dict | None:
+    """The one contact a question names ("did I pay mom?"), by nickname or full
+    name; None if none, or if the name fits several (two Johns)."""
+    hits = [p for p in payees if _name_in(transcript, [p.get("nickname"), p.get("legal_name")])]
+    return hits[0] if len(hits) == 1 else None
 
 
 def from_history(transcript: str) -> bool:

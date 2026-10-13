@@ -528,3 +528,16 @@ def test_a_move_between_accounts_is_named_in_recent_payments(client):
     from backend import answers
     assert answers.recent_payments("u_alice").splitlines()[0].startswith(
         "$200.00 moved between your accounts")
+
+
+# --------------------------------------------------------------------------- questions about one contact
+def test_did_i_pay_mom_lists_only_moms_payments(client):
+    """"did I send 50 to mom?" listed the last five payments, four of them to John."""
+    r = _ask(client, "did I send 50 to mom?")
+    lines = r["message"].splitlines()
+    assert lines and all("Mom ··3310" in l for l in lines)
+    assert all(row[1] == "Mom ··3310" for row in r["table"]["rows"])
+
+
+def test_a_contact_never_paid_says_so(client):
+    assert _ask(client, "did I pay landlord?")["message"] == "No payments to Landlord yet."
