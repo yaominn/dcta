@@ -226,7 +226,14 @@ _WORDS: list[tuple[str, str, re.Pattern, str]] = [
         r"|\b(?:told|asked|instructed|warned)\s+(?:me|us)\s+(?:not\s+to|never\s+to|to\s+never)\s+"
         r"hang\s+up\b"
         r"|\bthe\s+(?:officer|caller|man|woman|lady|guy|person|agent)\s+(?:is|'s)\s+(?:still\s+)?"
-        r"on\s+the\s+(?:line|phone|call)\b", re.I),
+        r"on\s+the\s+(?:line|phone|call)\b"
+        # "a man from the bank is on the phone telling me to", "the officer on
+        # the line is guiding me": a stranger, official or the bank, on a call,
+        # steering. Not "mom is on the phone telling me to pay her".
+        r"|\b(?:man|woman|lady|guy|gentleman|person|someone|somebody|caller|officer|agent"
+        r"|investigator|inspector|staff|bank|police)\b[^.?!]{0,30}?\bon\s+the\s+(?:phone|line|call)\b"
+        r"[^.?!]{0,20}?\b(?:(?:telling|asking|instructing)\s+(?:me|us)\s+(?:to|what)\b"
+        r"|(?:guiding|coaching|directing)\s+(?:me|us)\b)", re.I),
      "Someone seems to be directing you right now. Hang up, then call your bank or "
      "1799 on a number you look up yourself."),
     ("words_new_number", "strong", re.compile(

@@ -261,15 +261,41 @@ _OFFICIAL_ORDERS = re.compile(
     rf"\b{_OFFICIAL}\b[^.?!]{{0,50}}\b(?:said|says|told|asked|instructed|ordered|wants?|needs?)\b"
     rf"[^.?!]{{0,50}}\b(?:pay|transfer|send|move|withdraw)\b"
     rf"|\b(?:told|asked|instructed|ordered)\s+(?:me|us)\s+to\s+(?:pay|transfer|send|move)\b"
-    rf"[^.?!]{{0,60}}\b{_OFFICIAL}\b", re.I)
+    rf"[^.?!]{{0,60}}\b{_OFFICIAL}\b"
+    # "transfer $8,000 to this new account, the police officer said my account
+    # is compromised": the official's claim comes after the payment it explains.
+    rf"|\b{_OFFICIAL}\b[^.?!]{{0,30}}\b(?:said|says|told\s+(?:me|us)|claims?|claimed)\s+(?:that\s+)?"
+    rf"(?:my|our)\s+(?:bank\s+)?(?:account|card|savings|money|identity)\s+(?:is|was|has\s+been"
+    rf"|had\s+been|got|are|were)\s+(?:being\s+)?(?:compromised|hacked|at\s+risk|frozen|blocked"
+    rf"|used|involved|linked|flagged)\b", re.I)
 _JOB_TASK = re.compile(
     r"\bpart[- ]time\s+job\b|\btask\s+(?:job|fee)\b|\btop[- ]?up\s+to\s+earn\b"
     r"|\b(?:earn|unlock|release|withdraw)\s+(?:my\s+|the\s+)?commission\b"
     r"|\bunlock\s+(?:the\s+|my\s+|more\s+)?tasks?\b|\bupgrade\s+my\s+account\b"
-    r"|\brectify\s+(?:a|the|my)\s+mistake\b|\b(?:activation|training)\s+fee\b", re.I)
+    r"|\brectify\s+(?:a|the|my)\s+mistake\b|\b(?:activation|training)\s+fee\b"
+    # "a deposit for my online job tasks"
+    r"|\bonline\s+job\b|\bjob\s+tasks?\b"
+    r"|\b(?:deposit|fee|payment)\s+for\s+(?:my\s+|the\s+|an?\s+)?(?:online\s+)?(?:job|tasks?)\b", re.I)
+# Text aimed at the app rather than a payment. A request with any of it is
+# refused before the model reads it (backend/main.py, INJECTION_REFUSAL).
+# Specific on purpose: "ignore that, send 50 to mom", "you are now my
+# favourite" and "pay for the system upgrade" are ordinary requests.
 _INSTRUCTION_OVERRIDE = re.compile(
-    r"ignore (?:all |the |any )?(?:previous|prior|above|earlier) instructions?"
-    r"|disregard (?:the |all )?(?:previous|prior|above)\b|\bsystem prompt\b|\byou are now\b", re.I)
+    r"\bignore\s+(?:all\s+|the\s+|any\s+|your\s+|my\s+)?(?:previous|prior|above|earlier|other)\s+"
+    r"(?:instructions?|rules?|prompts?)"
+    r"|\bdisregard\s+(?:the\s+|all\s+|any\s+|your\s+)?(?:previous|prior|above|earlier)\b"
+    r"|\bsystem\s+prompt\b|(?:^|[.!?;]\s*)system\s*:"
+    r"|\byou\s+are\s+now\s+(?:in\s+)?(?:an?\s+|the\s+)?(?:\w+\s+)?(?:mode|assistant|ai|bot|model"
+    r"|admin(?:istrator)?|developer|system|unrestricted|jailbroken|dan)\b"
+    r"|\b(?:developer|admin|god|debug|maintenance)\s+mode\b|\bjailbreak"
+    r"|\bapprove\s+(?:all|every|any)\s+(?:the\s+)?(?:transfers?|payments?|transactions?|requests?)\b"
+    r"|\b(?:skip|bypass|disable|turn\s+off)\s+(?:the\s+|all\s+|any\s+)?(?:verification|validation"
+    r"|validator|checks?|biometrics?|confirmation|security|fraud\s+checks?)\b"
+    r"|\b(?:validator|auditor|validation\s+agent|checker)\s+(?:should|must|will|to|needs?\s+to)\s+"
+    r"(?:say|report|approve|pass|agree|accept|confirm|ignore)\b"
+    r"|\bdecode\s+(?:this|the\s+following|it|that)\b"
+    # an encoded blob (base64): letters and digits run together, 20 or more
+    r"|(?<![\w/+])(?=[A-Za-z0-9+/]*\d)(?=[A-Za-z0-9+/]*[A-Za-z])[A-Za-z0-9+/]{20,}={0,2}", re.I)
 _PAYMENT_RULES = [
     (_OFFICIAL_ORDERS, "words_official_orders", "refuse",
      "An official seems to be telling you to pay someone. Real officers never ask you to "

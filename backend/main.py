@@ -1095,6 +1095,9 @@ def _pipeline(draft: Draft) -> dict:
     }
 
 
+INJECTION_REFUSAL = ("Your message had instructions aimed at the app itself, so I haven't "
+                     "acted on it and nothing was drafted. To make a payment, just say it, "
+                     "like \"send $50 to Mom\".")
 NOTHING_HEARD = "I didn't catch anything — what would you like to do?"
 TOO_LONG = ("That's too long for me. Please say one or two payments at a time, "
             "like \"send $50 to Mom\".")
@@ -1110,6 +1113,25 @@ def create_draft(req: DraftRequest):
         return {"status": "clarify", "kind": kind, "draft_id": None, "field": kind,
                 "transcript": req.transcript[:ingest.MAX_CHARS], "choices": [],
                 "question": NOTHING_HEARD if kind == "empty" else TOO_LONG}
+    # Wording aimed at the app itself ("ignore previous instructions", "SYSTEM:",
+    # "skip verification", an encoded blob): refused before the model reads it.
+    # Defence in depth only. A hijacked model still couldn't move money (no
+    # payee ids, a signature over the exact draft), but nothing that asks the
+    # app to obey it should come back as a card to approve.
+    found = [w for w in scam.scan_transcript(req.transcript)
+             if w.code == "words_instruction_override"]
+    if found:
+        tid = "refused-" + DraftStore.new_id()
+        _trace_start(tid, req, "refused")
+        _traces.event(tid, "firewall", note="refused before the model was called",
+                      codes=scam.phrase_codes(found))
+        _audit.append(AuditEntryType.INJECTION_REFUSED, {
+            "transcript_hash": hash_transcript(req.transcript), "chars": len(req.transcript),
+            "codes": scam.phrase_codes(found), "user_id": req.user_id})
+        out = {"status": "blocked", "kind": "injection", "draft_id": None,
+               "transcript": req.transcript, "reasons": [INJECTION_REFUSAL]}
+        _note_stopped(req.user_id, out)
+        return out
     conn = get_conn()
     try:
         payees = [dict(r) for r in conn.execute(

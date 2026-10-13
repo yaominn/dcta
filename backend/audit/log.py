@@ -44,6 +44,7 @@ class AuditEntryType(str, Enum):
     DRAFT_DECLINED = "DRAFT_DECLINED"     # the user said no before signing
     DRAFT_CANCELLED = "DRAFT_CANCELLED"   # the user withdrew a pending draft
     SCAM_ASSESSMENT = "SCAM_ASSESSMENT"   # scam signals + score (policy/scam.py), by rule
+    INJECTION_REFUSED = "INJECTION_REFUSED"   # a request with wording aimed at the app, refused unread
     HOLD_CANCELLED = "HOLD_CANCELLED"     # a held payment cancelled — nothing sent
     KILL_SWITCH_ENGAGED = "KILL_SWITCH_ENGAGED"     # all outgoing payments frozen
     KILL_SWITCH_RELEASED = "KILL_SWITCH_RELEASED"   # unfrozen, with a phone code
