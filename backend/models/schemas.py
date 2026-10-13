@@ -100,9 +100,20 @@ class SymbolicAmount(BaseModel):
     op: AmountOp
 
 
-# Plain union: the two shapes share no required fields, so Pydantic resolves
-# unambiguously (a literal has `literal_cents`, a symbolic has `after_leg`+`op`).
-Amount = Union[LiteralAmount, SymbolicAmount]
+class SharesAmount(BaseModel):
+    """A number of whole shares the user stated: {"shares": 3} ("buy 3 DBS
+    shares"). BUY_EQUITY only (IntentPlan rejects it anywhere else). The
+    resolver prices it, shares x the quote; the model still does no arithmetic.
+    Before it, "buy 2 apple shares" could only be said as money, and was read
+    as $0.02."""
+    model_config = ConfigDict(extra="forbid")
+    shares: int = Field(gt=0, le=100_000)
+
+
+# Plain union: the shapes share no required fields, so Pydantic resolves
+# unambiguously (a literal has `literal_cents`, a symbolic has `after_leg`+`op`,
+# a share count has `shares`).
+Amount = Union[LiteralAmount, SymbolicAmount, SharesAmount]
 
 
 class MentionTarget(BaseModel):
@@ -194,6 +205,8 @@ class IntentPlan(BaseModel):
             raise ValueError(f"duplicate leg ids: {dupes} — leg ids must be unique")
         for i, leg in enumerate(self.plan):
             amt = leg.amount
+            if isinstance(amt, SharesAmount) and leg.type != "BUY_EQUITY":
+                raise ValueError(f"leg {leg.id!r}: a number of shares can only buy shares")
             if isinstance(amt, SymbolicAmount):
                 if amt.after_leg not in ids:
                     raise ValueError(

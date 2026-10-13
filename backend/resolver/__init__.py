@@ -63,6 +63,7 @@ from backend.models.schemas import (
     ResolvedPayBill,
     ResolvedPlan,
     ResolvedTransfer,
+    SharesAmount,
     SymbolicAmount,
     TransferIntent,
 )
@@ -385,6 +386,8 @@ def _resolve_leg(
             amount = balance_now
         else:  # HALF — integer division; an odd balance loses a cent by design
             amount = balance_now // 2
+    elif isinstance(leg.amount, SharesAmount):
+        amount = None                    # priced below, once the quote is known
     else:
         amount = leg.amount.literal_cents
 
@@ -399,13 +402,15 @@ def _resolve_leg(
                 choices=[],
                 resume_state=resume,
             )
-        shares = amount // price
+        # A number of shares the user said is priced here (shares x quote);
+        # money is floored to whole shares.
+        shares = leg.amount.shares if amount is None else amount // price
         if shares <= 0:
             # not enough to buy a single whole share -> clarify, never a zero leg
             return Clarify(
                 question=(
-                    f"{cents_to_display(amount)} isn't enough for a whole share of "
-                    f"{ticker} at {cents_to_display(price)} — a different amount or account?"
+                    f"${cents_to_display(amount)} isn't enough for a whole share of "
+                    f"{ticker} at ${cents_to_display(price)} — a different amount or account?"
                 ),
                 field=f"{leg.id}.amount",
                 kind="equity_too_small",

@@ -31,7 +31,7 @@ from __future__ import annotations
 import re
 
 from backend.display import account_label, cents_to_display
-from backend.models.schemas import IntentPlan, ResolvedPlan, SymbolicAmount
+from backend.models.schemas import IntentPlan, ResolvedPlan, SharesAmount, SymbolicAmount
 from backend.policy.engine import ANOMALY_MULTIPLE, _median_cents
 from backend.resolver import ACCOUNT_TYPE_SYNONYMS, names_an_account
 from backend.validator import (competing_amounts, leg_clauses, match_legs,
@@ -123,6 +123,10 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
             src = account_label(base.source_account) if base else acct
             amount_ev = {"kind": "calculated", "text": f"{what} of what's left in {src}"}
             notes.append(f"{_money(rleg.amount_cents)} is {what} of {src}.")
+        elif isinstance(ileg.amount, SharesAmount):
+            m = re.search(rf"\b\S+(?:\s+\S+){{0,2}}?\s+shares?\b", clause, re.I)
+            amount_ev = ({"kind": "said", "quote": m.group(0).strip()} if m
+                         else {"kind": "not_found"})
         else:
             chosen = answers.get(f"{ileg.id}.amount")
             is_chosen = ileg.id in competing and chosen in {str(c) for c in competing[ileg.id]}

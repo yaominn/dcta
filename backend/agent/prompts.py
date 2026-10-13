@@ -60,6 +60,8 @@ where
   MENTION = {"mention": "<the words the user said>"}  — e.g. {"mention": "mom"}
   AMOUNT  = {"literal_cents": <integer>}               — a stated amount, in cents
          or {"after_leg": "<earlier leg id>", "op": "ALL"|"HALF"}  — "the rest" / "half of it"
+         or {"shares": <integer>}                      — BUY_EQUITY only: a NUMBER OF
+            SHARES the user said ("buy 3 DBS shares" is {"shares": 3}, not money)
 
 RULES — violating any of them makes your output invalid:
 1. Output ONLY the JSON. No prose, no markdown fences, no commentary.

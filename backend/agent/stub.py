@@ -147,6 +147,23 @@ def _digit_to_cents(m: re.Match) -> int:
     return whole * 100 + (int(frac.ljust(2, "0")) if frac else 0)
 
 
+# "buy 3 D05 shares", "buy two AAPL shares", "buy 4 shares of D05": a count of
+# shares, not money (prompt: AMOUNT {"shares": N}, BUY_EQUITY only).
+_SHARE_COUNT = re.compile(
+    r"\b(\d{1,6}|" + "|".join(sorted(_ONES, key=len, reverse=True)) + r")\s+"
+    r"(?:[A-Za-z][A-Za-z0-9]*\s+)?shares?\b", re.I)
+
+
+def _extract_shares(clause: str) -> tuple[dict | None, str]:
+    """A number of shares in a clause, and the clause with the count removed."""
+    m = _SHARE_COUNT.search(clause)
+    if not m:
+        return None, clause
+    word = m.group(1).lower()
+    n = int(word) if word.isdigit() else _ONES[word]
+    return {"shares": n}, clause[:m.start(1)] + " " + clause[m.end(1):]
+
+
 def _extract_amount(clause: str) -> tuple[dict | None, str]:
     """Find the amount in a clause. Returns (amount_dict|None, clause_with_span_removed).
     A symbolic amount is returned as {"after_leg": None, "op": ...} — the caller
@@ -252,7 +269,9 @@ def _rules_plan(transcript: str, context: dict) -> dict:
     unresolved: list[str] = []
 
     for clause in clauses:
-        amount, rest = _extract_amount(clause)
+        amount, rest = _extract_shares(clause)
+        if amount is None:
+            amount, rest = _extract_amount(clause)
         source = _find_source_account(rest, account_types)
         leg_id = f"t{len(legs) + 1}"
 
@@ -283,6 +302,9 @@ def _rules_plan(transcript: str, context: dict) -> dict:
             unresolved.append(f"amount for: {clause!r}")
             continue
 
+        if "shares" in amount and kind != "BUY_EQUITY":
+            unresolved.append(f"shares are only bought: {clause!r}")
+            continue
         if amount.get("after_leg") is None and "op" in amount:
             if not legs:  # "the rest" with no earlier leg to reference
                 unresolved.append(f"'{clause.strip()}' needs an earlier leg")

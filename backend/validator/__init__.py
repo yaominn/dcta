@@ -66,6 +66,7 @@ from backend.models.schemas import (
     ResolvedPayBill,
     ResolvedPlan,
     ResolvedTransfer,
+    SharesAmount,
     SymbolicAmount,
 )
 
@@ -339,6 +340,25 @@ def _check_amount(ileg, rleg, clause: str, recomputed: dict[str, int], conn) -> 
                 f"but the draft pays {_money(rleg.amount_cents)}.",
             )
         return _pass(name, ileg.id, f"recomputed {expected}c matches")
+
+    if isinstance(ileg.amount, SharesAmount):
+        # A number of shares: the count must be said for THIS leg ("buy 3 DBS
+        # shares"), and the draft must buy exactly that many at the quote.
+        n = ileg.amount.shares
+        if n not in amounts.share_counts(clause):
+            return _fail(
+                name, ileg.id,
+                f"{n} shares not said in its clause {clause!r} "
+                f"(clause yields {sorted(amounts.share_counts(clause)) or 'nothing'})",
+                f"The draft buys {n} shares, but you didn't say that number.")
+        price = amounts._equity_price(conn, rleg.ticker)
+        if (rleg.estimated_shares, rleg.amount_cents) != (n, n * price):
+            return _fail(
+                name, ileg.id,
+                f"resolved {rleg.estimated_shares} shares / {rleg.amount_cents}c != "
+                f"{n} shares at {price}c",
+                f"You said {n} shares, but the draft buys {rleg.estimated_shares}.")
+        return _pass(name, ileg.id, f"{n} shares said + priced at {price}c")
 
     # literal: (1) the spoken figure must be derivable from THIS leg's clause
     #          (clause-localized; blocks a cross-clause swap), and

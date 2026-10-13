@@ -306,3 +306,70 @@ def test_an_unreachable_model_says_so_in_plain_words(client, monkeypatch):
     assert r.status_code == 502
     assert r.json()["detail"]["error"] == ("The assistant can't be reached right now. "
                                            "Nothing was sent. Try again in a moment.")
+
+
+# --------------------------------------------------------------------------- share counts
+def _buy_plan(mention, amount):
+    from backend.models.schemas import IntentPlan
+    return IntentPlan.model_validate({"plan": [
+        {"id": "t1", "type": "BUY_EQUITY", "source_account": {"mention": "default"},
+         "ticker": {"mention": mention}, "amount": amount}]})
+
+
+@pytest.mark.parametrize("mention,count,price", [("DBS", 3, 4580), ("apple", 2, 24150)])
+def test_a_number_of_shares_is_priced_by_the_resolver(client, mention, count, price):
+    """"buy 2 apple shares" was read as $0.02: the plan could only say money."""
+    from backend.resolver import Resolved, resolve
+    res = resolve(_buy_plan(mention, {"shares": count}),
+                  transcript=f"buy {count} {mention} shares", user_id="u_alice")
+    assert isinstance(res, Resolved)
+    leg = res.plan.plan[0]
+    assert (leg.estimated_shares, leg.amount_cents) == (count, count * price)
+
+
+@pytest.mark.parametrize("said,ticker,count", [("buy 3 D05 shares", "D05", 3),
+                                               ("buy two AAPL shares", "AAPL", 2),
+                                               ("buy 4 shares of D05", "D05", 4)])
+def test_buying_a_number_of_shares_end_to_end(client, said, ticker, count):
+    r = _ask(client, said)
+    assert r["status"] == "ready", r
+    leg = r["resolved_plan"]["plan"][0]
+    assert (leg["ticker"], leg["estimated_shares"]) == (ticker, count)
+    assert not r["validation"]["frozen"]
+
+
+def test_a_share_count_the_user_never_said_is_frozen(client):
+    from backend.resolver import resolve
+    from backend.validator import validate
+    plan = _buy_plan("D05", {"shares": 30})
+    res = resolve(plan, transcript="buy 3 D05 shares", user_id="u_alice")
+    report = validate(plan, res.plan, "buy 3 D05 shares", provider=None)
+    assert report.frozen
+
+
+def test_a_dollar_amount_is_not_a_share_count(client):
+    from backend.resolver import resolve
+    from backend.validator import validate
+    plan = _buy_plan("D05", {"shares": 50})
+    res = resolve(plan, transcript="buy 50 dollars of D05 shares", user_id="u_alice")
+    report = validate(plan, res.plan, "buy 50 dollars of D05 shares", provider=None)
+    assert report.frozen
+
+
+def test_shares_belong_to_share_purchases_only():
+    from pydantic import ValidationError
+    from backend.models.schemas import IntentPlan
+    with pytest.raises(ValidationError):
+        IntentPlan.model_validate({"plan": [
+            {"id": "t1", "type": "TRANSFER", "source_account": {"mention": "default"},
+             "target": {"mention": "mom"}, "amount": {"shares": 3}}]})
+
+
+def test_too_little_for_one_share_says_dollars(client):
+    """"0.02 isn't enough for a whole share of AAPL at 241.50" had no $ signs."""
+    from backend.resolver import Clarify, resolve
+    res = resolve(_buy_plan("AAPL", {"literal_cents": 1000}), transcript="buy $10 of AAPL",
+                  user_id="u_alice")
+    assert isinstance(res, Clarify)
+    assert res.question == ("$10.00 isn't enough for a whole share of AAPL at $241.50 — "
+                            "a different amount or account?")

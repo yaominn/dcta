@@ -15,6 +15,7 @@ from backend.models.schemas import (  # noqa: F401
     ResolvedPayBill,
     ResolvedPlan,
     ResolvedTransfer,
+    SharesAmount,
     SymbolicAmount,
     TransferIntent,
 )

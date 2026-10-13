@@ -373,6 +373,41 @@ def money_occurrences(clause: str) -> list[int]:
 
 
 
+# --------------------------------------------------------------------------- share counts
+# "buy 3 DBS shares", "buy three shares of D05", "a share of apple": a count
+# said before "share(s)", with at most two words between. Not "500 dollars of
+# DBS shares": a count is never money.
+_SHARE_WORD = re.compile(r"\b(?:shares?|stocks?)\b", re.I)
+_MONEY_AFTER = re.compile(r"^\s*(?:dollars?|bucks?|sgd|cents?|k|grand)\b", re.I)
+
+
+def share_counts(clause: str) -> set[int]:
+    """Every number of shares said in `clause`."""
+    out: set[int] = set()
+    for sw in _SHARE_WORD.finditer(clause):
+        before = clause[:sw.start()]
+        toks = list(re.finditer(r"\$?[A-Za-z0-9.,']+", before))[-3:]
+        words = [t.group(0).lower().rstrip(".,") for t in toks]
+        for k, (tok, w) in enumerate(zip(toks, words)):
+            if w.startswith("$") or _MONEY_AFTER.match(before[tok.end():]):
+                continue
+            if w.isdigit():
+                out.add(int(w))
+                continue
+            run: list[str] = []
+            for v in words[k:]:
+                if v in _ONES or v in _TENS or v == "hundred" or (v in ("a", "an") and not run):
+                    run.append(v)
+                else:
+                    break
+            # "a share" is one; "a few shares" is not.
+            if run in (["a"], ["an"]) and k != len(toks) - 1:
+                continue
+            if run and (n := _words_to_int(run)):
+                out.add(n)
+    return {n for n in out if n > 0}
+
+
 # --------------------------------------------------------------------------- symbolic recomputation
 def _equity_price(conn: "sqlite3.Connection", ticker: str) -> int:
     row = conn.execute(
