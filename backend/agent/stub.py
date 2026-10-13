@@ -267,7 +267,7 @@ def _unknown_name(rest: str) -> str | None:
     account", "pay uncle bob". The resolver then asks, offers to add them as a
     contact, or finds one of the user's own accounts."""
     text = re.sub(r"[\s,.;]*(?:\band\b)?[\s,.;]*$", "", rest.strip(), flags=re.I)  # "..., and"
-    m = re.search(r"\bto\s+([\w\- ]+?)(?:\s+(?:from|out of)\b.*)?$", text, re.I)
+    m = re.search(r"\bto\s+([\w\-'’ ]+?)(?:\s+(?:from|out of)\b.*)?$", text, re.I)
     if m is None:
         words = re.sub(r"\s+(?:from|out of)\s+.*$", "", text, flags=re.I)
         m = re.search(r"\b(?:pay|send|give|transfer|move)\s+([\w\- ]+)$", words, re.I)

@@ -445,7 +445,7 @@ def _check_beneficiary(rleg, transcript: str, conn) -> dict:
         acct_type = row["type"] if row else ""
         label = rleg.to_display
         ok = bool(acct_type) and any(_word_in(w, transcript)
-                                     for w in _ACCOUNT_WORDS.get(acct_type, (acct_type,)))
+                                     for w in _DESTINATION_WORDS.get(acct_type, (acct_type,)))
     elif isinstance(rleg, ResolvedBuyEquity):
         label = rleg.ticker
         ok = _word_in(rleg.ticker, transcript) or any(
@@ -486,6 +486,17 @@ _ACCOUNT_WORDS = {
     "savings": ("savings", "saving"),
     "joint": ("joint", "spending"),
     "settlement": ("settlement", "investment", "investments", "brokerage"),
+}
+
+
+# The words for the account money is moved TO. Wider than _ACCOUNT_WORDS: here
+# the word is the whole destination ("to my current account"), not a tripwire
+# that ordinary requests could trip, so every word the user can name an
+# account by counts. Kept here, not imported from the resolver.
+_DESTINATION_WORDS = {
+    "savings": ("savings", "saving"),
+    "joint": ("joint", "spending", "current", "checking", "everyday"),
+    "settlement": ("settlement", "investment", "investments", "invest", "brokerage", "trading"),
 }
 
 

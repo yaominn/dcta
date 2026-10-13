@@ -179,11 +179,13 @@ class MockExecutor:
                     elif leg.type == "OWN_TRANSFER":
                         # Between two of the same customer's accounts, asked
                         # again here: the money never lands in someone else's.
-                        owners = {r["user_id"] for r in conn.execute(
+                        rows = conn.execute(
                             "SELECT user_id FROM accounts WHERE id IN (?, ?)",
-                            (leg.source_account, leg.to_account))}
-                        if len(owners) != 1 or leg.source_account == leg.to_account:
-                            raise RuntimeError("both accounts must be the same customer's")
+                            (leg.source_account, leg.to_account)).fetchall()
+                        if (leg.source_account == leg.to_account or len(rows) != 2
+                                or rows[0]["user_id"] != rows[1]["user_id"]):
+                            raise RuntimeError("both accounts must exist and be the same "
+                                               "customer's")
                         self._debit(conn, leg.source_account, leg.amount_cents)
                         self._credit(conn, leg.to_account, leg.amount_cents)
                     else:  # pragma: no cover - schema-constrained, unreachable

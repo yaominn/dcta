@@ -367,12 +367,31 @@ def _resolve_leg(
     # 2. TARGET --------------------------------------------------------------
     own = (_own_account(conn, leg.target.mention, user_id)
            if isinstance(leg, TransferIntent) else None)
-    if own is not None:
-        if own == source_acct:
+    if own is not None and own == source_acct:
+        # The money can't come from where it goes. "move 500 to my savings":
+        # no source named, so the default (savings) is the wrong one; with one
+        # other everyday account it comes from that, else the user is asked,
+        # with an answer that must be one of the other accounts.
+        field = f"{leg.id}.source_account"
+        others = conn.execute(
+            "SELECT id, type, balance FROM accounts WHERE user_id=? AND id != ?",
+            (user_id, own)).fetchall()
+        everyday = [r for r in others if r["type"] != "settlement"]
+        if answers.get(field) in {r["id"] for r in others}:
+            source_acct = answers[field]
+        elif not names_an_account(leg.source_account.mention) and len(everyday) == 1:
+            source_acct = everyday[0]["id"]
+        else:
             return Clarify(
-                question="That's the same account. Which account should it go to?",
-                field=f"{leg.id}.target", kind="account", choices=[], resume_state=resume)
-    elif isinstance(leg, TransferIntent):
+                question=("That's the same account. Which account should it come from?"
+                          if names_an_account(leg.source_account.mention)
+                          else "Which account should it come from?"),
+                field=field, kind="account",
+                choices=[{"id": r["id"], "display": f"{account_label(r['id'])} "
+                                                     f"({cents_to_display(r['balance'])})"}
+                         for r in others],
+                resume_state=resume)
+    if isinstance(leg, TransferIntent) and own is None:
         tgt = _resolve_payee(
             conn, leg.target.mention, user_id,
             answers, f"{leg.id}.target", resume,
@@ -396,7 +415,7 @@ def _resolve_leg(
         if isinstance(tgt, Clarify):
             return tgt
         ticker, price = tgt
-    else:  # pragma: no cover - schema-constrained, unreachable
+    elif own is None:  # pragma: no cover - schema-constrained, unreachable
         raise RuntimeError(f"unknown intent type {leg.type!r}")
 
     # 3. AMOUNT -------------------------------------------------------------
@@ -637,14 +656,21 @@ def _own_account(conn, mention: str, user_id: str) -> str | None:
     """The user's own account a transfer's target names ("my joint account",
     "spending", "savings"), or None. A payee whose nickname or name matches
     wins, so a contact called "Savings" is still that contact."""
-    if _normalize(mention) in _DEFAULT_ACCOUNT_MENTIONS:
+    norm = _normalize(mention)
+    if norm in _DEFAULT_ACCOUNT_MENTIONS:
+        return None
+    # Every word must be an account word: "my sister's savings account" and
+    # "her joint account" are someone else's (the filler "my", "the" and
+    # "account" are already gone).
+    rows = conn.execute("SELECT id, type FROM accounts WHERE user_id=?", (user_id,)).fetchall()
+    words = {_normalize(r["type"]) for r in rows} | set(ACCOUNT_TYPE_SYNONYMS)
+    if not norm or any(t not in words for t in norm.split()):
         return None
     payees = conn.execute(
         "SELECT nickname, legal_name FROM payees WHERE user_id=? AND removed_at IS NULL",
         (user_id,)).fetchall()
     if _match(payees, mention, "nickname") or _match(payees, mention, "legal_name"):
         return None
-    rows = conn.execute("SELECT id, type FROM accounts WHERE user_id=?", (user_id,)).fetchall()
     matched = _match(rows, mention, "type", ACCOUNT_TYPE_SYNONYMS)
     return matched[0]["id"] if len(matched) == 1 else None
 

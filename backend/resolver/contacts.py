@@ -113,6 +113,7 @@ _NOT_A_NAME = re.compile(
     r"(?:accounts?|acct|numbers?|bank|person|people|someone|somebody|them|him|her|it"
     r"|recipients?|beneficiar(?:y|ies)|payees?|contacts?)$", re.I)
 _LEADING_WORD = re.compile(r"^(?:my|our|the|a|an)\s+", re.I)
+_OWNERS_ACCOUNT = re.compile(r"^(.+?)['’]s\s+(?:[a-z]+\s+){0,2}?(?:bank\s+)?(?:account|acct)$", re.I)
 
 
 def contact_name(mention: str) -> str | None:
@@ -122,6 +123,9 @@ def contact_name(mention: str) -> str | None:
     words = " ".join((mention or "").split())
     while (m := _LEADING_WORD.match(words)):
         words = words[m.end():]
+    # "my sister's savings account" is Sister, at her account
+    if (m := _OWNERS_ACCOUNT.match(words)):
+        words = m.group(1)
     if not words or _NOT_A_NAME.match(words):
         return None
     try:

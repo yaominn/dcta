@@ -1104,8 +1104,9 @@ MODEL_UNREACHABLE = ("The assistant can't be reached right now. Nothing was sent
                      "Try again in a moment.")
 # Asked, not requested: "how much do I have?", "do I have enough for...?".
 # Not "can you send mom 50": that is a request.
-_ASKS = re.compile(r"^\s*(?:why|what|how|where|when|which|who|whose|did|do|does|have|has"
-                   r"|is|are|was|were)\b", re.I)
+_ASKS = re.compile(r"^\s*(?:why|what|how|where|when|which|who|whose)\b"
+                   r"|^\s*(?:did|do|does|have|has|is|are|was|were)\s+(?:i|you|we|my|it|they"
+                   r"|he|she|there|that|this)\b", re.I)
 MANAGE_BILLS = ("Here are your recurring payments. Tap Cancel or Pause on the one you want "
                 "to change. Nothing changes until you do.")
 NOTHING_HEARD = "I didn't catch anything — what would you like to do?"
@@ -1219,8 +1220,12 @@ def create_draft(req: DraftRequest):
                       error=str(exc))
         if isinstance(exc, ParseFailure):
             # The model never produced a valid plan (often: no amount, which
-            # the schema requires). Ask, in words the user can act on; the
+            # the schema requires). A question ("did I pay mom?") is answered
+            # as one; otherwise ask, in words the user can act on. The
             # attempts stay on the trace for /data.
+            if route == "payment" and _is_question(req.transcript):
+                out, _ = _answer_question(req, tid, payees=payees)
+                return out
             question = (answers.follow_up(req.transcript, payees=payees, billers=billers,
                                           equities=equities)
                         if route == "payment" else None)
@@ -1280,16 +1285,14 @@ def create_draft(req: DraftRequest):
         # About money but not yet a payment ("send mom some money", "send 50"):
         # the question that would make it one. Questions ABOUT payments
         # ("did I send 50 to mom?") still go to the question lane.
-        if not _ASKS.search(req.transcript) and not (
-                asks_only_about_past_payments(req.transcript)
-                and not answers.from_history(req.transcript)):
+        if not _is_question(req.transcript):
             follow = answers.follow_up(req.transcript, payees=payees, billers=billers,
                                        equities=equities)
         if follow:
             draft.question = {**(draft.question or {}), "question": follow}
             out = {**out, "question": follow}
         elif not looks_like_payment(req.transcript):
-            out, question_calls = _answer_question(req, draft, payees=payees)
+            out, question_calls = _answer_question(req, draft.draft_id, payees=payees)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
     # A refused new contact already carries its own warning: no second one.
@@ -1313,7 +1316,14 @@ def _follow_up_reply(req: DraftRequest, route: str, question: str) -> dict:
             "transcript": req.transcript, "choices": [], "question": question}
 
 
-def _answer_question(req: DraftRequest, draft: Draft, *,
+def _is_question(transcript: str) -> bool:
+    """Asked ABOUT money, not asking to move it: "how much do I have?", "did I
+    pay mom?". "Send mom the usual" names a past payment but is a request."""
+    return bool(_ASKS.search(transcript)) or (
+        asks_only_about_past_payments(transcript) and not answers.from_history(transcript))
+
+
+def _answer_question(req: DraftRequest, trace_id: str, *,
                      payees: list[dict] | None = None) -> tuple[dict, list]:
     """Which question a request with no payment is asking. The model picks ONE
     label (backend/agent/question.py) from the user's words alone; the answer
@@ -1329,7 +1339,7 @@ def _answer_question(req: DraftRequest, draft: Draft, *,
         out = answers.reply(label, req.user_id, stopped=_stopped.get(req.user_id),
                             payee=answers.named_payee(req.transcript, payees or []))
         said = out["message"]
-    _traces.event(draft.draft_id, "question", provider=classifier.name,
+    _traces.event(trace_id, "question", provider=classifier.name,
                   llm_calls=classifier.calls, label=label, reply=said)
     return out, classifier.calls
 

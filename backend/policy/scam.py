@@ -281,9 +281,11 @@ _JOB_TASK = re.compile(
 # Specific on purpose: "ignore that, send 50 to mom", "you are now my
 # favourite" and "pay for the system upgrade" are ordinary requests.
 _INSTRUCTION_OVERRIDE = re.compile(
-    r"\bignore\s+(?:all\s+|the\s+|any\s+|your\s+|my\s+)?(?:previous|prior|above|earlier|other)\s+"
-    r"(?:instructions?|rules?|prompts?)"
-    r"|\bdisregard\s+(?:the\s+|all\s+|any\s+|your\s+)?(?:previous|prior|above|earlier)\b"
+    # "ignore all previous instructions", "ignore your instructions" — not a
+    # user correcting themselves ("ignore my previous instruction", "disregard
+    # the previous one", "ignore the other instructions I gave")
+    r"\b(?:ignore|disregard|forget)\s+(?:(?:all|any)\s+(?:of\s+)?(?:the\s+|your\s+)?|your\s+)?"
+    r"(?:(?:previous|prior|above|earlier|system)\s+)?(?:instructions?|rules?|prompts?|programming)\b"
     r"|\bsystem\s+prompt\b|(?:^|[.!?;]\s*)system\s*:"
     r"|\byou\s+are\s+now\s+(?:in\s+)?(?:an?\s+|the\s+)?(?:\w+\s+)?(?:mode|assistant|ai|bot|model"
     r"|admin(?:istrator)?|developer|system|unrestricted|jailbroken|dan)\b"
@@ -294,8 +296,11 @@ _INSTRUCTION_OVERRIDE = re.compile(
     r"|\b(?:validator|auditor|validation\s+agent|checker)\s+(?:should|must|will|to|needs?\s+to)\s+"
     r"(?:say|report|approve|pass|agree|accept|confirm|ignore)\b"
     r"|\bdecode\s+(?:this|the\s+following|it|that)\b"
-    # an encoded blob (base64): letters and digits run together, 20 or more
-    r"|(?<![\w/+])(?=[A-Za-z0-9+/]*\d)(?=[A-Za-z0-9+/]*[A-Za-z])[A-Za-z0-9+/]{20,}={0,2}", re.I)
+    # an encoded blob (base64): 20+ characters mixing lower case, upper case
+    # and digits, or ending in "=" padding. Not an IBAN or a bill reference
+    # (GB82WEST1234..., 2024ABCD0000...): those have no lower case.
+    r"|(?<![\w/+])(?-i:(?=[A-Za-z0-9+/]*\d)(?=[A-Za-z0-9+/]*[a-z])(?=[A-Za-z0-9+/]*[A-Z])"
+    r"[A-Za-z0-9+/]{20,}={0,2}|[A-Za-z0-9+/]{16,}==?)(?![\w/+])", re.I)
 _PAYMENT_RULES = [
     (_OFFICIAL_ORDERS, "words_official_orders", "refuse",
      "An official seems to be telling you to pay someone. Real officers never ask you to "

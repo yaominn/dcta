@@ -201,13 +201,20 @@ _BUY_WORD = re.compile(r"\b(?:buy|purchase|invest|shares?|stocks?)\b", re.I)
 _FROM_HISTORY = re.compile(
     r"\b(?:the\s+usual|as\s+usual|usual\s+amount|same\s+(?:as|amount)|again|double|twice"
     r"|triple|what\s+i\s+(?:sent|paid|gave))\b", re.I)
+# Another currency, said WITH an amount ("50 USD", "20 euros", "US$50"): not
+# "she won't mind" or "the pounds of fish".
+_CURRENCY = (r"(?:usd|us\s*dollars?|american\s+dollars?|eur|euros?|gbp|pounds?(?:\s+sterling)?"
+             r"|yen|jpy|rmb|yuan|cny|myr|ringgit|aud|hkd|idr|rupiah|rupees?|inr|baht|thb|won|krw)")
+_AMOUNT_WORD = (r"(?:\d[\d,.]*k?|a|one|two|three|four|five|six|seven|eight|nine|ten|twenty|thirty"
+                r"|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand)")
 _FOREIGN = re.compile(
-    r"\b(?:usd|us\s*dollars?|american\s+dollars?|eur|euros?|gbp|pounds?\s+sterling|pounds"
-    r"|yen|jpy|rmb|yuan|cny|myr|ringgit|aud|hkd|idr|rupiah|rupees?|inr|baht|thb|won|krw)\b"
-    r"|\bUS\$|€|£|¥", re.I)
+    rf"\b{_AMOUNT_WORD}\s*{_CURRENCY}\b|\b(?:usd|eur|gbp|jpy|myr|aud|hkd|inr|rm)\s*\d"
+    rf"|\bUS\$\s*\d|[€£¥]\s*\d", re.I)
+# Zero or a minus sign as the amount, right after the verb ("send 0 to mom",
+# "send mom -50"): not "at 10:00", "- 2nd time" or "#05-00".
 _NOT_POSITIVE = re.compile(
-    r"(?<![\w.$])-\s*\$?\d|(?<![\w.,$])\$?0+(?:\.0+)?(?![\w.,])|\bzero\s+(?:dollars?|bucks|sgd)\b",
-    re.I)
+    r"\b(?:send|pay|transfer|give|move|wire|remit)\s+(?:[a-z]+\s+)?"
+    r"(?:-\s*\$?\d|\$?0+(?:\.0+)?(?![\d:.,])|zero\b)", re.I)
 
 
 def _name_in(text: str, names) -> str | None:

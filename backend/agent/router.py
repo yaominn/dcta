@@ -56,8 +56,13 @@ _BARE_BILL = re.compile(
 # "cancel my CityGas recurring payment", "stop paying CityGas every month",
 # "show my recurring payments". Opens the Bills list, where each one has its
 # own Cancel and Pause; nothing is changed by the words alone.
+# Said AS the request ("cancel my...", "stop paying...", "show my..."), not
+# anywhere in a setup ("...every month until I tell you to stop").
 _MANAGE_RECURRING = re.compile(
-    r"\b(?:cancel|stop|pause|resume|unpause|turn\s+off|show|list|see|view)\b", re.I)
+    r"^\s*(?:please\s+)?(?:(?:can|could)\s+you\s+)?(?:i\s+want\s+to\s+)?"
+    r"(?:cancel|stop|pause|resume|unpause|turn\s+off|show|list|see|view)\b"
+    r"|\b(?:cancel|stop|pause|resume|unpause|turn\s+off)\s+(?:paying\b|my\b|the\b|that\b|this\b"
+    r"|our\b)", re.I)
 _MY_BILLS = re.compile(r"\b(?:show|list|see|view|check)\s+(?:me\s+)?(?:my|the)\s+"
                        r"(?:recurring\s+|monthly\s+|weekly\s+)?bills\b", re.I)
 
