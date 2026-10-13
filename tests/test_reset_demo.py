@@ -16,7 +16,7 @@ import time
 
 from backend.data.db import connect
 from backend.data.reset_demo import reset_demo
-from backend.data.seed import ACCOUNTS, seed
+from backend.data.seed import ACCOUNTS, PAYEES, seed
 
 
 def test_reset_restores_money_and_keeps_identity(tmp_path):
@@ -149,6 +149,6 @@ def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
     finally:
         conn.close()
     assert "removed_at" in cols_now
-    assert tuple(payees) == (len(rows), 0) and len(rows) == 4      # every contact kept, none removed
+    assert tuple(payees) == (len(rows), 0) and len(rows) == len(PAYEES)      # every contact kept, none removed
     assert out["balances"] == {a[0]: a[3] for a in ACCOUNTS}          # and the reset itself ran
     assert out["history_rows"] == 18 and out["not_restored"] == []

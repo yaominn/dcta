@@ -37,7 +37,7 @@ from backend.audit.log import AuditLog
 from backend.auth.credentials import MockCredentialStore
 from backend.data import billers
 from backend.data.db import connect
-from backend.data.seed import seed
+from backend.data.seed import PAYEES, seed
 from backend.drafts import Draft, DraftStore
 from backend.gateway import Gateway, MockExecutor, MockSigner, NonceStore
 from backend.gateway.executor import MandateRefused
@@ -773,7 +773,7 @@ def test_an_existing_ledger_gains_the_tables_without_a_reseed(tmp_path):
         migrate(conn)                                  # idempotent
         assert billers.current(conn, "biller_03").version == 1
         assert conn.execute("SELECT COUNT(*) FROM mandates").fetchone()[0] == 0
-        assert conn.execute("SELECT COUNT(*) FROM payees").fetchone()[0] == 4
+        assert conn.execute("SELECT COUNT(*) FROM payees").fetchone()[0] == len(PAYEES)
     finally:
         conn.close()
 

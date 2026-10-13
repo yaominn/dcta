@@ -535,12 +535,29 @@ def scenario_12_benign_control(client: TestClient) -> Result:
     return r
 
 
+def scenario_13_unverified_customer(client: TestClient) -> Result:
+    r = Result(13, "Unverified customer (KYC)",
+               "Bob's identity check is still PENDING; he asks to pay his mom $50.",
+               "Only a verified customer can move money: the request is refused with the "
+               "reason, and nothing is signable.")
+    d = client.post("/api/drafts", json={"transcript": "send 50 to mom", "user_id": "u_bob"}).json()
+    rules = [v["rule"] for v in (d.get("policy") or {}).get("verdicts", [])]
+    r.line(f"status: {d.get('status')}; rules: {rules}")
+    r.line(f"reason shown: {(d.get('reasons') or ['-'])[0]}")
+    nonce = client.get("/api/auth/nonce", params={"draft_id": d.get("draft_id")})
+    r.line(f"nonce for the draft: HTTP {nonce.status_code}")
+    r.passed = (d.get("status") == "blocked" and rules == ["kyc"]
+                and nonce.status_code != 200)
+    return r
+
+
 SCENARIOS = [
     scenario_1_happy_path, scenario_2_ambiguity, scenario_3_anomaly,
     scenario_4_injection_via_data, scenario_5_injection_via_voice,
     scenario_6_rogue_agent, scenario_7_audit_tamper,
     scenario_8_policy_bypass, scenario_9_frozen_draft_unsignable,
     scenario_10_new_number_scam, scenario_11_coached_victim, scenario_12_benign_control,
+    scenario_13_unverified_customer,
 ]
 
 

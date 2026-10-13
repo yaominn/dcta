@@ -30,6 +30,9 @@ ACCOUNTS = [
     ("acct_savings", "u_alice", "acct_savings", 842050, "savings"),   # $8,420.50
     ("acct_joint",   "u_alice", "acct_joint",   120000, "joint"),     # $1,200.00
     ("acct_invest",  "u_alice", "acct_invest",      0, "settlement"),# $0.00
+    # Bob's, so his request reaches the KYC rule: with no account it stopped at
+    # "which account?" and the KYC block could only be shown in a unit test.
+    ("acct_bob",     "u_bob",   "acct_bob",      30000, "savings"),   # $300.00
 ]
 
 PAYEES = [
@@ -38,6 +41,7 @@ PAYEES = [
     ("payee_21", "u_alice", "John",    "John Doe",      "4521", "+65 8123 4521"),  # usual $50 (anomaly baseline)
     ("payee_22", "u_alice", "John",    "John Smith",    "8892", "+65 9876 8892"),  # forces disambiguation
     ("payee_30", "u_alice", "Landlord","Property Mgmt", "7001", "+65 6123 7001"),  # large-but-normal
+    ("payee_40", "u_bob",   "Mom",     "Mary Lim",      "2207", "+65 9000 2207"),  # Bob's (KYC demo)
 ]
 
 BILLERS = [
@@ -64,14 +68,18 @@ LIMITS = {
 
 def _history_rows() -> list[tuple]:
     """12x $50 (5000c) to payee_21 (median 5000 -> 'fifty thousand' is 1000x, anomaly fires hard)
-    and 6x monthly $500 (50000c) to payee_17 (so $500 is unremarkable)."""
+    and 6x monthly $500 (50000c) to payee_17 (so $500 is unremarkable).
+
+    The newest is a day old. Stamped "now", two of them sat inside the velocity
+    window (5 transfers in 10 minutes) and today's daily total right after a
+    reset, so the demo's third payment was already hitting the rate limit."""
     rows: list[tuple] = []
     now = datetime.now(timezone.utc)
     for i in range(12):  # 12 small transfers to John Doe
-        ts = (now - timedelta(days=i)).isoformat()
+        ts = (now - timedelta(days=i + 1)).isoformat()
         rows.append(("u_alice", "payee_21", 5000, ts))    # $50.00 in cents
     for i in range(6):  # 6 monthly transfers to Mom
-        ts = (now - timedelta(days=30 * i)).isoformat()
+        ts = (now - timedelta(days=30 * i + 1)).isoformat()
         rows.append(("u_alice", "payee_17", 50000, ts))   # $500.00 in cents
     return rows
 

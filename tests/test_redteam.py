@@ -41,7 +41,7 @@ def test_every_red_team_property_holds(results, index):
 
 def test_every_scenario_runs(results):
     """A demo that silently skips a scenario is worse than one that fails."""
-    assert len(results) == len(SCENARIOS) == 12
+    assert len(results) == len(SCENARIOS) == 13
     assert all(r.evidence for r in results), "a scenario produced no evidence"
 
 

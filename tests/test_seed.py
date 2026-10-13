@@ -38,7 +38,7 @@ def test_users_seeded():
 
 
 def test_accounts_seeded():
-    assert _count("accounts") == 3
+    assert _count("accounts") == 4                # Alice's three + Bob's one (KYC demo)
     conn = get_conn()
     try:
         sav = conn.execute("SELECT balance FROM accounts WHERE id='acct_savings'").fetchone()
@@ -49,7 +49,7 @@ def test_accounts_seeded():
 
 def test_payees_seeded_with_two_johns():
     """payee_21 and payee_22 both nickname 'John' -> forces disambiguation (brief 4.4)."""
-    assert _count("payees") == 4
+    assert _count("payees") == 5                  # Alice's four + Bob's Mom (KYC demo)
     conn = get_conn()
     try:
         johns = conn.execute("SELECT * FROM payees WHERE nickname='John'").fetchall()
