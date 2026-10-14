@@ -1234,7 +1234,7 @@ def create_draft(req: DraftRequest):
         if never:                          # stopped, not asked (see _scam_stop)
             tid = "stopped-" + DraftStore.new_id()
             _trace_start(tid, req, route)
-            out = _scam_stop(tid, None, found, never)
+            out = _scam_stop(tid, req.user_id, found, never)
             _note_stopped(req.user_id, out)
             return out
         return _follow_up_reply(req, route, asked)
@@ -1278,7 +1278,7 @@ def create_draft(req: DraftRequest):
             if route == "payment":
                 found, never = _never_rules(req.transcript)
                 if never:                  # stopped, not asked (see _scam_stop)
-                    out = _scam_stop(tid, None, found, never)
+                    out = _scam_stop(tid, req.user_id, found, never)
                     _note_stopped(req.user_id, out)
                     return out
             question = (answers.follow_up(req.transcript, payees=payees, billers=billers,
@@ -1378,39 +1378,43 @@ def _never_rules(text: str) -> tuple[list, list[str]]:
     return found, sorted({w.code for w in found} & scam.NEVER_RULES)
 
 
-def _scam_stop(trace_id: str, draft_id: str | None, found: list, never: list[str]) -> dict:
+def _scam_stop(trace_id: str, user_id: str, found: list, never: list[str], *,
+               draft: Draft | None = None) -> dict:
     """The "Payment stopped" reply for a payment asked in never-rule words,
-    before any question: the scam warning for the words, and nothing to sign."""
+    before any question: the scam warning for the words, and nothing to sign.
+    Logged like a scored block — in the audit chain, and as a stopped attempt,
+    so a retry without the words still counts it (REPEATED_STOPPED_ATTEMPTS;
+    RETRY_AFTER_STOPPED needs a payee, and none is known yet). With no draft
+    (asked before the model, or a parse it never got right) the trace id
+    stands in for the draft id."""
+    key = draft.draft_id if draft else trace_id
     reasons = [w for w in [scam.warning_for(found)] if w]
     _traces.event(trace_id, "scam", blocked=True, never_rules=never,
                   note="stopped before asking: a never rule in the user's words")
-    return {"status": "blocked", "kind": "scam", "draft_id": draft_id, "reasons": reasons,
+    _audit.append(AuditEntryType.SCAM_ASSESSMENT, {
+        "stage": "before_question", "draft_id": key, "decision": scam.CALL_BANK,
+        "outcome": scam.BLOCK, "never_rules": never, "phrase_codes": scam.phrase_codes(found),
+        "source": "rules (not the model)"})
+    legs = ([SimpleNamespace(id=leg.id, payee_id=None,
+                             amount_cents=getattr(leg.amount, "literal_cents", 0))
+             for leg in IntentPlan.model_validate(draft.intent_plan).plan
+             if leg.type == "TRANSFER"] if draft
+            else [SimpleNamespace(id="t1", payee_id=None, amount_cents=0)])
+    attempts.record(key, user_id, legs, outcome=scam.BLOCK, asked=False, now=int(time.time()),
+                    status=attempts.STOPPED)
+    return {"status": "blocked", "kind": "scam", "draft_id": draft.draft_id if draft else None,
+            "reasons": reasons,
             "scam": {"outcome": scam.BLOCK, "decision": scam.CALL_BANK, "never_rules": never,
                      "phrase_codes": scam.phrase_codes(found), "warnings": reasons}}
 
 
 def _stop_for_never_rule(draft: Draft, found: list, never: list[str]) -> dict:
-    """A drafted payment stopped before its question. Logged like a scored
-    block — in the audit chain, and as a stopped attempt, so a retry without
-    the words still counts it (RETRY_AFTER_STOPPED needs a payee: none is known
-    yet, but REPEATED_STOPPED_ATTEMPTS counts it)."""
-    out = _scam_stop(draft.draft_id, draft.draft_id, found, never)
+    """A drafted payment stopped before its question: nothing left to sign."""
     draft.status = "blocked"
     draft.resolved_plan = None
     draft.question = None
     draft.scam_floor = scam.BLOCK
-    _audit.append(AuditEntryType.SCAM_ASSESSMENT, {
-        "stage": "before_question", "draft_id": draft.draft_id, "decision": scam.CALL_BANK,
-        "outcome": scam.BLOCK, "never_rules": never, "phrase_codes": scam.phrase_codes(found),
-        "source": "rules (not the model)"})
-    plan = IntentPlan.model_validate(draft.intent_plan)
-    attempts.record(draft.draft_id, draft.user_id,
-                    [SimpleNamespace(id=leg.id, payee_id=None,
-                                     amount_cents=getattr(leg.amount, "literal_cents", 0))
-                     for leg in plan.plan if leg.type == "TRANSFER"],
-                    outcome=scam.BLOCK, asked=False, now=int(time.time()),
-                    status=attempts.STOPPED)
-    return out
+    return _scam_stop(draft.draft_id, draft.user_id, found, never, draft=draft)
 
 
 def _follow_up_reply(req: DraftRequest, route: str, question: str) -> dict:

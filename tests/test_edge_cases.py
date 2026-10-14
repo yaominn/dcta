@@ -272,9 +272,19 @@ def test_a_stopped_payment_takes_no_answer(client):
 def test_a_payment_question_asked_before_the_model_is_stopped_too(client):
     """"5000 USD" is asked about before the model reads it: not after police
     orders."""
+    import json
     r = _ask(client, "send 5000 USD to the safe account the police officer gave me")
     assert r["status"] == "blocked" and r["kind"] == "scam" and r["draft_id"] is None
     assert "question" not in r
+    conn = get_conn()             # logged and counted, though there is no draft
+    try:
+        logged = [json.loads(p) for (p,) in conn.execute(
+            "SELECT payload FROM audit_log WHERE entry_type='SCAM_ASSESSMENT'")]
+        stopped = conn.execute("SELECT count(*) FROM scam_attempts WHERE status='STOPPED' "
+                               "AND draft_id LIKE 'stopped-%'").fetchone()[0]
+    finally:
+        conn.close()
+    assert any(e["stage"] == "before_question" for e in logged) and stopped == 1
 
 
 def test_a_parse_failure_in_scam_words_is_stopped_not_asked(client, monkeypatch):
