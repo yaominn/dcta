@@ -32,7 +32,8 @@ from fastapi.testclient import TestClient
 from backend.audit.canonical import hash_transcript
 from backend.data.seed import seed
 from backend.models.schemas import (AmountOp, BuyEquityIntent, IntentPlan, LiteralAmount,
-                                    MentionTarget, ResolvedBuyEquity, ResolvedPlan,
+                                    MentionTarget, ResolvedBuyEquity, ResolvedOwnTransfer,
+                                    ResolvedPlan,
                                     ResolvedTransfer, SymbolicAmount, TransferIntent)
 from backend.narrate import narrate
 
@@ -142,6 +143,46 @@ def test_a_calculated_amount_and_two_payments():
     assert out["evidence"]["t2"]["from"]["kind"] == "derived"
 
 
+def test_half_of_a_move_says_what_was_moved_not_whats_left():
+    """"Move a grand to my joint account and then buy DBS shares with half of
+    it": the resolver halves the $1,000 moved and debits Spending, where it
+    went. The card used to say "half of what's left in Savings · same account"."""
+    transcript = "Move a grand to my joint account and then buy DBS shares with half of it"
+    intent = IntentPlan(plan=[
+        TransferIntent(id="t1", type="TRANSFER", source_account=MentionTarget(mention="default"),
+                       target=MentionTarget(mention="my joint account"),
+                       amount=LiteralAmount(literal_cents=100000)),
+        BuyEquityIntent(id="t2", type="BUY_EQUITY", source_account=MentionTarget(mention="default"),
+                        ticker=MentionTarget(mention="DBS"),
+                        amount=SymbolicAmount(after_leg="t1", op=AmountOp.HALF))])
+    now = int(time.time())
+    plan = ResolvedPlan(
+        draft_id="d-move", transcript_hash=hash_transcript(transcript), created_at=now,
+        expires_at=now + 300,
+        plan=[ResolvedOwnTransfer(id="t1", source_account="acct_savings", to_account="acct_joint",
+                                  to_display="Spending", amount_cents=100000),
+              ResolvedBuyEquity(id="t2", type="BUY_EQUITY", source_account="acct_joint",
+                                ticker="D05", amount_cents=45800, estimated_shares=10,
+                                estimated_fill_price_cents=4580)])
+    out = narrate(intent, plan, transcript, accounts=ACCOUNTS, history=[])
+    ev = out["evidence"]["t2"]
+    assert ev["amount"] == {"kind": "calculated", "text": "half of the $1,000.00 moved in step 1"}
+    assert ev["from"] == {"kind": "derived", "text": "from Spending"}
+    assert "$458.00 comes from half of the $1,000.00 moved to Spending." in out["reply"]
+    assert "Savings" not in ev["amount"]["text"]
+
+
+def test_the_chained_buy_through_the_api(client):
+    d = client.post("/api/drafts", json={
+        "transcript": "Move a grand to my joint account and then buy DBS shares with half of it"}).json()
+    assert d["status"] == "ready"
+    legs = d["resolved_plan"]["plan"]
+    assert (legs[1]["source_account"], legs[1]["amount_cents"]) == ("acct_joint", 45800)
+    ev = d["narration"]["evidence"]["t2"]
+    assert ev["amount"]["text"] == "half of the $1,000.00 moved in step 1"
+    assert ev["from"] == {"kind": "derived", "text": "from Spending"}
+
+
 def test_every_figure_in_the_reply_comes_from_the_plan_or_the_ledger():
     """The reply can never disagree with the card: its payment amount is the
     RESOLVED amount, even if the parser's literal said something else."""
@@ -211,6 +252,7 @@ def test_the_card_evidence_line(page):
         "“50 dollars” · “mom” · Savings by default",
         "you chose “500” · “mom” · “spending”",
         "calculated: the rest of what's left in Savings · “apple” · same account",
+        "calculated: half of the $1,000.00 moved in step 1 · “DBS” · from Spending",
         "⚠ amount not in your words · ⚠ recipient not in your words · Savings by default",
         "\u201c50\u201d · \u201cmom\u201d · \u26a0 account not in your words",
         "",

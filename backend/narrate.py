@@ -117,14 +117,26 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
         acct = account_label(rleg.source_account)
         after[rleg.source_account] = after.get(rleg.source_account, 0) - rleg.amount_cents
         who, mention = _recipient(ileg, rleg)
+        base = (resolved_by_id.get(ileg.amount.after_leg)
+                if isinstance(ileg.amount, SymbolicAmount) else None)
 
         # --- amount: said, chosen, or calculated
         if isinstance(ileg.amount, SymbolicAmount):
-            what = "the rest" if ileg.amount.op.value == "ALL" else "half"
-            base = resolved_by_id.get(ileg.amount.after_leg)
-            src = account_label(base.source_account) if base else acct
-            amount_ev = {"kind": "calculated", "text": f"{what} of what's left in {src}"}
-            notes.append(f"{_money(rleg.amount_cents)} is {what} of {src}.")
+            if base is not None and base.type == "OWN_TRANSFER":
+                # The resolver's rule (resolver._resolve_leg, from_move): after
+                # a move between the user's own accounts, "half of it" is half
+                # the money moved, debited from the account it moved to.
+                what = "all" if ileg.amount.op.value == "ALL" else "half"
+                step = next(n for n, leg in enumerate(intent.plan, 1) if leg.id == base.id)
+                moved = f"the {_money(base.amount_cents)} moved"
+                amount_ev = {"kind": "calculated", "text": f"{what} of {moved} in step {step}"}
+                notes.append(f"{_money(rleg.amount_cents)} comes from {what} of "
+                             f"{moved} to {base.to_display}.")
+            else:
+                what = "the rest" if ileg.amount.op.value == "ALL" else "half"
+                src = account_label(base.source_account) if base else acct
+                amount_ev = {"kind": "calculated", "text": f"{what} of what's left in {src}"}
+                notes.append(f"{_money(rleg.amount_cents)} is {what} of {src}.")
         elif isinstance(ileg.amount, SharesAmount):
             m = re.search(rf"\b\S+(?:\s+\S+){{0,2}}?\s+shares?\b", clause, re.I)
             amount_ev = ({"kind": "said", "quote": m.group(0).strip()} if m
@@ -153,6 +165,10 @@ def narrate(intent: IntentPlan, resolved: ResolvedPlan, transcript: str, *,
         # --- source account
         acct_type = (accounts.get(rleg.source_account) or {}).get("type")
         from_ev = _source_evidence(ileg, transcript if single else clause, acct_type)
+        if from_ev["kind"] == "derived" and base is not None \
+                and rleg.source_account != base.source_account:
+            # Not the account the step before paid from: the one it moved to.
+            from_ev = {"kind": "derived", "text": f"from {acct}"}
         if from_ev["kind"] == "default":
             # There is no "amend by voice": the way to change it is Cancel and
             # ask again — so that is what the reply says.

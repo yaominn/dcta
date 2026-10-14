@@ -358,7 +358,7 @@ function evidenceText(ev, leg) {
   const f = ev.from || {};
   if (f.kind === "said") parts.push(q(f.quote));
   else if (f.kind === "default") parts.push(acctLabel(leg.source_account) + " by default");
-  else if (f.kind === "derived") parts.push("same account");
+  else if (f.kind === "derived") parts.push(f.text || "same account");
   else if (f.kind === "not_found") parts.push("\u26a0 account not in your words");
   return parts.join(" · ");
 }

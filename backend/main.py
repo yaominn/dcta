@@ -2176,8 +2176,17 @@ def get_draft(draft_id: str):
 @app.get("/api/data", response_model=None)
 def data_traces():
     """# MOCK/demo: the last requests, step by step — the exact prompts sent to
-    the LLM, its raw replies, and what every deterministic step did next."""
-    return {"provider": get_provider(settings).name, "traces": _traces.recent()}
+    the LLM, its raw replies, and what every deterministic step did next.
+
+    draft_status is the draft's status now ("ready", "cancelled", ...), or None
+    when there is no draft to sign: never made (a refusal, a question) or
+    expired. The page's badge only says a request waits for a signature when
+    its draft really can still be signed."""
+    def status(trace_id: str) -> str | None:
+        draft = _drafts.get(trace_id)
+        return draft.status if draft else None
+    return {"provider": get_provider(settings).name,
+            "traces": [{**tr, "draft_status": status(tr["id"])} for tr in _traces.recent()]}
 
 
 @app.get("/data")

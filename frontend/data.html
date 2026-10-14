@@ -213,6 +213,15 @@
       if (e.never_rules && e.never_rules.length) out.push(el("p", "muted", "Never rules: " + e.never_rules.join(", ")));
       return out;
     },
+    firewall(e) {
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Refused — wording aimed at the app"));
+      return [h, el("p", null, e.note || ""), el("p", "muted", (e.codes || []).join(", "))];
+    },
+    cancelled(e) {
+      const h = el("h3"); h.append(who("you"), document.createTextNode("You cancelled it — nothing was sent"));
+      return [h, el("p", "muted", `It was ${e.prior_status}.`)];
+    },
+    declined(e) { return RENDER.cancelled(e); },
     step_up(e) {
       const h = el("h3"); h.append(who("code"), document.createTextNode("Extra confirmation — code texted to your phone"));
       return [h, el("p", null, (e.reasons || []).join(" ")), el("p", "muted", "The code itself is never shown here.")];
@@ -238,22 +247,39 @@
     },
   };
 
+  // The badge: where the request ENDED. Every end state is named; "awaiting"
+  // needs the server to say the draft is still "ready" (tr.draft_status, from
+  // /api/data), so a refused, cancelled or expired request never reads as one
+  // waiting for a signature.
   function outcomeOf(tr) {
     const ev = tr.events;
     const last = (s) => [...ev].reverse().find((x) => x.step === s);
     const gw = last("gateway");
-    if (gw) return gw.accepted ? ["ok", (gw.execution && gw.execution.status) || "EXECUTED"] : ["bad", "REJECTED"];
-    const v = last("validate"); if (v && v.frozen) return ["bad", "FROZEN"];
-    const p = last("policy"); if (p && p.decision === "BLOCK") return ["bad", "BLOCKED"];
+    if (gw && gw.accepted) {
+      const st = (gw.execution && gw.execution.status) || "EXECUTED";
+      return ["ok", st === "EXECUTED" ? "SENT" : st];
+    }
+    const st = tr.draft_status;
+    if (last("cancelled") || last("declined") || st === "cancelled" || st === "declined")
+      return ["", "CANCELLED"];
+    if (gw) return ["bad", "REJECTED"];
+    if (last("firewall")) return ["bad", "REFUSED"];
+    const v = last("validate"); if ((v && v.frozen) || st === "frozen") return ["bad", "FROZEN"];
     const sb = last("scam"); if (sb && sb.blocked) return ["bad", "STOPPED"];
     const sc = last("scam_check"); if (sc && sc.rung === "REFUSE") return ["bad", "NOT ADDED"];
-    const parse = last("parse"); if (parse && parse.error) return ["bad", "PARSE FAILED"];
-    if (last("contacts")) return ["ok", "LISTED"];
+    const p = last("policy"); if ((p && p.decision === "BLOCK") || st === "blocked") return ["bad", "REFUSED"];
+    if (st === "executed") return ["ok", "SENT"];
+    if (st === "scheduled") return ["ok", "SCHEDULED"];
     if (last("question")) return ["ok", "ANSWERED"];
-    const r = last("resolve"); const lastEv = ev[ev.length - 1];
-    if (lastEv && lastEv.step === "resolve" && r.outcome === "question") return ["wait", "ASKED"];
-    if (last("step_up") && !(last("confirm") || {}).ok) return ["wait", "AWAITING CODE"];
-    return ["wait", "AWAITING SIGNATURE"];
+    if (last("contacts") || last("bills")) return ["ok", "LISTED"];
+    const parse = last("parse"); if (parse && parse.error) return ["bad", "PARSE FAILED"];
+    if (st === "ready") {
+      if (last("step_up") && !(last("confirm") || {}).ok) return ["wait", "AWAITING CODE"];
+      return ["wait", "AWAITING SIGNATURE"];
+    }
+    if (st === "clarify" || last("follow_up")) return ["wait", "ASKED"];
+    // No draft left to sign: it expired, or the request never made one.
+    return ["", last("resolve") || last("recurring_parse") ? "EXPIRED" : "NO PAYMENT"];
   }
 
   const open = new Set();
