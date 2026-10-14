@@ -970,7 +970,10 @@ def _pipeline(draft: Draft) -> dict:
                     + (" If you meant someone else, pick them below." if outcome.choices else ""))
         elif outcome.kind == "payee" and outcome.unknown_mention:
             # Money to "this new account": no one to add, and no guess either.
+            # No contact buttons: the validator needs the payee's name in the
+            # user's own words, so a tapped contact could only be frozen.
             draft.question["question"] = NO_NAME_QUESTION
+            draft.question["choices"] = []
         _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
         return {"status": "clarify", "draft_id": draft.draft_id, **draft.question}
 
@@ -1330,17 +1333,45 @@ def create_draft(req: DraftRequest):
             out = {**out, "question": follow}
         elif not looks_like_payment(req.transcript):
             out, question_calls = _answer_question(req, draft.draft_id, payees=payees)
+    # A payment in words no real bank or official uses: the score blocks it
+    # whatever the answer (scam.decide), so a question now ("who is it for?",
+    # "which John?") only offers choices that will be refused. Stop, and say
+    # why. A question ABOUT payments ("did I send 5000 to the safe account?")
+    # was answered above and keeps its warning below.
+    if draft.kind == "payment" and out.get("status") == "clarify":
+        never = scam.word_score(draft.scam_text)["never_rules"]
+        if never:
+            out = _stop_for_never_rule(draft, never)
+            _note_stopped(req.user_id, out)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
-    # A refused new contact already carries its own warning: no second one.
-    if out.get("status") != "ready" and not (draft.kind == "contact_add"
-                                             and out.get("status") == "blocked"):
+    # A refused new contact or a stopped payment already carries its own
+    # warning: no second one.
+    if out.get("status") != "ready" and not (out.get("status") == "blocked"
+                                             and (draft.kind == "contact_add"
+                                                  or out.get("kind") == "scam")):
         found = scam.scan_transcript(req.transcript)
         if scam.strong_codes(found):
             out["scam_language"] = {"codes": scam.phrase_codes(found),
                                     "warning": scam.warning_for(found)}
     return _with_debug(out, draft,
                        provider.calls + question_calls + getattr(draft, "llm_calls", []))
+
+
+def _stop_for_never_rule(draft: Draft, never: list[str]) -> dict:
+    """A payment stopped before its question: the "Payment stopped" card, with
+    the scam warning for the user's words. Nothing was drafted to sign."""
+    found = scam.scan_transcript(draft.scam_text)
+    reasons = [w for w in [scam.warning_for(found)] if w]
+    draft.status = "blocked"
+    draft.resolved_plan = None
+    draft.question = None
+    _traces.event(draft.draft_id, "scam", blocked=True, never_rules=never,
+                  note="stopped before asking: a never rule in the user's words")
+    return {"status": "blocked", "kind": "scam", "draft_id": draft.draft_id,
+            "reasons": reasons,
+            "scam": {"outcome": scam.BLOCK, "decision": scam.CALL_BANK, "never_rules": never,
+                     "phrase_codes": scam.phrase_codes(found), "warnings": reasons}}
 
 
 def _follow_up_reply(req: DraftRequest, route: str, question: str) -> dict:
@@ -1495,7 +1526,7 @@ def _run(draft: Draft) -> dict:
 
 # --------------------------------------------------------------------------- adding a contact
 NO_NAME_QUESTION = ("I can only send money to people saved in your contacts. "
-                    "Who is it for?")
+                    "Who is it for? Say the payment again with their name.")
 
 
 def _new_contact_offer(plan: IntentPlan, q: Clarify) -> dict | None:

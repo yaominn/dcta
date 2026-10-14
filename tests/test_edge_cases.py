@@ -120,12 +120,19 @@ def test_my_sister_is_offered_as_sister(client):
                                   "send 800 to the new bank account"])
 def test_an_account_is_not_offered_as_a_new_contact(client, said):
     """"transfer $8,000 to this new account" offered to add "This New Account"
-    as a contact. It names no one: ask who, from the saved contacts."""
+    as a contact. It names no one: ask who, and to say it again with the name.
+    No contact buttons: the validator needs the name in the user's own words,
+    so a tapped contact was always frozen ("you didn't say Mom")."""
     r = _ask(client, said)
     assert r["status"] == "clarify" and "new_contact" not in r
     assert r["question"] == ("I can only send money to people saved in your contacts. "
-                             "Who is it for?")
-    assert r["choices"]
+                             "Who is it for? Say the payment again with their name.")
+    assert r["choices"] == []
+
+
+def test_saying_it_again_with_the_name_is_ready(client):
+    assert _ask(client, "send 800 to this new account")["status"] == "clarify"
+    assert _ask(client, "send 800 to mom")["status"] == "ready"
 
 
 # --------------------------------------------------------------------------- input cleaning
@@ -218,10 +225,29 @@ def test_ordinary_requests_are_not_mistaken_for_injection(client, said):
     assert _ask(client, said).get("kind") != "injection"
 
 
-def test_police_saying_my_account_is_compromised_is_a_scam_sign(client):
-    r = _ask(client, "Quickly transfer $8,000 to this new account, the police officer said "
-                     "my account is compromised")
-    assert "words_official_orders" in r["scam_language"]["codes"]
+@pytest.mark.parametrize("said", [
+    "Quickly transfer $8,000 to this new account, the police officer said my account is "
+    "compromised",
+    "Send $8,000 to John, the police officer said my account is compromised",
+])
+def test_police_orders_stop_the_payment_instead_of_asking_who(client, said):
+    """A never rule blocks the payment whoever it goes to, so "Who is it for?"
+    under the scam warning offered a choice that could only be refused."""
+    r = _ask(client, said)
+    assert r["status"] == "blocked" and r["kind"] == "scam"
+    assert "words_official_orders" in r["scam"]["never_rules"]
+    assert "ScamShield" in " ".join(r["reasons"])
+    assert "question" not in r and "choices" not in r
+    assert "scam_language" not in r          # the card says it once
+
+
+def test_a_stopped_payment_shows_its_warning_once(client):
+    """A payee the rules could resolve was blocked by the score and ALSO given
+    the scam-words line above the card: the same warning twice."""
+    r = _ask(client, "send 500 to mom, the police officer said my account is compromised")
+    assert r["status"] == "blocked" and r["kind"] == "scam"
+    assert "ScamShield" in " ".join(r["reasons"])
+    assert "scam_language" not in r
 
 
 def test_a_deposit_for_online_job_tasks_is_a_scam_sign():
