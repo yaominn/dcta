@@ -1147,6 +1147,14 @@ tells you). It **keeps** your registered passkey, contact edits, the audit log
 and the record of executed drafts. (`python -m backend.data.seed` resets
 everything, passkeys included.)
 
+The same reset is one tap in the app: **Settings → Demo → Reset demo money**
+(`POST /api/demo/reset`). **It is a demo control, not a banking feature.** A
+real bank never lets a customer put their own balance back — money only moves
+through a signed payment. It exists so a presenter can rehearse and then start
+the demo from the seeded balances without a terminal. It moves no money
+between accounts, so it needs no signature; on a public demo server anyone
+with the link can press it, which only resets the fake demo ledger.
+
 ## Demo script (brief Section 10)
 
 1. **Happy path** — multi-intent voice command → one overlay → one fingerprint → both legs executed.
