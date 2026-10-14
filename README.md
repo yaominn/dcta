@@ -1157,8 +1157,12 @@ python -m backend.data.reset_demo
 It restores the seeded balances (Savings $8,420.50, Spending $1,200.00), the
 payment history the anomaly and limit rules read, and any demo contact you
 removed while practising (unless a newer contact has its name or number; it
-tells you). It **keeps** your registered passkey, contact edits, the audit log
-and the record of executed drafts. (`python -m backend.data.seed` resets
+tells you). It also clears the scam score's memory of the rehearsal — earlier
+stopped attempts and a freeze you turned off — so the first payment of the demo
+isn't asked "did anyone ask you to turn off your freeze?" or told "several
+payments were stopped today". A freeze that is still **on** stays on: only the
+code from the phone lifts it. It **keeps** your registered passkey, contact
+edits, the audit log and the record of executed drafts. (`python -m backend.data.seed` resets
 everything, passkeys included.)
 
 The same reset is one tap in the app: **Settings → Demo → Reset demo money**

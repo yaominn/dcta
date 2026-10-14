@@ -202,3 +202,28 @@ def test_the_settings_button_explains_an_unseeded_ledger(tmp_path, monkeypatch):
     r = TestClient(main.app).post("/api/demo/reset", json={"confirm": True})
     assert r.status_code == 409
     assert "python -m backend.data.seed" in r.json()["detail"]
+
+
+def test_reset_forgets_a_freeze_turned_off_but_keeps_one_still_on(tmp_path):
+    """A released freeze would make every later payment ask "did anyone ask
+    you to turn it off?". One still engaged is a safety control: only the
+    phone code lifts it, never the demo reset."""
+    db = tmp_path / "ledger.db"
+    with contextlib.redirect_stdout(io.StringIO()):
+        seed(db)
+    conn = connect(db)
+    try:
+        conn.execute("INSERT INTO kill_switch VALUES ('u_alice', 100, 200)")   # on, then off
+        conn.execute("INSERT INTO kill_switch VALUES ('u_bob', 100, NULL)")    # still on
+        conn.commit()
+    finally:
+        conn.close()
+
+    reset_demo(db)
+
+    conn = connect(db)
+    try:
+        rows = {r["user_id"]: r["released_at"] for r in conn.execute("SELECT * FROM kill_switch")}
+    finally:
+        conn.close()
+    assert rows == {"u_bob": None}

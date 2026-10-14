@@ -10,12 +10,15 @@ longer counts as "first-ever". A full `python -m backend.data.seed` fixes that
 but also DROPS the registered passkeys, so the presenter must re-enroll Touch
 ID minutes before going on stage.
 
-This restores exactly three things to their seeded state:
+This restores these to their seeded state:
   - account balances
   - the transaction history (the baseline for anomaly, daily-limit and
     velocity checks)
   - demo contacts removed from the contacts card (Mom, the two Johns,
     Landlord), unless a newer contact has taken the name or number
+  - the scam score's memory of the rehearsal: earlier attempts (so no
+    "several payments were stopped today") and a freeze that was turned off
+    (so no "you turned off your freeze"). A freeze still ON stays on.
 
 and deliberately keeps everything else:
   - registered passkeys          (no re-enrolling)
@@ -68,6 +71,12 @@ def reset_demo(db_path: Path = DB_PATH) -> dict:
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='scam_attempts'").fetchone() is not None:
             conn.execute("DELETE FROM scam_attempts")
+        # A freeze turned off while rehearsing would make every payment ask
+        # "did anyone ask you to?" (FREEZE_TURNED_OFF). A freeze still ON stays
+        # on: lifting it needs the code from the phone, not a demo button.
+        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='kill_switch'").fetchone() is not None:
+            conn.execute("DELETE FROM kill_switch WHERE released_at IS NOT NULL")
         # The seed's own rows and statement shape: one baseline, not two copies.
         conn.executemany(
             "INSERT INTO transaction_history (user_id, payee_id, leg_type, amount, ts) "

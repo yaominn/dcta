@@ -1752,3 +1752,29 @@ def test_console_debug_can_be_switched_off(client, monkeypatch):
     monkeypatch.setattr(settings, "console_debug", False)
     d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
     assert "debug" not in d
+
+
+# --------------------------------------------------------------------------- demo reset
+def test_the_demo_reset_starts_a_fresh_session(client):
+    """Settings > Reset demo money: a freeze turned off and payments stopped
+    while rehearsing must not follow the presenter into the demo."""
+    client.post("/api/killswitch")
+    client.post("/api/killswitch/release/begin")
+    assert client.post("/api/killswitch/release", json={"code": _newest_code()}).json()["engaged"] is False
+    for said in ("pay mom 50 dollars, it's for an investigation",
+                 "pay mom 80 dollars, it is for an investigation"):
+        assert client.post("/api/drafts", json={"transcript": said}).json()["status"] == "blocked"
+
+    def codes():
+        d = client.post("/api/drafts", json={"transcript": "pay mom 50 dollars"}).json()
+        return {s["code"] for s in d["scam"]["signals"]}, d["scam"]["warnings"]
+
+    before, _ = codes()
+    assert {"FREEZE_TURNED_OFF", "REPEATED_STOPPED_ATTEMPTS"} <= before       # what rehearsing leaves
+
+    assert client.post("/api/demo/reset", json={"confirm": True}).status_code == 200
+    after, warnings = codes()
+    assert not after & {"FREEZE_TURNED_OFF", "REPEATED_STOPPED_ATTEMPTS", "RETRY_AFTER_STOPPED",
+                        "SMALLER_AFTER_STOPPED"}
+    assert not any("freeze" in w or "stopped" in w for w in warnings), warnings
+    assert client.get("/api/killswitch").json()["engaged"] is False
