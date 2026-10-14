@@ -78,7 +78,7 @@
   const short = (h) => h.slice(0, 10) + "…";
   const money = (c) => "$" + (c / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const show = (field, v) => typeof v === "string" ? JSON.stringify(v)
-    : /amount_cents$/.test(field) && typeof v === "number" ? money(v) : String(v);
+    : /amount[^.]*$/.test(field) && typeof v === "number" ? money(v) : String(v);
   let entries = [];             // oldest first, as the chain is stored
   let shown = PAGE;
   let brokenId = null;          // the entry a tamper demo broke, highlighted
@@ -153,34 +153,44 @@
     }
   }
 
+  let busy = false;              // one tamper at a time: results never land out of order
   async function tamper(id) {
-    let r;
+    if (busy) return;
+    busy = true;
+    let r, t;
     try {
       r = await fetch("/api/audit/tamper-demo", {
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ entry_id: id }),
       });
+      t = await r.json();
     } catch (_) {
       paintResult("bad", "Couldn't run the tamper demo", ["Is the server running? Try again."]);
       return;
+    } finally {
+      busy = false;
     }
     if (r.status !== 200) {
-      paintResult("bad", "Couldn't run the tamper demo", ["Entry #" + id + " wasn't found."]);
+      paintResult("bad", "Couldn't run the tamper demo",
+        [r.status === 404 ? "Entry #" + id + " is no longer in the log. Press Verify to reload it."
+                          : "The server couldn't run it. Try again."]);
       return;
     }
-    const t = await r.json();
-    const broke = t.ok ? null : entries[t.break_at];
-    brokenId = broke ? broke.id : null;
-    paintResult(t.ok ? "ok" : "bad",
-      t.ok ? "Not caught" : "Caught: Verify says broken at entry #" + broke.id + " (" + broke.entry_type + ")",
-      ["Simulated attack on a copy of the log: entry #" + t.entry_id + " (" + t.entry_type + ") had "
-         + t.field + " changed from " + show(t.field, t.old) + " to " + show(t.field, t.new)
-         + ", without fixing its fingerprint.",
-       t.ok ? "" : "Reason: " + t.reason + ". The real log is unchanged."].filter(Boolean),
-      true);
-    if (brokenId != null && entries.slice().reverse().findIndex((e) => e.id === brokenId) >= shown) {
-      shown = entries.length;   // the broken entry must be on screen
+    brokenId = t.broken_id;
+    if (!t.live_ok) {
+      paintResult("bad", "The real log is already broken at entry #" + t.broken_id,
+        ["Verify finds a real break before anything was simulated: " + t.reason + "."], false);
+    } else {
+      paintResult(t.ok ? "ok" : "bad",
+        t.ok ? "Not caught" : "Caught: Verify says broken at entry #" + t.broken_id + " (" + t.entry_type + ")",
+        ["Simulated attack on a copy of the log: entry #" + t.entry_id + " (" + t.entry_type + ") had "
+           + t.field + " changed from " + show(t.field, t.old) + " to " + show(t.field, t.new)
+           + ", without fixing its fingerprint.",
+         t.ok ? "" : "Reason: " + t.reason + ". The real log is unchanged."].filter(Boolean),
+        true);
     }
+    const at = entries.slice().reverse().findIndex((e) => e.id === brokenId);
+    if (at >= shown) shown = at + 1;    // the broken entry must be on screen
     paintList();
     const row = document.getElementById("entry-" + brokenId);
     if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });

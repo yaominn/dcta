@@ -92,6 +92,7 @@ def test_tamper_demo_catches_the_edit_and_leaves_the_log_alone(tmp_path):
     r = log.simulate_tamper(2)
 
     assert r["ok"] is False and r["break_at"] == 1 and "tampered" in r["reason"]
+    assert r["broken_id"] == 2 and r["live_ok"] is True
     assert (r["field"], r["old"], r["new"]) == ("amount_cents", 5000, 500000)
     assert log.all_entries() == before
     assert log.verify_chain()["ok"] is True
@@ -128,3 +129,21 @@ def test_tamper_demo_endpoint_never_writes_the_live_log(tmp_path, monkeypatch):
     assert log.all_entries() == before
     assert client.get("/api/audit/verify").json()["ok"] is True
     assert client.get("/audit").status_code == 200
+
+
+def test_tamper_demo_reports_a_real_break_as_real(tmp_path):
+    """If the live log is already broken earlier, the demo must not claim to
+    have caught its own edit."""
+    log = _log(tmp_path)
+    for v in "abc":
+        log.append(AuditEntryType.DRAFT, {"v": v})
+    log._raw_update_payload(1, '{"v":"HACKED"}')
+    r = log.simulate_tamper(3)
+    assert r["live_ok"] is False and r["broken_id"] == 1
+
+
+def test_tamper_demo_adds_a_field_when_there_is_nothing_to_edit(tmp_path):
+    log = _log(tmp_path)
+    log.append(AuditEntryType.DRAFT, {"note": "", "tampered": None})
+    r = log.simulate_tamper(1)
+    assert (r["field"], r["old"], r["new"]) == ("tampered", None, "yes") and r["ok"] is False

@@ -135,17 +135,22 @@ class AuditLog:
         left alone — but in a COPY of the rows, then run the same check as
         verify_chain(). The real log is append-only and stays untouched (a real
         edit would leave it broken for every demo after; red-team scenario 7
-        does that on its own throwaway chain). None if there is no such entry."""
+        does that on its own throwaway chain). None if there is no such entry.
+
+        broken_id is the id of the entry the check stopped at. If the real log
+        is already broken, live_ok is False and the demo proves nothing: the
+        break it reports is the real one, not the simulated edit."""
         entries = self.all_entries()
         target = next((e for e in entries if e["id"] == entry_id), None)
         if target is None:
             return None
-        before = json.loads(target["payload"])
-        after, field, old, new = _tampered(before)
-        target["payload"] = canonical_json(after)
-        return {**verify_entries(entries), "entry_id": entry_id,
-                "entry_type": target["entry_type"], "field": field,
-                "old": old, "new": new}
+        live = verify_entries(entries)
+        payload, field, old, new = _tampered(json.loads(target["payload"]))
+        target["payload"] = canonical_json(payload)
+        out = live if not live["ok"] else verify_entries(entries)
+        broken = entries[out["break_at"]]["id"] if out["break_at"] is not None else None
+        return {**out, "live_ok": live["ok"], "broken_id": broken, "entry_id": entry_id,
+                "entry_type": target["entry_type"], "field": field, "old": old, "new": new}
 
 
 def verify_entries(entries: list[dict]) -> dict:
@@ -162,9 +167,9 @@ def verify_entries(entries: list[dict]) -> dict:
 
 
 def _tampered(payload: dict) -> tuple[dict, str, Any, Any]:
-    """A copy of `payload` with one value changed, the way a fraudster would:
-    an amount x100, else a yes/no flipped, else a number or a word changed.
-    Returns (copy, dotted path of the field, old value, new value)."""
+    """`payload` (a fresh dict, changed in place) with one value changed, the
+    way a fraudster would: an amount x100, else a yes/no flipped, else a number
+    or a word changed. Returns (payload, dotted path of the field, old, new)."""
     found: list[tuple[list, Any]] = []
 
     def walk(node: Any, path: list) -> None:
@@ -193,12 +198,12 @@ def _tampered(payload: dict) -> tuple[dict, str, Any, Any]:
         for path, v in found:
             if isinstance(v, str) and v:
                 return path, v, v[:-1] + ("1" if v[-1] != "1" else "2")
-        return ["tampered"], None, True
+        old = payload.get("tampered")        # nothing to edit: add a field
+        return ["tampered"], old, "yes" if old != "yes" else "no"
 
     path, old, new = pick()
-    copy = json.loads(json.dumps(payload))
-    node = copy
+    node = payload
     for key in path[:-1]:
         node = node[key]
     node[path[-1]] = new
-    return copy, ".".join(str(k) for k in path), old, new
+    return payload, ".".join(str(k) for k in path), old, new
