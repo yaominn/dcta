@@ -58,9 +58,11 @@ def reset_demo(db_path: Path = DB_PATH) -> dict:
         conn.execute(f"UPDATE payees SET removed_at=NULL WHERE removed_at IS NOT NULL "
                      f"AND id IN ({marks}) AND NOT {clash}", seeded + seeded)
         # A large payment still waiting to run would land on the reset balances.
+        # One already RUNNING is being sent right now: deleting its row would
+        # not stop the money, only lose the record that it went.
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                         "AND name='delayed_payments'").fetchone() is not None:
-            conn.execute("DELETE FROM delayed_payments WHERE status IN ('PENDING','RUNNING')")
+            conn.execute("DELETE FROM delayed_payments WHERE status='PENDING'")
         # Earlier attempts feed the scam score (retries, stopped payments): a
         # reset demo starts with none.
         if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "

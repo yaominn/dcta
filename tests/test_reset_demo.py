@@ -154,31 +154,51 @@ def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
     assert out["history_rows"] == 18 and out["not_restored"] == []
 
 
-def test_the_settings_button_resets_the_live_ledger():
-    """POST /api/demo/reset is the same reset, run by the server on its own
-    ledger: spent money comes back, the passkey stays."""
+
+def test_the_settings_button_runs_the_same_reset(tmp_path, monkeypatch):
+    """POST /api/demo/reset is the same reset, run by the server on its
+    ledger: spent money comes back, the passkey stays. Pointed at a temp
+    ledger, so running this never touches the presenter's real passkey."""
     from fastapi.testclient import TestClient
 
-    from backend.data.db import DB_PATH
-    from backend.main import app
+    import backend.main as main
 
+    db = tmp_path / "ledger.db"
     with contextlib.redirect_stdout(io.StringIO()):
-        seed()
+        seed(db)
+    conn = connect(db)
     try:
-        conn = connect(DB_PATH)
-        try:
-            conn.execute("UPDATE accounts SET balance=1250 WHERE id='acct_savings'")
-            conn.execute("INSERT INTO webauthn_credentials VALUES (?,?,?,?,?)",
-                         ("cred_touchid", "u_alice", b"cose", 7, int(time.time())))
-            conn.commit()
-        finally:
-            conn.close()
-
-        r = TestClient(app).post("/api/demo/reset")
-
-        assert r.status_code == 200
-        assert r.json()["balances"] == {a[0]: a[3] for a in ACCOUNTS}
-        assert r.json()["passkeys_kept"] == 1
+        conn.execute("UPDATE accounts SET balance=1250 WHERE id='acct_savings'")
+        conn.execute("INSERT INTO webauthn_credentials VALUES (?,?,?,?,?)",
+                     ("cred_touchid", "u_alice", b"cose", 7, int(time.time())))
+        conn.commit()
     finally:
-        with contextlib.redirect_stdout(io.StringIO()):
-            seed()
+        conn.close()
+    monkeypatch.setattr(main, "DB_PATH", db)
+    client = TestClient(main.app)
+
+    # A plain cross-site form post carries no JSON body: refused, nothing reset.
+    assert client.post("/api/demo/reset", data={"confirm": "true"}).status_code == 422
+    conn = connect(db)
+    try:
+        assert conn.execute("SELECT balance FROM accounts "
+                            "WHERE id='acct_savings'").fetchone()[0] == 1250
+    finally:
+        conn.close()
+
+    r = client.post("/api/demo/reset", json={"confirm": True})
+
+    assert r.status_code == 200
+    assert r.json()["balances"] == {a[0]: a[3] for a in ACCOUNTS}
+    assert r.json()["passkeys_kept"] == 1
+
+
+def test_the_settings_button_explains_an_unseeded_ledger(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import backend.main as main
+
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "empty.db")
+    r = TestClient(main.app).post("/api/demo/reset", json={"confirm": True})
+    assert r.status_code == 409
+    assert "python -m backend.data.seed" in r.json()["detail"]

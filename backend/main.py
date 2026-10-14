@@ -160,11 +160,17 @@ def list_accounts(user_id: str = Query("u_alice")):
         conn.close()
 
 
+class DemoResetRequest(BaseModel):
+    # A JSON body, so a plain cross-site form post can't trigger it.
+    confirm: Literal[True]
+
+
 @app.post("/api/demo/reset")
-def demo_reset():
+def demo_reset(req: DemoResetRequest):
     """The Settings button for `python -m backend.data.reset_demo`: seeded
     balances and payment history back, passkeys, contacts and the audit log
-    kept. It moves no money anywhere, so it needs no signature."""
+    kept. A demo control, not a banking feature (README). It moves no money
+    anywhere, so it needs no signature."""
     from backend.data.reset_demo import reset_demo
     try:
         return reset_demo(DB_PATH)

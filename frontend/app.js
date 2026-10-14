@@ -1134,6 +1134,9 @@ function showScheduled(res) {
       refreshBalances();
     } else if (st.status === "CANCELLED") {
       finish("Cancelled", "This payment was cancelled. Nothing was sent.");
+    } else if (st.detail && st.detail.error) {
+      // No longer scheduled: Settings > Reset demo money dropped it.
+      finish("Cancelled", "The demo was reset before this payment was sent. Nothing was sent.");
     } else if (typeof st.seconds_left === "number") {
       left = st.seconds_left;
     }
@@ -2029,7 +2032,7 @@ function wireDemoReset() {
     btn.disabled = true;
     let r;
     try {
-      r = await jpost(API + "/api/demo/reset", {});
+      r = await jpost(API + "/api/demo/reset", { confirm: true });
     } catch (_) {
       r = { status: 0, json: {} };
     }
@@ -2037,9 +2040,8 @@ function wireDemoReset() {
     note.classList.toggle("error", r.status !== 200);
     note.textContent = r.status === 200
       ? "Done. Balances and payment history are back to the start."
-      : "Couldn't reset the demo. Try again.";
+      : typeof r.json.detail === "string" ? r.json.detail : "Couldn't reset the demo. Try again.";
     refreshBalances();
-    refreshBillsBadge();              // waiting large payments were dropped too
   };
 }
 
