@@ -740,6 +740,19 @@ question.
 > touch the append-only log. The flag is opt-in: a normal `seed()` still
 > preserves audit history, because surviving a re-seed is usually the point.
 
+### The audit page: `/audit`
+
+`http://localhost:8000/audit` (linked from the main page) lists every entry,
+newest first, with its fingerprint (hash) and the one before it. **Verify the
+chain** runs `verify_chain()` on the live log (`GET /api/audit/verify`).
+**Tamper** on any entry runs the attack on a **copy** of the chain
+(`POST /api/audit/tamper-demo`): one value in that entry is changed — an amount
+×100, else a yes/no flipped, else a number or word — without fixing its hash,
+and the same check reports the break at exactly that entry. The live log is
+never written, so the demo can be repeated and no `--reset-audit` is needed
+afterwards. Red-team scenario 7 is the version that really edits a database
+row, on a throwaway chain of its own.
+
 
 ## M8 — The wired pipeline + the red-team demo
 

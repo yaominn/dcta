@@ -544,6 +544,25 @@ def audit_verify():
     return _audit.verify_chain()
 
 
+class TamperDemoRequest(BaseModel):
+    entry_id: int
+
+
+@app.post("/api/audit/tamper-demo")
+def audit_tamper_demo(req: TamperDemoRequest):
+    """The audit page's tamper button: one value in one entry changed in a COPY
+    of the chain, then verified. The live log is never written."""
+    out = _audit.simulate_tamper(req.entry_id)
+    if out is None:
+        raise HTTPException(404, f"no audit entry {req.entry_id}")
+    return out
+
+
+@app.get("/audit")
+def audit_page():
+    return FileResponse(FRONTEND_DIR / "audit.html")
+
+
 # --------------------------------------------------------------------------- M2: WebAuthn
 def _get_user(user_id: str) -> dict:
     conn = get_conn()

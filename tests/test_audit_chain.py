@@ -78,3 +78,53 @@ def test_linkage_break_from_deletion_detected(tmp_path):
     r = log.verify_chain()
     assert r["ok"] is False
     assert r["break_at"] is not None                     # the gap surfaces as a linkage break
+
+
+def test_tamper_demo_catches_the_edit_and_leaves_the_log_alone(tmp_path):
+    """The audit page's Tamper button: an amount changed in a copy of the
+    chain is caught at that entry; the real rows are byte-for-byte unchanged."""
+    log = _log(tmp_path)
+    log.append(AuditEntryType.DRAFT, {"v": "a"})
+    log.append(AuditEntryType.EXECUTION, {"amount_cents": 5000, "ok": True})   # id 2
+    log.append(AuditEntryType.SIGNATURE, {"v": "c"})
+    before = log.all_entries()
+
+    r = log.simulate_tamper(2)
+
+    assert r["ok"] is False and r["break_at"] == 1 and "tampered" in r["reason"]
+    assert (r["field"], r["old"], r["new"]) == ("amount_cents", 5000, 500000)
+    assert log.all_entries() == before
+    assert log.verify_chain()["ok"] is True
+
+
+def test_tamper_demo_changes_something_in_any_payload(tmp_path):
+    log = _log(tmp_path)
+    log.append(AuditEntryType.POLICY, {"verified": True})
+    log.append(AuditEntryType.TRANSCRIPT, {"chars": 12, "hash": "ab"})
+    log.append(AuditEntryType.DRAFT, {"draft_id": "d1"})
+    log.append(AuditEntryType.DRAFT, {})
+    assert log.simulate_tamper(1)["new"] is False
+    assert log.simulate_tamper(2)["new"] == 13
+    assert log.simulate_tamper(3)["new"] == "d2"
+    assert [log.simulate_tamper(i)["break_at"] for i in (1, 2, 3, 4)] == [0, 1, 2, 3]
+    assert log.simulate_tamper(99) is None
+
+
+def test_tamper_demo_endpoint_never_writes_the_live_log(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import backend.main as main
+
+    log = _log(tmp_path)
+    log.append(AuditEntryType.DRAFT, {"v": "a"})
+    log.append(AuditEntryType.EXECUTION, {"amount_cents": 5000})
+    before = log.all_entries()
+    monkeypatch.setattr(main, "_audit", log)
+    client = TestClient(main.app)
+
+    r = client.post("/api/audit/tamper-demo", json={"entry_id": 2})
+    assert r.status_code == 200 and r.json()["break_at"] == 1
+    assert client.post("/api/audit/tamper-demo", json={"entry_id": 9}).status_code == 404
+    assert log.all_entries() == before
+    assert client.get("/api/audit/verify").json()["ok"] is True
+    assert client.get("/audit").status_code == 200

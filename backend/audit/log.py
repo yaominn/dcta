@@ -17,6 +17,7 @@ case, which we pass.
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -126,13 +127,78 @@ class AuditLog:
         """Walk the chain; report {ok, break_at, reason}. break_at is the 0-based
         index of the FIRST entry whose stored hash can't be recomputed or whose
         prev_hash doesn't link to the previous entry. None if the chain is intact."""
+        return verify_entries(self.all_entries())
+
+    def simulate_tamper(self, entry_id: int) -> dict | None:
+        """The audit page's tamper demo: change one value in entry `entry_id`
+        the way an attacker with DB write access would — payload edited, hash
+        left alone — but in a COPY of the rows, then run the same check as
+        verify_chain(). The real log is append-only and stays untouched (a real
+        edit would leave it broken for every demo after; red-team scenario 7
+        does that on its own throwaway chain). None if there is no such entry."""
         entries = self.all_entries()
-        prev = GENESIS_HASH
-        for i, e in enumerate(entries):
-            recomputed = entry_hash(e["prev_hash"], e["entry_type"], e["payload"], e["created_at"])
-            if recomputed != e["hash"]:
-                return {"ok": False, "break_at": i, "reason": "content tampered (hash mismatch)"}
-            if e["prev_hash"] != prev:
-                return {"ok": False, "break_at": i, "reason": "chain linkage broken (prev_hash mismatch)"}
-            prev = e["hash"]
-        return {"ok": True, "break_at": None, "reason": None}
+        target = next((e for e in entries if e["id"] == entry_id), None)
+        if target is None:
+            return None
+        before = json.loads(target["payload"])
+        after, field, old, new = _tampered(before)
+        target["payload"] = canonical_json(after)
+        return {**verify_entries(entries), "entry_id": entry_id,
+                "entry_type": target["entry_type"], "field": field,
+                "old": old, "new": new}
+
+
+def verify_entries(entries: list[dict]) -> dict:
+    """verify_chain() over rows already read, oldest first."""
+    prev = GENESIS_HASH
+    for i, e in enumerate(entries):
+        recomputed = entry_hash(e["prev_hash"], e["entry_type"], e["payload"], e["created_at"])
+        if recomputed != e["hash"]:
+            return {"ok": False, "break_at": i, "reason": "content tampered (hash mismatch)"}
+        if e["prev_hash"] != prev:
+            return {"ok": False, "break_at": i, "reason": "chain linkage broken (prev_hash mismatch)"}
+        prev = e["hash"]
+    return {"ok": True, "break_at": None, "reason": None}
+
+
+def _tampered(payload: dict) -> tuple[dict, str, Any, Any]:
+    """A copy of `payload` with one value changed, the way a fraudster would:
+    an amount x100, else a yes/no flipped, else a number or a word changed.
+    Returns (copy, dotted path of the field, old value, new value)."""
+    found: list[tuple[list, Any]] = []
+
+    def walk(node: Any, path: list) -> None:
+        if isinstance(node, dict):
+            for k, v in node.items():
+                walk(v, path + [k])
+        elif isinstance(node, list):
+            for i, v in enumerate(node):
+                walk(v, path + [i])
+        else:
+            found.append((path, node))
+
+    walk(payload, [])
+
+    def pick() -> tuple[list, Any, Any]:
+        for path, v in found:
+            if (path and isinstance(path[-1], str) and "amount" in path[-1]
+                    and isinstance(v, int) and not isinstance(v, bool)):
+                return path, v, v * 100 if v else 100000
+        for path, v in found:
+            if isinstance(v, bool):
+                return path, v, not v
+        for path, v in found:
+            if isinstance(v, int):
+                return path, v, v + 1
+        for path, v in found:
+            if isinstance(v, str) and v:
+                return path, v, v[:-1] + ("1" if v[-1] != "1" else "2")
+        return ["tampered"], None, True
+
+    path, old, new = pick()
+    copy = json.loads(json.dumps(payload))
+    node = copy
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = new
+    return copy, ".".join(str(k) for k in path), old, new

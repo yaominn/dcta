@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DCTA Audit Log</title>
+  <!-- The hash-chained audit log, a Verify button, and a tamper demo. The
+       tamper runs on a COPY of the chain (POST /api/audit/tamper-demo): the
+       real log is append-only and is never written from here. Every value is
+       set with textContent — payloads are displayed, never parsed as HTML. -->
+  <link rel="stylesheet" href="/static/style.css" />
+  <style>
+    body { display: block; }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 32px 16px 64px; }
+    .top h1 { margin: 4px 0 6px; font-size: 26px; letter-spacing: -.3px; }
+    .top p { margin: 0 0 8px; color: var(--muted); max-width: 680px; }
+    .brand { margin: 0; font-weight: 800; letter-spacing: 2px; color: var(--accent-ink); font-size: 13px; }
+    .bar { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; margin: 18px 0 12px; }
+    .bar .btn { width: auto; margin: 0; padding: 10px 18px; }
+    .result { margin: 0 0 18px; padding: 14px 16px; border-radius: 14px; background: var(--surface);
+              border: 1px solid var(--line); font-size: 14px; }
+    .result strong { display: block; font-size: 16px; margin-bottom: 2px; }
+    .result.ok { background: var(--ok-soft); border-color: transparent; }
+    .result.ok strong { color: var(--ok); }
+    .result.bad { background: var(--bad-soft); border-color: transparent; }
+    .result.bad strong { color: var(--bad); }
+    .result p { margin: 4px 0 0; }
+    .result .btn { width: auto; margin: 10px 0 0; padding: 8px 14px; }
+    .entry { background: var(--surface); border: 1px solid var(--line); border-radius: 14px; margin: 0 0 8px; overflow: hidden; }
+    .entry.broken { border-color: var(--bad); box-shadow: 0 0 0 2px var(--bad-soft); }
+    .entry > summary { list-style: none; cursor: pointer; padding: 12px 14px; display: grid;
+                       grid-template-columns: auto 1fr auto; gap: 2px 12px; align-items: center; }
+    .entry > summary::-webkit-details-marker { display: none; }
+    .num { font: 600 13px var(--mono); color: var(--muted); grid-row: span 2; min-width: 44px; }
+    .type { font-weight: 700; font-size: 14px; }
+    .sub { font-size: 12px; color: var(--muted); font-family: var(--mono); word-break: break-all; }
+    .tamper { grid-row: span 2; width: auto; margin: 0; padding: 6px 12px; font-size: 13px; }
+    .body { border-top: 1px solid var(--line); padding: 10px 14px 14px; font-size: 13px; }
+    .body p { margin: 4px 0; }
+    pre { margin: 6px 0 0; padding: 10px 12px; border-radius: 10px; background: var(--surface-2);
+          font: 12px/1.45 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 320px; overflow: auto; }
+    .more { display: block; margin: 12px auto 0; width: auto; padding: 10px 18px; }
+    .empty { text-align: center; color: var(--muted); padding: 60px 16px; border: 1px dashed var(--line); border-radius: 16px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <p class="brand">DCTA · AUDIT LOG</p>
+      <h1>Every step is written down, and nobody can quietly change it</h1>
+      <p>Each entry (what you said, the draft, the checks, your signature, the
+        payment) stores a fingerprint of the entry before it. Edit one old
+        entry and its fingerprint no longer matches, so <b>Verify</b> points to
+        the exact entry that was changed.</p>
+      <p>Press <b>Tamper</b> on any entry to see it. The change is made to a
+        copy of the log, so the real log is never altered. Honest limit: this
+        catches someone editing entries; someone who rewrites the <i>whole</i>
+        chain would need an outside copy of the fingerprints to be caught.</p>
+    </div>
+    <div class="bar">
+      <button id="verify" class="btn solid" type="button">Verify the chain</button>
+      <span id="count" class="muted small"></span>
+    </div>
+    <div id="result" class="result" role="status" hidden></div>
+    <div id="list"><p class="empty">Loading the audit log…</p></div>
+    <button id="more" class="btn secondary more" type="button" hidden>Show older entries</button>
+  </div>
+
+  <script>
+  "use strict";
+  const PAGE = 50;
+  const el = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const short = (h) => h.slice(0, 10) + "…";
+  const money = (c) => "$" + (c / 100).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const show = (field, v) => typeof v === "string" ? JSON.stringify(v)
+    : /amount_cents$/.test(field) && typeof v === "number" ? money(v) : String(v);
+  let entries = [];             // oldest first, as the chain is stored
+  let shown = PAGE;
+  let brokenId = null;          // the entry a tamper demo broke, highlighted
+
+  function paintResult(cls, title, lines, withBack) {
+    const box = document.getElementById("result");
+    box.className = "result " + cls;
+    box.replaceChildren(el("strong", null, title), ...lines.map((t) => el("p", null, t)));
+    if (withBack) {
+      const back = el("button", "btn secondary", "Back to the real log");
+      back.type = "button";
+      back.onclick = verify;
+      box.append(back);
+    }
+    box.hidden = false;
+  }
+
+  function paintList() {
+    const list = document.getElementById("list");
+    list.replaceChildren();
+    document.getElementById("count").textContent = entries.length + " entries";
+    if (!entries.length) {
+      list.append(el("p", "empty", "No entries yet. Use the assistant and every step appears here."));
+      document.getElementById("more").hidden = true;
+      return;
+    }
+    const newestFirst = entries.slice().reverse();
+    for (const e of newestFirst.slice(0, shown)) {
+      const d = el("details", "entry" + (e.id === brokenId ? " broken" : ""));
+      d.id = "entry-" + e.id;
+      const s = el("summary");
+      const btn = el("button", "btn secondary tamper", "Tamper");
+      btn.type = "button";
+      btn.onclick = (ev) => { ev.preventDefault(); tamper(e.id); };
+      s.append(el("span", "num", "#" + e.id), el("span", "type", e.entry_type), btn,
+               el("span", "sub", new Date(e.created_at).toLocaleString() + " · fingerprint " + short(e.hash)));
+      const b = el("div", "body");
+      let pretty = e.payload;
+      try { pretty = JSON.stringify(JSON.parse(e.payload), null, 2); } catch (_) { /* shown as stored */ }
+      b.append(el("p", "sub", "fingerprint " + e.hash), el("p", "sub", "previous    " + e.prev_hash),
+               el("pre", null, pretty));
+      d.append(s, b);
+      list.append(d);
+    }
+    document.getElementById("more").hidden = shown >= entries.length;
+  }
+
+  async function load() {
+    entries = (await (await fetch("/api/audit/chain")).json()).entries || [];
+  }
+
+  async function verify() {
+    const btn = document.getElementById("verify");
+    btn.disabled = true;
+    brokenId = null;
+    try {
+      await load();
+      const v = await (await fetch("/api/audit/verify")).json();
+      if (v.ok) {
+        paintResult("ok", "Chain intact",
+          ["All " + entries.length + " entries match their fingerprints and link to the one before."]);
+      } else {
+        const e = entries[v.break_at] || {};
+        brokenId = e.id;
+        paintResult("bad", "Broken at entry #" + e.id + " (" + e.entry_type + ")", [v.reason]);
+      }
+      paintList();
+    } catch (_) {
+      paintResult("bad", "Couldn't check the log", ["Is the server running? Try again."]);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  async function tamper(id) {
+    let r;
+    try {
+      r = await fetch("/api/audit/tamper-demo", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ entry_id: id }),
+      });
+    } catch (_) {
+      paintResult("bad", "Couldn't run the tamper demo", ["Is the server running? Try again."]);
+      return;
+    }
+    if (r.status !== 200) {
+      paintResult("bad", "Couldn't run the tamper demo", ["Entry #" + id + " wasn't found."]);
+      return;
+    }
+    const t = await r.json();
+    const broke = t.ok ? null : entries[t.break_at];
+    brokenId = broke ? broke.id : null;
+    paintResult(t.ok ? "ok" : "bad",
+      t.ok ? "Not caught" : "Caught: Verify says broken at entry #" + broke.id + " (" + broke.entry_type + ")",
+      ["Simulated attack on a copy of the log: entry #" + t.entry_id + " (" + t.entry_type + ") had "
+         + t.field + " changed from " + show(t.field, t.old) + " to " + show(t.field, t.new)
+         + ", without fixing its fingerprint.",
+       t.ok ? "" : "Reason: " + t.reason + ". The real log is unchanged."].filter(Boolean),
+      true);
+    if (brokenId != null && entries.slice().reverse().findIndex((e) => e.id === brokenId) >= shown) {
+      shown = entries.length;   // the broken entry must be on screen
+    }
+    paintList();
+    const row = document.getElementById("entry-" + brokenId);
+    if (row) row.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  document.getElementById("verify").onclick = verify;
+  document.getElementById("more").onclick = () => { shown += PAGE; paintList(); };
+  verify();
+  </script>
+</body>
+</html>
