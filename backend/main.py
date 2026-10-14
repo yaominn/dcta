@@ -17,6 +17,7 @@ import re
 import threading
 from contextlib import asynccontextmanager
 import time
+from types import SimpleNamespace
 
 from typing import Literal
 
@@ -971,7 +972,8 @@ def _pipeline(draft: Draft) -> dict:
         elif outcome.kind == "payee" and outcome.unknown_mention:
             # Money to "this new account": no one to add, and no guess either.
             # No contact buttons: the validator needs the payee's name in the
-            # user's own words, so a tapped contact could only be frozen.
+            # user's own words, and "this new account" names no one, so a
+            # tapped contact was frozen ("you didn't say Mom").
             draft.question["question"] = NO_NAME_QUESTION
             draft.question["choices"] = []
         _traces.event(draft.draft_id, "resolve", outcome="question", **draft.question)
@@ -1228,6 +1230,13 @@ def create_draft(req: DraftRequest):
         return {"status": "info", "kind": "bills", "draft_id": None, "message": MANAGE_BILLS}
     if route == "payment" and (asked := answers.before_model(req.transcript, payees=payees)):
         # Read by a model, "50 USD" becomes S$50 and "-50" becomes $50.
+        found, never = _never_rules(req.transcript)
+        if never:                          # stopped, not asked (see _scam_stop)
+            tid = "stopped-" + DraftStore.new_id()
+            _trace_start(tid, req, route)
+            out = _scam_stop(tid, None, found, never)
+            _note_stopped(req.user_id, out)
+            return out
         return _follow_up_reply(req, route, asked)
     if route == "contact_list":
         view = _contacts_view(req.user_id)
@@ -1266,6 +1275,12 @@ def create_draft(req: DraftRequest):
             if route == "payment" and _is_question(req.transcript):
                 out, _ = _answer_question(req, tid, payees=payees)
                 return out
+            if route == "payment":
+                found, never = _never_rules(req.transcript)
+                if never:                  # stopped, not asked (see _scam_stop)
+                    out = _scam_stop(tid, None, found, never)
+                    _note_stopped(req.user_id, out)
+                    return out
             question = (answers.follow_up(req.transcript, payees=payees, billers=billers,
                                           equities=equities)
                         if route == "payment" else None)
@@ -1339,17 +1354,16 @@ def create_draft(req: DraftRequest):
     # why. A question ABOUT payments ("did I send 5000 to the safe account?")
     # was answered above and keeps its warning below.
     if draft.kind == "payment" and out.get("status") == "clarify":
-        never = scam.word_score(draft.scam_text)["never_rules"]
+        found, never = _never_rules(draft.scam_text)
         if never:
-            out = _stop_for_never_rule(draft, never)
+            out = _stop_for_never_rule(draft, found, never)
             _note_stopped(req.user_id, out)
     # Scam-language warning even when there is no draft to review yet ("who
     # is the safe account?"): the words alone deserve it. Advisory only.
     # A refused new contact or a stopped payment already carries its own
     # warning: no second one.
     if out.get("status") != "ready" and not (out.get("status") == "blocked"
-                                             and (draft.kind == "contact_add"
-                                                  or out.get("kind") == "scam")):
+                                             and out.get("kind") in ("contact_add", "scam")):
         found = scam.scan_transcript(req.transcript)
         if scam.strong_codes(found):
             out["scam_language"] = {"codes": scam.phrase_codes(found),
@@ -1358,20 +1372,45 @@ def create_draft(req: DraftRequest):
                        provider.calls + question_calls + getattr(draft, "llm_calls", []))
 
 
-def _stop_for_never_rule(draft: Draft, never: list[str]) -> dict:
-    """A payment stopped before its question: the "Payment stopped" card, with
-    the scam warning for the user's words. Nothing was drafted to sign."""
-    found = scam.scan_transcript(draft.scam_text)
+def _never_rules(text: str) -> tuple[list, list[str]]:
+    """The scam phrases in `text`, and which of them are never rules."""
+    found = scam.scan_transcript(text)
+    return found, sorted({w.code for w in found} & scam.NEVER_RULES)
+
+
+def _scam_stop(trace_id: str, draft_id: str | None, found: list, never: list[str]) -> dict:
+    """The "Payment stopped" reply for a payment asked in never-rule words,
+    before any question: the scam warning for the words, and nothing to sign."""
     reasons = [w for w in [scam.warning_for(found)] if w]
+    _traces.event(trace_id, "scam", blocked=True, never_rules=never,
+                  note="stopped before asking: a never rule in the user's words")
+    return {"status": "blocked", "kind": "scam", "draft_id": draft_id, "reasons": reasons,
+            "scam": {"outcome": scam.BLOCK, "decision": scam.CALL_BANK, "never_rules": never,
+                     "phrase_codes": scam.phrase_codes(found), "warnings": reasons}}
+
+
+def _stop_for_never_rule(draft: Draft, found: list, never: list[str]) -> dict:
+    """A drafted payment stopped before its question. Logged like a scored
+    block — in the audit chain, and as a stopped attempt, so a retry without
+    the words still counts it (RETRY_AFTER_STOPPED needs a payee: none is known
+    yet, but REPEATED_STOPPED_ATTEMPTS counts it)."""
+    out = _scam_stop(draft.draft_id, draft.draft_id, found, never)
     draft.status = "blocked"
     draft.resolved_plan = None
     draft.question = None
-    _traces.event(draft.draft_id, "scam", blocked=True, never_rules=never,
-                  note="stopped before asking: a never rule in the user's words")
-    return {"status": "blocked", "kind": "scam", "draft_id": draft.draft_id,
-            "reasons": reasons,
-            "scam": {"outcome": scam.BLOCK, "decision": scam.CALL_BANK, "never_rules": never,
-                     "phrase_codes": scam.phrase_codes(found), "warnings": reasons}}
+    draft.scam_floor = scam.BLOCK
+    _audit.append(AuditEntryType.SCAM_ASSESSMENT, {
+        "stage": "before_question", "draft_id": draft.draft_id, "decision": scam.CALL_BANK,
+        "outcome": scam.BLOCK, "never_rules": never, "phrase_codes": scam.phrase_codes(found),
+        "source": "rules (not the model)"})
+    plan = IntentPlan.model_validate(draft.intent_plan)
+    attempts.record(draft.draft_id, draft.user_id,
+                    [SimpleNamespace(id=leg.id, payee_id=None,
+                                     amount_cents=getattr(leg.amount, "literal_cents", 0))
+                     for leg in plan.plan if leg.type == "TRANSFER"],
+                    outcome=scam.BLOCK, asked=False, now=int(time.time()),
+                    status=attempts.STOPPED)
+    return out
 
 
 def _follow_up_reply(req: DraftRequest, route: str, question: str) -> dict:
@@ -1782,6 +1821,11 @@ def answer_clarification(draft_id: str, answer: ClarifyAnswer):
     # the pipeline and flip a declined or executed draft back to `ready`.
     if draft.status in FINAL_STATUSES:
         raise HTTPException(409, {"error": f"draft is {draft.status}", "draft_id": draft_id,
+                                  "status": draft.status})
+    # A stopped draft asks nothing: an answer would re-run it and bring back
+    # the question it was stopped instead of ("which John?").
+    if draft.status == "blocked":
+        raise HTTPException(409, {"error": "draft is blocked", "draft_id": draft_id,
                                   "status": draft.status})
     draft.answers[answer.field] = answer.choice_id
     _traces.event(draft_id, "answer", field=answer.field, choice_id=answer.choice_id)

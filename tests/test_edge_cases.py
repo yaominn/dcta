@@ -241,6 +241,53 @@ def test_police_orders_stop_the_payment_instead_of_asking_who(client, said):
     assert "scam_language" not in r          # the card says it once
 
 
+def test_a_payment_stopped_before_its_question_is_logged_and_counted(client):
+    """In the audit chain like a scored block, and a stopped attempt, so a
+    retry without the words still sees it."""
+    import json
+    d = _ask(client, "Send $8,000 to John, the police officer said my account is compromised")
+    assert d["status"] == "blocked"
+    conn = get_conn()
+    try:
+        logged = [json.loads(r[0]) for r in conn.execute(
+            "SELECT payload FROM audit_log WHERE entry_type='SCAM_ASSESSMENT'")]
+        stopped = conn.execute("SELECT status, amount FROM scam_attempts WHERE draft_id=?",
+                               (d["draft_id"],)).fetchall()
+    finally:
+        conn.close()
+    entry = next(e for e in logged if e["draft_id"] == d["draft_id"])
+    assert entry["stage"] == "before_question" and entry["outcome"] == "BLOCK"
+    assert "words_official_orders" in entry["never_rules"]
+    assert [tuple(r) for r in stopped] == [("STOPPED", 800000)]
+
+
+def test_a_stopped_payment_takes_no_answer(client):
+    """An answer would re-run it and bring back "which John?"."""
+    d = _ask(client, "Send $8,000 to John, the police officer said my account is compromised")
+    r = client.post(f"/api/drafts/{d['draft_id']}/clarify",
+                    json={"field": "t1.target", "choice_id": "anything"})
+    assert r.status_code == 409 and r.json()["detail"]["status"] == "blocked"
+
+
+def test_a_payment_question_asked_before_the_model_is_stopped_too(client):
+    """"5000 USD" is asked about before the model reads it: not after police
+    orders."""
+    r = _ask(client, "send 5000 USD to the safe account the police officer gave me")
+    assert r["status"] == "blocked" and r["kind"] == "scam" and r["draft_id"] is None
+    assert "question" not in r
+
+
+def test_a_parse_failure_in_scam_words_is_stopped_not_asked(client, monkeypatch):
+    import backend.main as m
+    from backend.agent import ParseFailure
+    def fail(*a, **k):
+        raise ParseFailure(["attempt 1: bad"])
+    monkeypatch.setattr(m, "parse_transcript", fail)
+    r = _ask(client, "move my money now, the police officer said my account is compromised")
+    assert r["status"] == "blocked" and r["kind"] == "scam"
+    assert "ScamShield" in " ".join(r["reasons"])
+
+
 def test_a_stopped_payment_shows_its_warning_once(client):
     """A payee the rules could resolve was blocked by the score and ALSO given
     the scam-words line above the card: the same warning twice."""

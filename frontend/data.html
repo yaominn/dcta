@@ -205,6 +205,14 @@
       out.push(h2, el("p", null, `${e.rung}: ${RUNG[e.rung] || ""}`), ul);
       return out;
     },
+    scam(e) {
+      // Only a stop is drawn here: the full score is in the console (CONSOLE_DEBUG).
+      if (!e.blocked) return [];
+      const h = el("h3"); h.append(who("code"), document.createTextNode("Scam rules — payment stopped"));
+      const out = [h, el("p", null, e.note || "Too many signs of a scam: nothing to sign.")];
+      if (e.never_rules && e.never_rules.length) out.push(el("p", "muted", "Never rules: " + e.never_rules.join(", ")));
+      return out;
+    },
     step_up(e) {
       const h = el("h3"); h.append(who("code"), document.createTextNode("Extra confirmation — code texted to your phone"));
       return [h, el("p", null, (e.reasons || []).join(" ")), el("p", "muted", "The code itself is never shown here.")];
@@ -237,6 +245,7 @@
     if (gw) return gw.accepted ? ["ok", (gw.execution && gw.execution.status) || "EXECUTED"] : ["bad", "REJECTED"];
     const v = last("validate"); if (v && v.frozen) return ["bad", "FROZEN"];
     const p = last("policy"); if (p && p.decision === "BLOCK") return ["bad", "BLOCKED"];
+    const sb = last("scam"); if (sb && sb.blocked) return ["bad", "STOPPED"];
     const sc = last("scam_check"); if (sc && sc.rung === "REFUSE") return ["bad", "NOT ADDED"];
     const parse = last("parse"); if (parse && parse.error) return ["bad", "PARSE FAILED"];
     if (last("contacts")) return ["ok", "LISTED"];
@@ -279,9 +288,10 @@
       const steps = el("div", "steps");
       tr.events.forEach((e, i) => {
         const r = RENDER[e.step]; if (!r) return;
+        const parts = r(e); if (!parts.length) return;
         const row = el("div", "step");
         const body = el("div");
-        body.append(...r(e));
+        body.append(...parts);
         row.append(el("span", "n", String(i + 1)), body);
         steps.append(row);
       });
