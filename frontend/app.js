@@ -2019,6 +2019,30 @@ function wireBills() {
   setInterval(refreshBillsBadge, 15000);
 }
 
+// Settings > Demo: the presenter's `python -m backend.data.reset_demo`, one tap.
+function wireDemoReset() {
+  const btn = document.getElementById("demo-reset");
+  const note = document.getElementById("demo-reset-note");
+  if (!btn) return;
+  btn.onclick = async () => {
+    if (!confirm("Put the demo balances and payment history back to the start? Your passkey and contacts stay.")) return;
+    btn.disabled = true;
+    let r;
+    try {
+      r = await jpost(API + "/api/demo/reset", {});
+    } catch (_) {
+      r = { status: 0, json: {} };
+    }
+    btn.disabled = false;
+    note.classList.toggle("error", r.status !== 200);
+    note.textContent = r.status === 200
+      ? "Done. Balances and payment history are back to the start."
+      : "Couldn't reset the demo. Try again.";
+    refreshBalances();
+    refreshBillsBadge();              // waiting large payments were dropped too
+  };
+}
+
 /* ---------- voice input, three tiers ---------- */
 /* Readable messages for the Web Speech API's error codes. */
 const SPEECH_ERRORS = {
@@ -2299,6 +2323,7 @@ function wireKillSwitch() {
 async function init() {
   wireSound();
   wireKillSwitch();
+  wireDemoReset();
   refreshKillSwitch();
   tickClock();
   setInterval(tickClock, 15000);

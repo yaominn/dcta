@@ -152,3 +152,33 @@ def test_reset_brings_an_old_ledger_up_to_date_first(tmp_path):
     assert tuple(payees) == (len(rows), 0) and len(rows) == len(PAYEES)      # every contact kept, none removed
     assert out["balances"] == {a[0]: a[3] for a in ACCOUNTS}          # and the reset itself ran
     assert out["history_rows"] == 18 and out["not_restored"] == []
+
+
+def test_the_settings_button_resets_the_live_ledger():
+    """POST /api/demo/reset is the same reset, run by the server on its own
+    ledger: spent money comes back, the passkey stays."""
+    from fastapi.testclient import TestClient
+
+    from backend.data.db import DB_PATH
+    from backend.main import app
+
+    with contextlib.redirect_stdout(io.StringIO()):
+        seed()
+    try:
+        conn = connect(DB_PATH)
+        try:
+            conn.execute("UPDATE accounts SET balance=1250 WHERE id='acct_savings'")
+            conn.execute("INSERT INTO webauthn_credentials VALUES (?,?,?,?,?)",
+                         ("cred_touchid", "u_alice", b"cose", 7, int(time.time())))
+            conn.commit()
+        finally:
+            conn.close()
+
+        r = TestClient(app).post("/api/demo/reset")
+
+        assert r.status_code == 200
+        assert r.json()["balances"] == {a[0]: a[3] for a in ACCOUNTS}
+        assert r.json()["passkeys_kept"] == 1
+    finally:
+        with contextlib.redirect_stdout(io.StringIO()):
+            seed()

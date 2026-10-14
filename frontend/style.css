@@ -814,6 +814,9 @@ details.sec[open] summary::before { transform: rotate(90deg); }
 .switch:checked { background: var(--accent); }
 .switch:checked::after { transform: translateX(20px); }
 .settings .btn.secondary { margin-top: 16px; background: var(--surface-2); }
+.settings .set-label + .btn.secondary { margin-top: 0; }
+.set-note { margin: 8px 4px 0; font-size: 13px; color: var(--muted); }
+.set-note.error { color: var(--bad-ink); }
 
 /* Hide balances: the amounts blur until it's switched off. */
 :root[data-privacy="on"] .bal-total, :root[data-privacy="on"] .bal-amt { filter: blur(10px); }

@@ -160,6 +160,18 @@ def list_accounts(user_id: str = Query("u_alice")):
         conn.close()
 
 
+@app.post("/api/demo/reset")
+def demo_reset():
+    """The Settings button for `python -m backend.data.reset_demo`: seeded
+    balances and payment history back, passkeys, contacts and the audit log
+    kept. It moves no money anywhere, so it needs no signature."""
+    from backend.data.reset_demo import reset_demo
+    try:
+        return reset_demo(DB_PATH)
+    except SystemExit as e:          # no seeded ledger: the CLI's message, not a dead worker
+        raise HTTPException(409, str(e))
+
+
 @app.get("/api/seed/payees")
 def list_payees(user_id: str = Query("u_alice")):
     """Returns the FULL payee rows — legal names + last4 included here for
