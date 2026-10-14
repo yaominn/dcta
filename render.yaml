@@ -1,0 +1,13 @@
+# Render Blueprint: one free Docker web service. See deploy/render/README.md.
+services:
+  - type: web
+    name: dcta
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./deploy/render/Dockerfile
+    dockerContext: .
+    healthCheckPath: /api
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
