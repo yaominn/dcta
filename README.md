@@ -24,6 +24,28 @@ limited mandate (fixed biller and amount, bounded count and total, an end date),
 not by a per-payment biometric approval, and every such payment is re-checked
 and announced. See [Recurring bill payments](#recurring-bill-payments--a-signed-mandate-and-a-supervised-start).
 
+## How DCTA meets the challenge brief (R1–R9)
+
+✅ met · ⚠️ partly met, with the reason. Each row links to the section with the
+details and tests.
+
+| # | Requirement | What DCTA does | |
+|---|---|---|---|
+| R1 | **Zero-UI multi-intent parsing** | One sentence becomes one draft with several steps: payments to contacts (PayNow), bill payments, share purchases and moves between your own accounts. "The rest" and "half of it" are worked out by deterministic code, never by the model. One review card, one fingerprint. ([M3](#m3--llm-parser--schema--opaque-ids), [M4](#m4--resolver--clarify-loop)) | ✅ |
+| R2 | **Dynamic ambiguity resolution** | Never guesses. Two Johns → "John Doe ··4521 or John Smith ··8892?"; an unknown payee, a missing amount, an unknown share, or two amounts in one breath ("50, no wait, 500") each get one short question with tap-to-answer buttons. ([M4](#m4--resolver--clarify-loop), [Unclear requests](#unclear-unusual-and-hostile-requests)) | ⚠️ |
+| | | *Partly:* a single "fifty" is not questioned against your usual amounts ("Did you mean S$50?"). An amount is asked about only when you said two. | |
+| R3 | **Dual-engine discrepancy auditing** | An independent validator re-reads the transcript. A wrong amount, a wrong payee, or a debit from a different account than the one you named **freezes** the draft: it gets no signing challenge, so it can't be signed. A GPT second opinion with its own prompt is recorded alongside. ([M6](#m6--independent-validation-agent), red-team scenario 9) | ⚠️ |
+| | | *Partly:* the asset type, and the account when you didn't name one (Savings by default, shown on the card), are checked but only recorded, never frozen. A false freeze on a correct payment would be worse than the missed signal. | |
+| R4 | **Deterministic HITL biometric authorisation** | The AI only drafts. The review card is a fixed template filled from the server's JSON, never from model text; the browser recomputes the payload hash itself, and your passkey (Touch ID / Face ID, user verification required) signs that hash plus a single-use nonce. ([Only a ready draft executes](#only-a-ready-drafts-exact-payment-executes--and-the-user-can-say-no)) | ✅ |
+| R5 | **Zero-trust API gateway** | The gateway executes only a valid passkey signature over the exact payload that was drafted, policy-checked and validated; each nonce works once and each draft pays at most once. The model's code has no route to the gateway or the signing keys — a CI test fails the build if it ever imports them. ([Mock signing](#mock-signing--tests-only-off-on-every-real-server), red-team scenarios 6 and 8) | ⚠️ |
+| | | *Partly:* the agent and the gateway run in one server process, separated by that import-boundary test, not as two processes as the brief sketches. | |
+| R6 | **Injection shielding** | Input is cleaned first (Unicode NFKC, invisible characters removed, length capped); plain injections ("ignore all previous instructions…") are refused before the model reads them and logged. The model sees only opaque ids and nicknames inside data blocks — never account numbers, legal names or bill references — and its schema has no field that could name an account. The seeded poisoned bill reference never reaches a prompt. Done by rules, not a second LLM classifier. ([Unclear requests](#unclear-unusual-and-hostile-requests), red-team scenarios 4 and 5) | ✅ |
+| R7 | **Risk & velocity throttling** | More than 5 transfers in 10 minutes is blocked; $20,000 per payment and $50,000 a day. A payment far above what you usually send that person needs a code from your phone (out-of-band). The scam score asks what a payment is for, adds a cancellable wait, or holds it with a phone code. **Freeze** stops everything at once. ([M5](#m5--policy-engine-kyc--limits--velocity--anomaly), [Out-of-band step-up](#out-of-band-step-up-confirmation), [Scam protection](#scam-protection--for-the-scams-a-signature-cant-stop)) | ⚠️ |
+| | | *Partly:* there is no fixed "above S$X always needs a phone code" rule. The code is triggered by an amount unusual for that payee or by the scam score. | |
+| R8 | **Full audit trail** | A hash-chained log of every step: a fingerprint of what was said, the draft, policy, validator and scam decisions, phone codes, the signature and the result. `/audit` verifies the chain and shows a tampered entry being caught. ([The audit page](#the-audit-page-audit), red-team scenario 7) | ⚠️ |
+| | | *Partly, on purpose:* the log keeps a fingerprint (hash) of what you said, not the raw text or audio. The hash is what the signature binds, and raw speech would put account details into storage built to be impossible to edit or delete (PDPA data minimisation). | |
+| R9 | **Mock KYC + basic risk controls** | A customer whose KYC is pending (Bob) is refused with the reason, end to end; the risk controls are R7's. ([M5](#m5--policy-engine-kyc--limits--velocity--anomaly), red-team scenario 13) | ✅ |
+
 ## Prerequisites
 
 Three things, two of which `pip` cannot install for you. **All three team
@@ -1226,3 +1248,14 @@ each one, so a regression breaks CI rather than surfacing on stage.
   `docs/RECURRING_BILLS.md`. Not a claim of compliance with the MAS E-Payments
   User Protection Guidelines; a real deployment needs the payment provider and
   qualified reviewers to validate it.
+
+## Credits
+
+Everything not listed here was written for this project.
+
+- **Python:** [FastAPI](https://fastapi.tiangolo.com/), [Uvicorn](https://www.uvicorn.org/), [Pydantic](https://docs.pydantic.dev/), [python-dotenv](https://github.com/theskumar/python-dotenv), [python-multipart](https://github.com/Kludex/python-multipart), [webauthn](https://github.com/duo-labs/py_webauthn) (Duo Labs, passkey verification), the [Tencent Cloud SDK](https://github.com/TencentCloud/tencentcloud-sdk-python) (optional provider), and for tests [pytest](https://pytest.org/), [Playwright](https://playwright.dev/python/) and httpx2.
+- **AI:** the OpenAI API — `gpt-4.1-mini` drafts and second-checks payments, `gpt-4o-mini-transcribe` turns speech into text.
+- **Browser:** WebAuthn (passkeys), the Web Speech API and `speechSynthesis`. The frontend is plain HTML, CSS and JavaScript, with no third-party scripts, fonts or images.
+- **Deployment:** [Caddy](https://caddyserver.com/) for HTTPS (`deploy/`), and a [Render](https://render.com/) blueprint (`render.yaml`).
+- **References:** the MAS/IMDA Shared Responsibility Framework and the MAS E-Payments User Protection Guidelines (see *How DCTA lines up with MAS rules*); Singapore scam categories and the ScamShield (1799) and DBS Fraud Hotline (1800 339 6963) numbers.
+- **Tools:** built with CodeBuddy and Claude Code.
