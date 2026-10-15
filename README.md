@@ -58,9 +58,10 @@ python -m backend.data.seed
 
 # run the API
 uvicorn backend.main:app --reload
-# open http://localhost:8000/  -> health + scenario
-# open http://localhost:8000/api/seed/users   -> seeded users
-# open http://localhost:8000/api/seed/headline -> 32-share arithmetic
+# open http://localhost:8000/        -> the assistant (phone-style app)
+# open http://localhost:8000/audit   -> verify the audit log; the tamper demo
+# open http://localhost:8000/data    -> what the AI was told, step by step
+# open http://localhost:8000/phone   -> the demo phone (one-time codes)
 
 # run the tests
 pytest -q
@@ -71,50 +72,37 @@ pytest -q
 > `127.0.0.1:8000` lets registration succeed and then makes signing fail with
 > an unhelpful error.
 
-## Credentials (stub by default — needed only to go live)
+## Credentials: an OpenAI GPT API key (or none at all)
 
-The LLM parser (M3) runs on a deterministic stub provider until credentials
-exist, so local dev, CI and the security tests need no keys and no network.
+Without a key, the LLM parser (M3) runs on a deterministic stub provider, so
+local dev, CI and the security tests need no keys and no network.
 
-**Selected by config — never by a code edit:**
+The live demo uses an **OpenAI GPT API key**. Put it in a `.env` file in the
+repo root — **never commit `.env`**:
 
-| `LLM_PROVIDER` | Uses | When |
-|---|---|---|
-| `auto` | TokenHub if `TOKENHUB_API_KEY`, else OpenAI if `OPENAI_API_KEY`, else stub | normal use |
-| `tokenhub` | Tencent TokenHub (`hy3-preview`) | the Tencent-native live model |
-| `openai` | OpenAI GPT (`gpt-4.1-mini`, set by `OPENAI_MODEL`) | alternative live model |
-| `hunyuan` | legacy `hunyuan.tencentcloudapi.com` | dead publicly; self-hosted only |
-| `stub` | deterministic rules | CI, tests, offline dev |
+```bash
+OPENAI_API_KEY=<your key>
+OPENAI_MODEL=gpt-4.1-mini      # the default
+```
 
-Pinning a live provider is worth knowing about for the demo: it makes a missing
-or broken key **fail loudly**, instead of silently falling back to the stub —
-which would look exactly like the model working.
+The one key covers the parser, the validator's second opinion and voice
+transcription. The model is chosen by config, never by a code edit:
+`LLM_PROVIDER=openai` pins GPT, `LLM_PROVIDER=stub` forces the offline rules.
 
-TokenHub and OpenAI speak the same wire protocol, so both are thin subclasses
-of `backend/agent/openai_compat.py`. **GPT-5-series reasoning models reject
-`temperature=0`** (HTTP 400); the default `gpt-4.1-mini` accepts it. To run a
-reasoning model, also set `LLM_TEMPERATURE=1`.
+Pinning the provider is worth doing for the demo: it makes a missing or broken
+key **fail loudly** (`/api/plan` returns 502 naming the variable), instead of
+silently falling back to the stub — which would look exactly like the model
+working.
 
-**`TOKENHUB_API_KEY` is a separate credential from `TENCENTCLOUD_SECRET_ID` /
-`_SECRET_KEY`.** The Tencent pair still signs ASR; it carries no authority on
-TokenHub. Generate a TokenHub key in its console (free trial credits included)
-and put it in `.env` — with it blank, `/api/plan` returns 502 naming the
-variable, by design.
+**GPT-5-series reasoning models reject `temperature=0`** (HTTP 400); the
+default `gpt-4.1-mini` accepts it. To run a reasoning model, also set
+`LLM_TEMPERATURE=1`.
 
 Whichever provider runs, the schema constraint is enforced **on our side** —
 generate → validate against the frozen Pydantic schema → retry, bounded. A
 provider failure (bad key, rate limit, timeout) is retried and then returned
 as **502**, distinct from a 422 "could not produce a valid plan". Neither is
 a 500.
-
-To swap stub → a real provider (M7 ASR follows the same pattern):
-
-1. `cp .env.example .env`
-2. Fill `TENCENTCLOUD_SECRET_ID` / `TENCENTCLOUD_SECRET_KEY` from the Tencent
-   Cloud console (CAM → API Key Management). **Never commit `.env`.**
-3. The code reads these from the environment; the stub is used while
-   `settings.has_credentials` is False. Swapping is a config change, never a
-   code change.
 
 ## Mock signing — tests only, off on every real server
 
@@ -393,7 +381,7 @@ curl -X POST http://localhost:8000/api/plan \
 The pipeline: stored rows → **sanitizer** (`backend/agent/context.py` — the
 LLM sees only `{id, nickname}` payees, `{id, name}` billers, account types,
 tickers; legal names, last4s, reference text, account ids and balances never
-enter any prompt) → prompt → provider (stub or Hunyuan) → **generate →
+enter any prompt) → prompt → provider (stub or OpenAI GPT) → **generate →
 validate against the frozen schema → reject and retry, bounded** → fail closed
 (HTTP 422) if no valid plan within the budget.
 
@@ -524,8 +512,9 @@ Three things about the seeded data, stated rather than discovered later:
   transfers-only.
 - **Nothing in the seed exercises velocity** (its rows are a day apart), so
   those tests build their own.
-- **`u_bob` has no accounts**, so his KYC block is unreachable through the
-  resolver. The rules are pure functions and are tested directly.
+- **`u_bob` (KYC `PENDING`) has one account**, so his KYC block runs end to
+  end through the real pipeline (red-team scenario 13). The rules are also
+  pure functions, tested directly.
 - **"Daily" means UTC midnight**, which is what the UTC-aware seeded timestamps
   support. A deployed Singapore product would use UTC+8 and differ for eight
   hours a day.
@@ -598,8 +587,9 @@ Decisions stated up front (not hidden):
 - **If the audit DB is unreadable at first boot, rehydrate fails OPEN** rather
   than refusing every nonce, for the same reason. The authoritative freeze is
   re-established by the next validation.
-- **The LLM half is unexercised.** With no Tencent credentials the provider is
-  the deterministic stub, so that path has never run against a real model.
+- **The LLM half runs only with a key.** With `OPENAI_API_KEY` set, GPT gives a
+  second opinion that is recorded, never acted on alone; without a key the
+  deterministic checks run by themselves.
 
 Tests (`pytest tests/test_validator.py tests/test_import_boundary.py`): the 8
 acceptance cases (clean plan passes; tampered literal amount, tampered
@@ -637,21 +627,18 @@ tiers, and the bottom one always works**:
 
 | tier | where | needs a key | when it runs |
 |---|---|---|---|
-| OpenAI transcription or Tencent Cloud ASR | our backend | yes | a provider is configured |
+| OpenAI transcription | our backend | yes | `OPENAI_API_KEY` is set |
 | Web Speech API | the browser | no | server ASR returns 503/415 |
 | **text input** | the browser | no | **always available** |
 
-Tier 1 is selected by `ASR_PROVIDER` (`openai` | `tencent` | `none` | `auto`).
-`auto`, the default, takes Tencent when its credential pair exists, else OpenAI
-when `OPENAI_API_KEY` exists — the same key the LLM uses, so one key covers
-voice and parsing. OpenAI uses `gpt-4o-mini-transcribe` (`OPENAI_ASR_MODEL`)
-with the language pinned to `en` (`OPENAI_ASR_LANGUAGE`; empty = auto-detect).
+Tier 1 uses the same `OPENAI_API_KEY` as the parser, so one key covers voice
+and parsing: `gpt-4o-mini-transcribe` (`OPENAI_ASR_MODEL`) with the language
+pinned to `en` (`OPENAI_ASR_LANGUAGE`; empty = auto-detect).
 
-Each provider declares the containers it accepts, and `/api/transcribe` checks
-the **active** provider's list. They differ where it matters: **OpenAI accepts
-webm**, Chrome's `MediaRecorder` default, so Chrome audio is transcribed
-server-side as recorded. Tencent does not, so on Tencent, Chrome gets a 415 and
-drops to Web Speech (below).
+`/api/transcribe` checks the audio container against what the provider
+accepts. **OpenAI accepts webm**, Chrome's `MediaRecorder` default, so Chrome
+audio is transcribed server-side as recorded; a container it can't take gets a
+415 and the browser drops to Web Speech (below).
 
 Tier 1 is necessarily browser → **our backend** → provider, because API keys
 must never reach the browser. That extra hop is part of why tier 2 exists: it
@@ -681,15 +668,6 @@ the signed payload, so nothing new is trusted and the template stays fixed
 
 Decisions stated up front (not hidden):
 
-- **`backend/asr/tencent.py` is UNEXERCISED.** No Tencent credentials exist, so
-  not one line has run against the real service. Two things to check on the
-  first live call are in its docstring: the **audio container** (Chrome's
-  MediaRecorder produces webm-opus; `SentenceRecognition` documents ogg-opus —
-  same codec, *different container*, so webm may be rejected) and
-  `EngSerViceType` matching the spoken language. Both are configurable
-  (`ASR_VOICE_FORMAT`, `ASR_ENGINE`) precisely because the container is the
-  likeliest first failure. If it is, the fix is a server-side rewrap, not a
-  redesign — the Web Speech tier keeps the demo working meanwhile.
 - **The client never holds the draft.** Answering a clarification sends only
   `{field, choice_id}` for a `draft_id`; the plan stays server-side, so a
   client cannot substitute one.
@@ -708,8 +686,7 @@ question.
   `MediaRecorder` produces `audio/webm;codecs=opus`, which shares a codec but
   **not** a container with the documented `ogg-opus`. `voice.js` previously sent
   the blob with no format hint, so the server applied its configured default
-  and would have forwarded webm audio labelled `mp3` — the exact mislabelling
-  `backend/asr/tencent.py` names as the likeliest first-live-call failure. It
+  and would have forwarded webm audio labelled `mp3`, which a provider rejects. It
   now asks `MediaRecorder` for a documented container where the browser has one,
   and reports verbatim what it actually recorded. An unsupported container gets
   an honest **415** naming the fallback tier, and the demo drops to Web Speech
@@ -732,13 +709,11 @@ question.
   storage that is deliberately hard to redact. A test asserts the transcript
   text never reaches the log.
 
-> **After a tamper demo, re-seed with `--reset-audit`.**
-> `python -m backend.data.seed --reset-audit`
->
-> `verify_chain()` reports the *first* break, so once scenario 7 has edited an
-> entry the chain stays broken for every later run, and a plain re-seed does not
-> touch the append-only log. The flag is opt-in: a normal `seed()` still
-> preserves audit history, because surviving a re-seed is usually the point.
+> **The live audit log is never tampered with.** Red-team scenario 7 edits a
+> row in a throwaway log of its own, and the `/audit` page tampers with a copy
+> (below), so the real chain stays intact and every demo can be repeated.
+> `python -m backend.data.seed --reset-audit` starts a fresh log if you ever
+> want one.
 
 ### The audit page: `/audit`
 
@@ -822,12 +797,11 @@ But the parse was perturbed, and the demo prints that. The defence was never
 "the model resists injection"; it is that a compromised model can produce only
 a draft, which a human sees and declines.
 
-Two things the seeded data makes unreachable, recorded rather than discovered
+One thing the seeded data makes unreachable, recorded rather than discovered
 later: `acct_savings` holds $8,420.50, which is *below* the $20,000
 per-transaction limit, so the resolver's insufficient-funds check always fires
 before policy can refuse an over-limit amount through the honest path — the
-reachable block there is **velocity**. And `u_bob` has no accounts, so his KYC
-block is only reachable by calling the policy functions directly.
+reachable block there is **velocity**.
 
 
 ## Out-of-band step-up confirmation
@@ -861,7 +835,8 @@ not change. Tests: `pytest tests/test_stepup.py`.
 
 > **Demo order matters for balances.** The happy path spends almost all of
 > Savings, so a later "$5,000 to John" asks about insufficient funds instead of
-> escalating. Run the anomaly scene first, or re-seed between scenes.
+> escalating. Run the anomaly scene first, or tap **Settings → Demo → Reset
+> demo money** between scenes (a re-seed would also delete your passkey).
 
 ## Editing contacts by voice or text
 
@@ -1042,7 +1017,7 @@ transcripts.
 See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the pipeline and the
 package responsibilities, and [`docs/TRUST_BOUNDARY.md`](docs/TRUST_BOUNDARY.md)
 for the boundary table (what crosses each boundary, who could forge it, the
-mitigation). Diagrams will be rendered before submission.
+mitigation).
 
 ```
 Voice/Text -> ASR -> sanitizer -> LLM parser -> resolver -> policy
@@ -1053,12 +1028,12 @@ Voice/Text -> ASR -> sanitizer -> LLM parser -> resolver -> policy
 
 - **Backend:** Python + FastAPI, SQLite, the Duo `webauthn` library, Pydantic v2 (frozen schemas).
 - **Frontend:** plain HTML/JS (no React, no build toolchain).
-- **LLM:** behind a swappable provider interface (Tencent Hunyuan preferred).
+- **LLM:** OpenAI GPT (`gpt-4.1-mini`), behind a swappable provider interface.
   Output handling: generate → validate against the Pydantic schema → reject
   and retry, bounded retries. The schema constraint is enforced **on our side**
   regardless of provider-side enforcement.
-- **ASR/TTS:** OpenAI transcription or Tencent Cloud ASR (Singapore region,
-  English), Web Speech API fallback. Text input always works as a demo floor.
+- **ASR/TTS:** OpenAI transcription, Web Speech API fallback; replies are
+  spoken by the browser. Text input always works as a demo floor.
 - **Auth:** WebAuthn for **transaction signing only**; app login is a mock session.
 
 ## Repo layout (brief Section 8)
@@ -1205,8 +1180,10 @@ can show — both attack **our own code**, not the model:
     versioned; the recent change scores as a scam pattern: a warning, a
     server-enforced hold, and a one-tap Cancel.
 11. **A coached victim** — "the police officer said I need to transfer 5000 to
-    landlord immediately, don't tell anyone". Rules on the raw transcript flag
-    it: a specific warning, a hold, a phone code.
+    landlord immediately, don't tell anyone". Rules on the raw transcript (not
+    the model) find a never rule: the payment is stopped with nothing to sign,
+    and the card says to call the bank, with tap-to-call buttons for the DBS
+    Fraud Hotline and ScamShield.
 12. **A benign control** — $50 to a long-standing payee goes through with no
     extra friction at all.
 13. **An unverified customer** — Bob's KYC is pending; his request is refused
@@ -1223,24 +1200,10 @@ each one, so a regression breaks CI rather than surfacing on stage.
 
 ## Honest limitations (stated in the pitch, not hidden)
 
-- **Tencent retired the legacy Hunyuan `ChatCompletions` API.** With real
-  credentials (24 Sep 2026) authentication succeeds, but every model —
-  `hunyuan-functioncall`, `hunyuan-turbos-latest`, `hunyuan-lite` and others —
-  returns *"this model has been taken offline; migrate to TokenHub"*, and that
-  platform shuts down 2026-09-30. **Migrated:** `backend/agent/tokenhub.py`
-  speaks the replacement API (`https://tokenhub.tencentmaas.com/v1`,
-  OpenAI-compatible, model `hy3-preview`, bearer API key) and is what `auto`
-  now prefers. `backend/agent/hunyuan.py` is kept for a self-hosted or
-  grandfathered endpoint. This is exactly the swap the provider interface was
-  built for: one new file, one branch in `get_provider`, and not one line of
-  `parser.py`, `prompts.py` or `context.py` changed.
-- **The live demo runs on OpenAI (`gpt-4.1-mini`), not Tencent's model.** Two
-  live providers are wired — TokenHub and OpenAI — and each needs its own API
-  key; with the chosen provider pinned and its key missing, the parser fails
-  loudly rather than serving stub output. Every security property is tested and
-  holds regardless of the model — that is the point of validating on our side.
-  The TokenHub and Tencent ASR integrations are written and unit-tested but
-  have not run against the live Tencent services.
+- **The live demo runs on an OpenAI GPT API key (`gpt-4.1-mini`).** The model
+  sits behind a swappable provider interface, so it is a config choice. Every
+  security property is tested with the offline stub and holds whatever the
+  model does — that is the point of validating on our side.
 - **Only English is understood.** "给妈妈转50块" (give mum 50) is not read as a
   payment to Mom; the app asks who it's for instead.
 
@@ -1252,8 +1215,9 @@ each one, so a regression breaks CI rather than surfacing on stage.
 - The independent validation agent catches model error, drift and mis-parse —
   it does **not** defend against transcript-borne injection (handled
   architecturally: the user must still sign).
-- WebAuthn platform authenticators are device-bound; registration is performed
-  live in the demo, and the deployed HTTPS origin is tested a week before submission.
+- Passkeys are device-bound, so one is registered live on the demo device. Away
+  from `localhost`, WebAuthn needs HTTPS, and a passkey works only on the
+  domain it was registered for.
 - **Recurring bills are fixed-amount only**, weekly or monthly. There is no
   trusted bill feed, so a variable invoice cannot be paid automatically; a new
   amount needs new signed terms. Automatic payments after the first three are
